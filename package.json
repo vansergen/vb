@@ -1,0 +1,21 @@
+{
+  "name": "docker-ghcr-template",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "commitlint": "commitlint --verbose --from=$( git rev-list --max-parents=0 $( git rev-parse --abbrev-ref HEAD ) )",
+    "install:clean": "npm install",
+    "preinstall:clean": "rm -rf node_modules package-lock.json",
+    "prepare": "husky",
+    "prettier": "prettier -c .",
+    "prettier:write": "prettier -c -w ."
+  },
+  "license": "AGPL-3.0-only",
+  "devDependencies": {
+    "@binden/commitlint-config": "^2.1.0",
+    "@binden/semantic-release-config": "^3.0.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.1",
+    "prettier": "^3.5.3"
+  }
+}
