@@ -1,0 +1,832 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SELF_SCRIPT="${DVR_SELF:-$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")}"
+
+readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
+readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
+readonly GPG_ROOT="${GPG_ROOT:-/gpg}"
+
+backup_root="$DEFAULT_BACKUP_ROOT"
+
+source_arg=""
+target_volume=""
+private_key_file="private.gpg"
+
+all_volumes=0
+timestamp_filter=""
+jobs=1
+dry_run=0
+clear_target=0
+symmetric=0
+
+declare -A volume_filters=()
+declare -A latest_file=()
+declare -A latest_ts=()
+declare -A unique_timestamps=()
+declare -A pid_to_volume=()
+declare -a running_pids=()
+
+download_from_s3=0
+decrypt=0
+compressed=0
+
+src_path=""
+source_name=""
+target_dir=""
+tmp_dir=""
+mc_config_dir=""
+s3_mc_path=""
+
+parsed_volume=""
+parsed_timestamp=""
+
+gpg_raw_private_key="${GPG_PRIVATE_KEY:-}"
+gpg_passphrase="${GPG_PASSPHRASE:-}"
+
+aws_access_key_id="${AWS_ACCESS_KEY_ID:-}"
+aws_secret_access_key="${AWS_SECRET_ACCESS_KEY:-}"
+aws_session_token="${AWS_SESSION_TOKEN:-}"
+aws_region="${AWS_REGION:-us-east-1}"
+aws_endpoint_url="${AWS_ENDPOINT_URL:-}"
+
+decompressor_cmd=()
+decompressor_name="none"
+
+failed=0
+wait_supports_p=0
+
+# ------------------------------------------------------------------------------
+# Colors
+# ------------------------------------------------------------------------------
+
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+  readonly COLOR_RESET=$'\033[0m'
+  readonly COLOR_RED=$'\033[0;31m'
+  readonly COLOR_YELLOW=$'\033[0;33m'
+  readonly COLOR_GREEN=$'\033[0;32m'
+else
+  readonly COLOR_RESET=""
+  readonly COLOR_RED=""
+  readonly COLOR_YELLOW=""
+  readonly COLOR_GREEN=""
+fi
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+
+log() {
+  local level="INFO"
+  local color="$COLOR_GREEN"
+
+  case "${1:-}" in
+    ERROR)
+      level="ERROR"
+      color="$COLOR_RED"
+      shift
+      ;;
+    WARN)
+      level="WARN"
+      color="$COLOR_YELLOW"
+      shift
+      ;;
+    INFO)
+      level="INFO"
+      color="$COLOR_GREEN"
+      shift
+      ;;
+  esac
+
+  printf '[%s] %s %b[%s]%b %s\n' \
+    "$SCRIPT_NAME" \
+    "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$color" \
+    "$level" \
+    "$COLOR_RESET" \
+    "$*" >&2
+}
+
+die() {
+  log ERROR "$*"
+  exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Usage:
+  # Restore one volume
+  $SCRIPT_NAME -i <backup-file|s3://bucket/key> -t <target-volume> [options]
+
+  # Restore all volumes from local BACKUP_ROOT
+  $SCRIPT_NAME -a [options]
+
+  # Restore selected volumes in "all" mode
+  $SCRIPT_NAME -a -v <VOLUME_NAME> [-v <VOLUME_NAME> ...] [options]
+
+Options:
+  Modes:
+    -a          Restore all volumes from local backup files in BACKUP_ROOT
+    -i <source> Backup source:
+                  - file name inside current BACKUP_ROOT
+                  - absolute/relative local path
+                  - s3://bucket/key
+    -t <name>   Target volume name inside ${VOLUMES_ROOT}
+
+                Without -a:
+                  -i and -t are required
+                With -a:
+                  -i and -t must not be used
+                  -v acts as a volume filter and may be repeated
+
+  General:
+    -d <dir>    Local backup directory override (default: ${DEFAULT_BACKUP_ROOT})
+    -T <ts>     In -a mode, restore only backups with this timestamp
+                Format: YYYYMMDD_HHMMSS
+    -v <name>   In -a mode, restore only this volume (repeatable)
+    -j <N>      Number of parallel restores in -a mode (default: 1)
+    -C          Clear target volume before restore
+    -n          Dry-run
+    -h          Show help
+
+  Decryption:
+    -s          Symmetric GPG decryption
+    -k <file>   Private key file for asymmetric GPG decryption
+                (absolute path or file inside ${GPG_ROOT}, default: private.gpg)
+
+Environment variables:
+  BACKUP_ROOT           Local backup directory (default: /backups)
+  VOLUMES_ROOT          Mounted volumes root (default: /volumes)
+  GPG_ROOT              Mounted GPG directory (default: /gpg)
+  GPG_PRIVATE_KEY       Private key content for asymmetric decryption
+  GPG_PASSPHRASE        Passphrase for symmetric decryption or private key
+  AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 restore)
+  AWS_SECRET_ACCESS_KEY S3 secret access key (required for S3 restore)
+  AWS_SESSION_TOKEN     Optional session token for temporary credentials
+  AWS_REGION            S3 region (default: us-east-1)
+  AWS_ENDPOINT_URL      Optional custom S3 endpoint (MinIO, Yandex Cloud, DO Spaces, etc.)
+  NO_COLOR              Disable colors in logs
+
+Supported formats:
+  .tar
+  .tar.gz
+  .tar.gpg
+  .tar.gz.gpg
+
+Examples:
+  # Single restore
+  $SCRIPT_NAME -i postgres_data_20250411_120000.tar.gz -t postgres_data
+  GPG_PASSPHRASE='secret' $SCRIPT_NAME -i backup.tar.gz.gpg -t postgres_data -s -C
+  GPG_PASSPHRASE='key-pass' $SCRIPT_NAME -i s3://my-bucket/daily/app/backup.tar.gpg -t postgres_data -k private.asc -C
+
+  # Restore all
+  $SCRIPT_NAME -a -C
+  $SCRIPT_NAME -a -T 20250411_120000 -C
+  $SCRIPT_NAME -a -v postgres_data -v redis_data -C
+  $SCRIPT_NAME -a -j 4 -C
+  GPG_PASSPHRASE='secret' $SCRIPT_NAME -a -s -C
+
+Notes:
+  - In -a mode, restore is performed from local files in BACKUP_ROOT only.
+  - Without -T, the latest backup is selected independently for each volume.
+  - If selected backups have different timestamps, restore may be inconsistent
+    across volumes. Prefer using -T for full snapshot restore.
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup / signals
+# ------------------------------------------------------------------------------
+
+cleanup() {
+  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+    rm -rf "$tmp_dir"
+  fi
+
+  if [[ -n "$mc_config_dir" && -d "$mc_config_dir" ]]; then
+    rm -rf "$mc_config_dir"
+  fi
+}
+
+terminate_children() {
+  local pid
+  for pid in "${!pid_to_volume[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+trap cleanup EXIT
+trap 'log WARN "Interrupted"; terminate_children; wait || true; exit 130' INT
+trap 'log WARN "Terminated"; terminate_children; wait || true; exit 143' TERM
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+validate_volume_name() {
+  local volume="$1"
+  [[ "$volume" =~ ^[a-zA-Z0-9._-]+$ ]] || die \
+    "Target volume name must contain only alphanumeric characters, dots, dashes, and underscores"
+}
+
+dir_has_entries() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 1
+  [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+}
+
+resolve_source() {
+  if [[ "$source_arg" == s3://* ]]; then
+    download_from_s3=1
+    src_path="$source_arg"
+    source_name="${src_path##*/}"
+    return
+  fi
+
+  if [[ "$source_arg" == /* || "$source_arg" == ./* || "$source_arg" == ../* ]]; then
+    src_path="$source_arg"
+  elif [[ -f "$source_arg" ]]; then
+    src_path="$source_arg"
+  else
+    src_path="${backup_root%/}/$source_arg"
+  fi
+
+  [[ -f "$src_path" ]] || die "Backup file not found: $src_path"
+  source_name="$(basename "$src_path")"
+}
+
+detect_format() {
+  local name="$source_name"
+
+  if [[ "$name" == *.gpg ]]; then
+    decrypt=1
+    name="${name%.gpg}"
+  fi
+
+  if [[ "$name" == *.gz ]]; then
+    compressed=1
+    name="${name%.gz}"
+  fi
+
+  [[ "$name" == *.tar ]] || die "Unsupported backup format: $source_name. Expected .tar[.gz][.gpg]"
+
+  if (( symmetric )) && (( decrypt == 0 )); then
+    die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
+  fi
+}
+
+construct_s3_path() {
+  local s3_path="${src_path#s3://}"
+  local bucket="${s3_path%%/*}"
+  local key="${s3_path#*/}"
+
+  [[ -n "$bucket" && "$bucket" != "$s3_path" ]] || die "Invalid S3 path: $src_path"
+
+  s3_mc_path="vb/${bucket}/${key}"
+}
+
+prepare_s3_client() {
+  mc_config_dir="$(mktemp -d)"
+
+  local endpoint
+  if [[ -n "$aws_endpoint_url" ]]; then
+    endpoint="$aws_endpoint_url"
+  else
+    endpoint="https://s3.${aws_region}.amazonaws.com"
+  fi
+
+  local -a session_token_flag=()
+  if [[ -n "$aws_session_token" ]]; then
+    session_token_flag=(--session-token "$aws_session_token")
+  fi
+
+  mc --config-dir "$mc_config_dir" alias set vb \
+    "$endpoint" \
+    "$aws_access_key_id" \
+    "$aws_secret_access_key" \
+    "${session_token_flag[@]}" \
+    >/dev/null 2>&1 \
+    || die "Failed to configure S3 client"
+}
+
+prepare_gpg_home() {
+  tmp_dir="$(mktemp -d)"
+  export GNUPGHOME="${tmp_dir}/gnupg"
+  mkdir -p "$GNUPGHOME"
+  chmod 700 "$GNUPGHOME"
+  printf 'allow-loopback-pinentry\n' > "${GNUPGHOME}/gpg-agent.conf"
+  gpgconf --launch gpg-agent >/dev/null 2>&1 || true
+}
+
+prepare_asymmetric_gpg() {
+  local key_source
+
+  prepare_gpg_home
+
+  if [[ -n "$gpg_raw_private_key" ]]; then
+    key_source="${tmp_dir}/private.key"
+    printf '%s' "$gpg_raw_private_key" > "$key_source"
+    chmod 600 "$key_source"
+  else
+    if [[ "$private_key_file" == /* ]]; then
+      key_source="$private_key_file"
+    else
+      key_source="${GPG_ROOT%/}/$private_key_file"
+    fi
+  fi
+
+  [[ -f "$key_source" ]] || die "Private key file not found: $key_source"
+  gpg --batch --import "$key_source" >/dev/null 2>&1 || die "Failed to import private key"
+}
+
+verify_local_checksum_if_present() {
+  (( download_from_s3 )) && return 0
+
+  local checksum_file="${src_path}.sha256"
+  [[ -f "$checksum_file" ]] || return 0
+
+  log INFO "Checksum file found: $checksum_file"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$checksum_file" >/dev/null || die "Checksum verification failed"
+    log INFO "Checksum verification passed"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "$checksum_file" >/dev/null || die "Checksum verification failed"
+    log INFO "Checksum verification passed"
+  else
+    log WARN "sha256sum/shasum not found, checksum verification skipped"
+  fi
+}
+
+validate_single_mode() {
+  [[ -n "$source_arg" ]] || die "Required flag is missing: -i <backup-file|s3://bucket/key>"
+  [[ -n "$target_volume" ]] || die "Required flag is missing: -t <target-volume>"
+  validate_volume_name "$target_volume"
+
+  require_command tar
+
+  resolve_source
+  detect_format
+
+  target_dir="${VOLUMES_ROOT%/}/$target_volume"
+
+  if [[ -d "$target_dir" ]] && dir_has_entries "$target_dir" && (( clear_target == 0 )); then
+    die "Target volume is not empty: $target_dir. Use -C to clear it before restore"
+  fi
+
+  if (( compressed )); then
+    if command -v pigz >/dev/null 2>&1; then
+      decompressor_cmd=(pigz -dc)
+      decompressor_name="pigz"
+    elif command -v gzip >/dev/null 2>&1; then
+      decompressor_cmd=(gzip -dc)
+      decompressor_name="gzip"
+      log WARN "pigz not found, falling back to gzip"
+    else
+      die "Compressed backup detected, but neither pigz nor gzip is installed"
+    fi
+  fi
+
+  if (( decrypt )); then
+    require_command gpg
+
+    if (( symmetric )); then
+      [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
+      prepare_gpg_home
+    else
+      prepare_asymmetric_gpg
+    fi
+  fi
+
+  if (( download_from_s3 )); then
+    [[ -n "$aws_access_key_id" ]] || die "AWS_ACCESS_KEY_ID environment variable is not set"
+    [[ -n "$aws_secret_access_key" ]] || die "AWS_SECRET_ACCESS_KEY environment variable is not set"
+    require_command mc
+    prepare_s3_client
+    construct_s3_path
+  fi
+}
+
+clear_target_contents() {
+  [[ -n "$target_dir" ]] || die "Internal error: target_dir is empty"
+  [[ "$target_dir" != "/" ]] || die "Refusing to clear '/'"
+  [[ "$target_dir" == "${VOLUMES_ROOT%/}/"* ]] || die "Refusing to clear path outside ${VOLUMES_ROOT}"
+
+  if [[ ! -d "$target_dir" ]]; then
+    return 0
+  fi
+
+  log INFO "Clearing target volume: $target_dir"
+  find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+
+source_stream() {
+  if (( download_from_s3 )); then
+    mc --config-dir "$mc_config_dir" cat "$s3_mc_path"
+  else
+    cat -- "$src_path"
+  fi
+}
+
+decrypt_stream() {
+  if (( decrypt == 0 )); then
+    cat
+    return
+  fi
+
+  if [[ -n "$gpg_passphrase" ]]; then
+    gpg \
+      --batch \
+      --yes \
+      --no-tty \
+      --pinentry-mode loopback \
+      --passphrase-fd 3 \
+      --decrypt \
+      --output - \
+      3<<<"$gpg_passphrase"
+  else
+    gpg \
+      --batch \
+      --yes \
+      --no-tty \
+      --pinentry-mode loopback \
+      --decrypt \
+      --output -
+  fi
+}
+
+decompress_stream() {
+  if (( compressed )); then
+    "${decompressor_cmd[@]}"
+  else
+    cat
+  fi
+}
+
+extract_stream() {
+  tar \
+    --extract \
+    --file - \
+    --directory "$target_dir" \
+    --numeric-owner \
+    --same-owner \
+    --preserve-permissions
+}
+
+parse_backup_filename() {
+  local base="$1"
+  local name="$base"
+
+  parsed_volume=""
+  parsed_timestamp=""
+
+  if [[ "$name" == *.gpg ]]; then
+    name="${name%.gpg}"
+  fi
+
+  if [[ "$name" == *.gz ]]; then
+    name="${name%.gz}"
+  fi
+
+  [[ "$name" == *.tar ]] || return 1
+  name="${name%.tar}"
+
+  if [[ "$name" =~ ^(.+)_([0-9]{8}_[0-9]{6})$ ]]; then
+    parsed_volume="${BASH_REMATCH[1]}"
+    parsed_timestamp="${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  return 1
+}
+
+collect_backups_for_all_mode() {
+  [[ -d "$backup_root" ]] || die "Backup directory not found: $backup_root"
+
+  while IFS= read -r -d '' filepath; do
+    local filename
+    filename="$(basename "$filepath")"
+
+    if ! parse_backup_filename "$filename"; then
+      log WARN "Skipping unsupported file: $filename"
+      continue
+    fi
+
+    local vol="$parsed_volume"
+    local ts="$parsed_timestamp"
+
+    if ! [[ "$vol" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+      log WARN "Skipping backup with unsafe volume name '${vol}': $filename"
+      continue
+    fi
+
+    if (( ${#volume_filters[@]} > 0 )) && [[ -z "${volume_filters[$vol]:-}" ]]; then
+      continue
+    fi
+
+    if [[ -n "$timestamp_filter" && "$ts" != "$timestamp_filter" ]]; then
+      continue
+    fi
+
+    if [[ -z "${latest_ts[$vol]:-}" || "$ts" > "${latest_ts[$vol]}" ]]; then
+      latest_file["$vol"]="$filepath"
+      latest_ts["$vol"]="$ts"
+    fi
+  done < <(
+    find "$backup_root" -maxdepth 1 -type f \
+      \( -name '*.tar' -o -name '*.tar.gz' -o -name '*.tar.gpg' -o -name '*.tar.gz.gpg' \) \
+      -print0
+  )
+}
+
+validate_requested_filters_in_all_mode() {
+  if (( ${#volume_filters[@]} == 0 )); then
+    return 0
+  fi
+
+  local missing_requested=0
+  while IFS= read -r requested; do
+    if [[ -z "${latest_file[$requested]:-}" ]]; then
+      log ERROR "No backup found for requested volume: $requested"
+      missing_requested=1
+    fi
+  done < <(printf '%s\n' "${!volume_filters[@]}" | sort)
+
+  (( missing_requested == 0 )) || die "One or more requested volumes have no matching backups"
+}
+
+build_child_args() {
+  declare -ga CHILD_ARGS=()
+
+  if (( symmetric )); then
+    CHILD_ARGS+=(-s)
+  fi
+
+  if (( symmetric == 0 )) && [[ "$private_key_file" != "private.gpg" ]]; then
+    CHILD_ARGS+=(-k "$private_key_file")
+  fi
+
+  if (( clear_target )); then
+    CHILD_ARGS+=(-C)
+  fi
+}
+
+remove_running_pid() {
+  local pid_to_remove="$1"
+  local pid
+  local new_running=()
+
+  for pid in "${running_pids[@]}"; do
+    if [[ "$pid" != "$pid_to_remove" ]]; then
+      new_running+=("$pid")
+    fi
+  done
+
+  running_pids=("${new_running[@]}")
+}
+
+launch_child_restore() {
+  local vol="$1"
+  local filepath="$2"
+
+  BACKUP_ROOT="$backup_root" \
+  bash "$SELF_SCRIPT" -i "$filepath" -t "$vol" "${CHILD_ARGS[@]}" &
+
+  local pid=$!
+  pid_to_volume["$pid"]="$vol"
+  running_pids+=("$pid")
+
+  log INFO "Launched restore: $vol (pid=$pid)"
+}
+
+reap_one_child() {
+  local pid=""
+  local vol=""
+  local status=0
+
+  if (( wait_supports_p )); then
+    if wait -n -p pid; then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    pid="${running_pids[0]}"
+    if wait "$pid"; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+
+  vol="${pid_to_volume[$pid]:-unknown}"
+  remove_running_pid "$pid"
+  unset 'pid_to_volume[$pid]'
+
+  if (( status == 0 )); then
+    log INFO "Restore completed: $vol"
+  else
+    log ERROR "Restore failed: $vol"
+    failed=1
+  fi
+}
+
+wait_for_all_children() {
+  while (( ${#running_pids[@]} > 0 )); do
+    reap_one_child
+  done
+}
+
+run_single_restore() {
+  validate_single_mode
+  verify_local_checksum_if_present
+
+  log INFO "Starting restore"
+  log INFO "Source: $src_path"
+
+  if (( download_from_s3 )); then
+    log INFO "Source type: S3"
+  else
+    log INFO "Source type: local file"
+  fi
+
+  log INFO "Target volume: $target_volume"
+  log INFO "Target directory: $target_dir"
+
+  if (( compressed )); then
+    log INFO "Compression: ${decompressor_name}"
+  else
+    log INFO "Compression: none"
+  fi
+
+  if (( decrypt )); then
+    if (( symmetric )); then
+      log INFO "Decryption: symmetric GPG"
+    else
+      log INFO "Decryption: asymmetric GPG"
+    fi
+  else
+    log INFO "Decryption: none"
+  fi
+
+  if (( clear_target )); then
+    log INFO "Target mode: clear before restore"
+  else
+    log INFO "Target mode: must be empty"
+  fi
+
+  if (( dry_run )); then
+    log INFO "Dry-run: no changes made"
+    return 0
+  fi
+
+  mkdir -p "$target_dir"
+
+  if (( clear_target )); then
+    clear_target_contents
+  fi
+
+  source_stream | decrypt_stream | decompress_stream | extract_stream
+
+  log INFO "Restore completed successfully"
+}
+
+run_all_restores() {
+  if [[ -n "$timestamp_filter" ]]; then
+    [[ "$timestamp_filter" =~ ^[0-9]{8}_[0-9]{6}$ ]] || die \
+      "Invalid timestamp format: '$timestamp_filter'. Expected YYYYMMDD_HHMMSS"
+  fi
+
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "Invalid -j value: '$jobs'. Expected positive integer"
+
+  collect_backups_for_all_mode
+  validate_requested_filters_in_all_mode
+  build_child_args
+
+  if [[ "${#latest_file[@]}" -eq 0 ]]; then
+    [[ -z "$timestamp_filter" ]] || die "No backup files found in $backup_root for timestamp $timestamp_filter"
+    die "No backup files found in $backup_root"
+  fi
+
+  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+    wait_supports_p=1
+  fi
+
+  log INFO "Found ${#latest_file[@]} volume(s) to restore"
+  log INFO "Parallel jobs: $jobs"
+
+  while IFS= read -r vol; do
+    unique_timestamps["${latest_ts[$vol]}"]=1
+    log INFO "  $vol  <-  $(basename "${latest_file[$vol]}")"
+  done < <(printf '%s\n' "${!latest_file[@]}" | sort)
+
+  if [[ -n "$timestamp_filter" ]]; then
+    log INFO "Snapshot timestamp: $timestamp_filter"
+  elif (( ${#unique_timestamps[@]} > 1 )); then
+    log WARN "Selected backups span multiple timestamps; restore may be inconsistent across volumes"
+  fi
+
+  if (( dry_run )); then
+    log INFO "Dry-run mode: validating each volume"
+
+    failed=0
+    while IFS= read -r vol; do
+      log INFO "--- $vol ---"
+      BACKUP_ROOT="$backup_root" \
+      bash "$SELF_SCRIPT" -i "${latest_file[$vol]}" -t "$vol" -n "${CHILD_ARGS[@]}" || {
+        log ERROR "Validation failed: $vol"
+        failed=1
+      }
+    done < <(printf '%s\n' "${!latest_file[@]}" | sort)
+
+    (( failed == 0 )) || die "One or more volumes failed validation"
+    log INFO "Dry-run completed successfully"
+    return 0
+  fi
+
+  failed=0
+
+  while IFS= read -r vol; do
+    while (( ${#running_pids[@]} >= jobs )); do
+      reap_one_child
+    done
+
+    launch_child_restore "$vol" "${latest_file[$vol]}"
+  done < <(printf '%s\n' "${!latest_file[@]}" | sort)
+
+  wait_for_all_children
+
+  (( failed == 0 )) || die "One or more restores failed"
+  log INFO "All restores completed successfully"
+}
+
+# ------------------------------------------------------------------------------
+# Parse args
+# ------------------------------------------------------------------------------
+
+while getopts ':ad:i:t:T:v:j:sk:Cnh' flag; do
+  case "$flag" in
+    a) all_volumes=1 ;;
+    d) backup_root="$OPTARG" ;;
+    i) source_arg="$OPTARG" ;;
+    t) target_volume="$OPTARG" ;;
+    T) timestamp_filter="$OPTARG" ;;
+    v)
+      validate_volume_name "$OPTARG"
+      volume_filters["$OPTARG"]=1
+      ;;
+    j) jobs="$OPTARG" ;;
+    s) symmetric=1 ;;
+    k) private_key_file="$OPTARG" ;;
+    C) clear_target=1 ;;
+    n) dry_run=1 ;;
+    h)
+      usage
+      exit 0
+      ;;
+    :)
+      die "Option -$OPTARG requires an argument"
+      ;;
+    \?)
+      die "Unsupported flag: -$OPTARG"
+      ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+[[ $# -eq 0 ]] || die "Unexpected extra arguments: $*"
+
+# ------------------------------------------------------------------------------
+# Mode selection
+# ------------------------------------------------------------------------------
+
+if (( all_volumes )); then
+  [[ -z "$source_arg" ]] || die "Option -i cannot be used with -a"
+  [[ -z "$target_volume" ]] || die "Option -t cannot be used with -a"
+else
+  [[ -z "$timestamp_filter" ]] || die "Option -T can only be used with -a"
+  (( ${#volume_filters[@]} == 0 )) || die "Option -v can only be used with -a; use -t for single restore"
+  (( jobs == 1 )) || die "Option -j can only be used with -a"
+fi
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+if (( all_volumes )); then
+  run_all_restores
+else
+  run_single_restore
+fi

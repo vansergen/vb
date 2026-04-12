@@ -1,0 +1,790 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SELF_SCRIPT="${DVB_SELF:-$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")}"
+
+readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
+readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
+readonly GPG_ROOT="${GPG_ROOT:-/gpg}"
+
+backup_root="$DEFAULT_BACKUP_ROOT"
+backup_timestamp="${BACKUP_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
+
+all_volumes=0
+jobs=1
+dry_run=0
+
+compress=0
+encrypt=0
+symmetric=0
+upload_to_s3=0
+
+pgp_key="public.gpg"
+s3_bucket=""
+s3_folder=""
+
+volume=""
+declare -a requested_volumes=()
+
+gpg_raw_key="${GPG_PUBLIC_KEY:-}"
+gpg_passphrase="${GPG_PASSPHRASE:-}"
+aws_access_key_id="${AWS_ACCESS_KEY_ID:-}"
+aws_secret_access_key="${AWS_SECRET_ACCESS_KEY:-}"
+aws_session_token="${AWS_SESSION_TOKEN:-}"
+aws_region="${AWS_REGION:-us-east-1}"
+aws_endpoint_url="${AWS_ENDPOINT_URL:-}"
+
+tmp_dir=""
+tmp_backup_path=""
+recipient_fpr=""
+backup_path=""
+s3_url=""
+mc_config_dir=""
+s3_mc_path=""
+directory=""
+filename=""
+
+compressor_cmd=()
+compressor_name="none"
+
+declare -A pid_to_volume=()
+declare -a running_pids=()
+
+failed=0
+wait_supports_p=0
+
+# ------------------------------------------------------------------------------
+# Colors
+# ------------------------------------------------------------------------------
+
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+  readonly COLOR_RESET=$'\033[0m'
+  readonly COLOR_RED=$'\033[0;31m'
+  readonly COLOR_YELLOW=$'\033[0;33m'
+  readonly COLOR_GREEN=$'\033[0;32m'
+else
+  readonly COLOR_RESET=""
+  readonly COLOR_RED=""
+  readonly COLOR_YELLOW=""
+  readonly COLOR_GREEN=""
+fi
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+
+log() {
+  local level="INFO"
+  local color="$COLOR_GREEN"
+
+  case "${1:-}" in
+    ERROR)
+      level="ERROR"
+      color="$COLOR_RED"
+      shift
+      ;;
+    WARN)
+      level="WARN"
+      color="$COLOR_YELLOW"
+      shift
+      ;;
+    INFO)
+      level="INFO"
+      color="$COLOR_GREEN"
+      shift
+      ;;
+  esac
+
+  printf '[%s] %s %b[%s]%b %s\n' \
+    "$SCRIPT_NAME" \
+    "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$color" \
+    "$level" \
+    "$COLOR_RESET" \
+    "$*" >&2
+}
+
+die() {
+  log ERROR "$*"
+  exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Usage:
+  # Backup one volume
+  $SCRIPT_NAME -v <VOLUME_NAME> [options]
+
+  # Backup all mounted volumes
+  $SCRIPT_NAME -a [options]
+
+  # Backup selected volumes in "all" mode
+  $SCRIPT_NAME -a -v <VOLUME_NAME> [-v <VOLUME_NAME> ...] [options]
+
+Options:
+  Modes:
+    -a          Backup all mounted volumes
+    -v <name>   Volume name inside ${VOLUMES_ROOT}
+                Without -a: exactly one -v is required
+                With -a: acts as a filter and may be repeated
+
+  General:
+    -d <dir>    Local backup directory override (default: ${DEFAULT_BACKUP_ROOT})
+    -T <ts>     Backup timestamp override (format: YYYYMMDD_HHMMSS)
+    -j <N>      Number of parallel backups in -a mode (default: 1)
+    -n          Dry-run: validate and print what would be backed up
+    -h          Show help
+
+  Backup options:
+    -c          Compress backup (pigz if available, otherwise gzip)
+    -e          Encrypt backup with public key (asymmetric GPG)
+    -s          Encrypt backup with passphrase (symmetric GPG)
+    -b <bucket> Upload backup to S3 bucket
+    -f <path>   S3 folder/prefix inside bucket
+    -k <file>   Public key filename inside ${GPG_ROOT} (default: public.gpg)
+
+Environment variables:
+  BACKUP_ROOT           Local backup directory (default: /backups)
+  VOLUMES_ROOT          Mounted volumes root (default: /volumes)
+  GPG_ROOT              Mounted GPG directory (default: /gpg)
+  BACKUP_TIMESTAMP      Override backup timestamp (default: current time, format: YYYYMMDD_HHMMSS)
+  GPG_PUBLIC_KEY        Public key content for asymmetric encryption
+  GPG_PASSPHRASE        Passphrase for symmetric encryption
+  AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 upload)
+  AWS_SECRET_ACCESS_KEY S3 secret access key (required for S3 upload)
+  AWS_SESSION_TOKEN     S3 session token for temporary credentials (STS/IAM roles)
+  AWS_REGION            S3 region (default: us-east-1)
+  AWS_ENDPOINT_URL      Optional custom S3 endpoint (Yandex Cloud, MinIO, DO Spaces, etc.)
+  NO_COLOR              Disable colors in logs
+
+Notes:
+  - S3 upload uses the MinIO client (mc). Compatible with AWS S3, MinIO, Yandex Cloud, DO Spaces, and other S3-compatible stores.
+  - Use the same backup timestamp across multiple runs to create one logical snapshot set.
+  - For consistency-sensitive apps (databases), stop writes or use app-aware dumps.
+
+Examples:
+  # One volume
+  $SCRIPT_NAME -v postgres_data
+  $SCRIPT_NAME -v postgres_data -c -s
+  $SCRIPT_NAME -v postgres_data -c -e -k backup-public.asc
+  $SCRIPT_NAME -v postgres_data -c -e -b my-bucket -f daily/app1
+
+  # All volumes
+  $SCRIPT_NAME -a
+  $SCRIPT_NAME -a -c
+  $SCRIPT_NAME -a -c -s
+  $SCRIPT_NAME -a -j 4 -c
+
+  # Selected volumes in all-mode
+  $SCRIPT_NAME -a -v postgres_data -v redis_data -c
+
+  # Shared timestamp
+  $SCRIPT_NAME -a -T 20250411_120000 -c
+  BACKUP_TIMESTAMP=20250411_120000 $SCRIPT_NAME -a -c
+
+  # Dry-run
+  $SCRIPT_NAME -v postgres_data -n
+  $SCRIPT_NAME -a -n
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup
+# ------------------------------------------------------------------------------
+
+cleanup() {
+  if [[ -n "$tmp_backup_path" && -f "$tmp_backup_path" ]]; then
+    rm -f "$tmp_backup_path"
+  fi
+
+  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+    rm -rf "$tmp_dir"
+  fi
+
+  if [[ -n "$mc_config_dir" && -d "$mc_config_dir" ]]; then
+    rm -rf "$mc_config_dir"
+  fi
+}
+
+terminate_children() {
+  local pid
+  for pid in "${!pid_to_volume[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+trap cleanup EXIT
+trap 'log WARN "Interrupted"; terminate_children; wait || true; exit 130' INT
+trap 'log WARN "Terminated"; terminate_children; wait || true; exit 143' TERM
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+validate_volume_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || die \
+    "Volume name must contain only alphanumeric characters, dots, dashes, and underscores"
+}
+
+file_size_human() {
+  local path="$1"
+  du -sh "$path" 2>/dev/null | awk '{print $1}'
+}
+
+build_filename_for_volume() {
+  local vol="$1"
+  local name="${vol}_${backup_timestamp}.tar"
+
+  if (( compress )); then
+    name+=".gz"
+  fi
+
+  if (( symmetric || encrypt )); then
+    name+=".gpg"
+  fi
+
+  printf '%s\n' "$name"
+}
+
+build_destination_for_filename() {
+  local fname="$1"
+
+  if (( upload_to_s3 )); then
+    local folder="${s3_folder#/}"
+    folder="${folder%/}"
+    if [[ -n "$folder" ]]; then
+      printf 's3://%s/%s/%s\n' "$s3_bucket" "$folder" "$fname"
+    else
+      printf 's3://%s/%s\n' "$s3_bucket" "$fname"
+    fi
+  else
+    printf '%s/%s\n' "${backup_root%/}" "$fname"
+  fi
+}
+
+construct_s3_url() {
+  local folder="${s3_folder#/}"
+  folder="${folder%/}"
+
+  local key
+  if [[ -n "$folder" ]]; then
+    key="${folder}/${filename}"
+  else
+    key="${filename}"
+  fi
+
+  s3_url="s3://${s3_bucket}/${key}"
+  s3_mc_path="vb/${s3_bucket}/${key}"
+}
+
+prepare_s3_client() {
+  mc_config_dir="$(mktemp -d)"
+
+  local endpoint
+  if [[ -n "$aws_endpoint_url" ]]; then
+    endpoint="$aws_endpoint_url"
+  else
+    endpoint="https://s3.${aws_region}.amazonaws.com"
+  fi
+
+  local -a session_token_flag=()
+  if [[ -n "$aws_session_token" ]]; then
+    session_token_flag=(--session-token "$aws_session_token")
+  fi
+
+  mc --config-dir "$mc_config_dir" alias set vb \
+    "$endpoint" \
+    "$aws_access_key_id" \
+    "$aws_secret_access_key" \
+    "${session_token_flag[@]}" \
+    >/dev/null 2>&1 \
+    || die "Failed to configure S3 client"
+}
+
+prepare_gpg_home() {
+  tmp_dir="$(mktemp -d)"
+  export GNUPGHOME="${tmp_dir}/gnupg"
+  mkdir -p "$GNUPGHOME"
+  chmod 700 "$GNUPGHOME"
+  printf 'allow-loopback-pinentry\n' > "${GNUPGHOME}/gpg-agent.conf"
+  gpgconf --launch gpg-agent >/dev/null 2>&1 || true
+}
+
+prepare_asymmetric_gpg() {
+  local key_source
+
+  prepare_gpg_home
+
+  if [[ -n "$gpg_raw_key" ]]; then
+    key_source="${tmp_dir}/public.key"
+    printf '%s' "$gpg_raw_key" > "$key_source"
+    chmod 600 "$key_source"
+  else
+    key_source="${GPG_ROOT%/}/${pgp_key}"
+  fi
+
+  [[ -f "$key_source" ]] || die "Public key file not found: $key_source"
+
+  recipient_fpr="$(
+    gpg --batch --with-colons --import-options show-only --import "$key_source" 2>/dev/null \
+      | awk -F: '/^fpr:/ { print $10; exit }'
+  )"
+
+  [[ -n "$recipient_fpr" ]] || die "Unable to extract recipient fingerprint from public key"
+
+  gpg --batch --import "$key_source" >/dev/null 2>&1 || die "Failed to import public key"
+}
+
+prepare_compressor() {
+  if (( compress == 0 )); then
+    compressor_cmd=()
+    compressor_name="none"
+    return 0
+  fi
+
+  if command -v pigz >/dev/null 2>&1; then
+    compressor_cmd=(pigz -c)
+    compressor_name="pigz"
+  elif command -v gzip >/dev/null 2>&1; then
+    compressor_cmd=(gzip -c)
+    compressor_name="gzip"
+    log WARN "pigz not found, falling back to gzip"
+  else
+    die "Compression requested, but neither pigz nor gzip is installed"
+  fi
+}
+
+prepare_gpg_runtime() {
+  if (( symmetric )); then
+    prepare_gpg_home
+  elif (( encrypt )); then
+    prepare_asymmetric_gpg
+  fi
+}
+
+archive_stream() {
+  tar --create --numeric-owner --directory "$directory" --file - .
+}
+
+compress_stream() {
+  if (( compress )); then
+    "${compressor_cmd[@]}"
+  else
+    cat
+  fi
+}
+
+encrypt_stream() {
+  if (( symmetric )); then
+    gpg \
+      --batch \
+      --yes \
+      --no-tty \
+      --pinentry-mode loopback \
+      --passphrase-fd 3 \
+      --symmetric \
+      --cipher-algo AES256 \
+      --s2k-digest-algo SHA512 \
+      --s2k-mode 3 \
+      --compress-algo none \
+      3<<<"$gpg_passphrase"
+  elif (( encrypt )); then
+    gpg \
+      --batch \
+      --yes \
+      --no-tty \
+      --trust-model always \
+      --encrypt \
+      --recipient "$recipient_fpr" \
+      --compress-algo none
+  else
+    cat
+  fi
+}
+
+write_destination() {
+  if (( upload_to_s3 )); then
+    mc --config-dir "$mc_config_dir" pipe "$s3_mc_path"
+  else
+    cat > "$tmp_backup_path"
+  fi
+}
+
+write_checksum() {
+  local target="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$target" > "${target}.sha256"
+    log INFO "Checksum written: ${target}.sha256"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$target" > "${target}.sha256"
+    log INFO "Checksum written: ${target}.sha256"
+  else
+    log WARN "sha256sum/shasum not found, checksum skipped"
+  fi
+}
+
+validate_common_options() {
+  [[ "$backup_timestamp" =~ ^[0-9]{8}_[0-9]{6}$ ]] || die \
+    "Invalid backup timestamp: '$backup_timestamp'. Expected YYYYMMDD_HHMMSS"
+
+  (( symmetric + encrypt <= 1 )) || die "Use either -s or -e, not both"
+
+  if (( symmetric )); then
+    [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
+  fi
+
+  if (( encrypt )); then
+    [[ -n "$gpg_raw_key" || -f "${GPG_ROOT%/}/${pgp_key}" ]] || die \
+      "Either GPG_PUBLIC_KEY env var or ${GPG_ROOT%/}/${pgp_key} must be provided"
+  fi
+
+  if (( upload_to_s3 )); then
+    [[ -n "$s3_bucket" ]] || die "S3 bucket must be provided with -b"
+    [[ -n "$aws_access_key_id" ]] || die "AWS_ACCESS_KEY_ID environment variable is not set"
+    [[ -n "$aws_secret_access_key" ]] || die "AWS_SECRET_ACCESS_KEY environment variable is not set"
+    require_command mc
+    prepare_s3_client
+  else
+    [[ -n "$backup_root" ]] || die "Backup directory is empty"
+  fi
+
+  require_command tar
+
+  if (( symmetric || encrypt )); then
+    require_command gpg
+  fi
+
+  prepare_compressor
+}
+
+validate_single_mode() {
+  directory="${VOLUMES_ROOT%/}/${volume}"
+  [[ -d "$directory" ]] || die "Volume '$volume' is not mounted into ${VOLUMES_ROOT}"
+
+  validate_common_options
+}
+
+collect_selected_volumes_for_all_mode() {
+  declare -ga SELECTED_VOLUMES=()
+
+  if (( ${#requested_volumes[@]} > 0 )); then
+    while IFS= read -r vol; do
+      local dir="${VOLUMES_ROOT%/}/${vol}"
+      [[ -d "$dir" ]] || die "Requested volume is not mounted into ${VOLUMES_ROOT}: $vol"
+      SELECTED_VOLUMES+=("$vol")
+    done < <(printf '%s\n' "${requested_volumes[@]}" | sort -u)
+    return
+  fi
+
+  while IFS= read -r -d '' dir; do
+    local vol
+    vol="$(basename "$dir")"
+
+    if [[ ! "$vol" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+      log WARN "Skipping directory with unsafe volume name: $vol"
+      continue
+    fi
+
+    SELECTED_VOLUMES+=("$vol")
+  done < <(find "$VOLUMES_ROOT" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  (( ${#SELECTED_VOLUMES[@]} > 0 )) || die "No mounted volumes found in ${VOLUMES_ROOT}"
+  mapfile -t SELECTED_VOLUMES < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort -u)
+}
+
+build_child_args() {
+  declare -ga CHILD_ARGS=()
+
+  if (( compress )); then
+    CHILD_ARGS+=(-c)
+  fi
+
+  if (( encrypt )); then
+    CHILD_ARGS+=(-e)
+  fi
+
+  if (( symmetric )); then
+    CHILD_ARGS+=(-s)
+  fi
+
+  if (( upload_to_s3 )); then
+    CHILD_ARGS+=(-b "$s3_bucket")
+    if [[ -n "$s3_folder" ]]; then
+      CHILD_ARGS+=(-f "$s3_folder")
+    fi
+  fi
+
+  if (( encrypt )) && [[ -n "$pgp_key" ]]; then
+    CHILD_ARGS+=(-k "$pgp_key")
+  fi
+}
+
+remove_running_pid() {
+  local pid_to_remove="$1"
+  local pid
+  local new_running=()
+
+  for pid in "${running_pids[@]}"; do
+    if [[ "$pid" != "$pid_to_remove" ]]; then
+      new_running+=("$pid")
+    fi
+  done
+
+  running_pids=("${new_running[@]}")
+}
+
+launch_child_backup() {
+  local vol="$1"
+
+  BACKUP_ROOT="$backup_root" \
+  BACKUP_TIMESTAMP="$backup_timestamp" \
+  bash "$SELF_SCRIPT" -v "$vol" "${CHILD_ARGS[@]}" &
+
+  local pid=$!
+  pid_to_volume["$pid"]="$vol"
+  running_pids+=("$pid")
+
+  log INFO "Launched backup: $vol (pid=$pid)"
+}
+
+reap_one_child() {
+  local pid=""
+  local vol=""
+  local status=0
+
+  if (( wait_supports_p )); then
+    if wait -n -p pid; then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    pid="${running_pids[0]}"
+    if wait "$pid"; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+
+  vol="${pid_to_volume[$pid]:-unknown}"
+  remove_running_pid "$pid"
+  unset 'pid_to_volume[$pid]'
+
+  if (( status == 0 )); then
+    log INFO "Backup completed: $vol"
+  else
+    log ERROR "Backup failed: $vol"
+    failed=1
+  fi
+}
+
+wait_for_all_children() {
+  while (( ${#running_pids[@]} > 0 )); do
+    reap_one_child
+  done
+}
+
+run_single_backup() {
+  validate_single_mode
+
+  filename="$(build_filename_for_volume "$volume")"
+
+  if (( upload_to_s3 )); then
+    construct_s3_url
+  else
+    backup_path="${backup_root%/}/${filename}"
+    tmp_backup_path="${backup_path}.part"
+  fi
+
+  log INFO "Starting backup"
+  log INFO "Volume: $volume"
+  log INFO "Source directory: $directory"
+
+  if (( compress )); then
+    log INFO "Compression: ${compressor_name}"
+  else
+    log INFO "Compression: none"
+  fi
+
+  if (( symmetric )); then
+    log INFO "Encryption: symmetric GPG"
+  elif (( encrypt )); then
+    log INFO "Encryption: asymmetric GPG"
+  else
+    log INFO "Encryption: disabled"
+  fi
+
+  if (( upload_to_s3 )); then
+    log INFO "Destination: $s3_url"
+  else
+    log INFO "Destination: $backup_path"
+  fi
+
+  if (( dry_run )); then
+    if (( upload_to_s3 == 0 )) && [[ -e "$backup_path" ]]; then
+      die "Backup file already exists: $backup_path"
+    fi
+    log INFO "Dry-run: no changes made"
+    return 0
+  fi
+
+  if (( upload_to_s3 == 0 )); then
+    mkdir -p "$backup_root"
+    [[ ! -e "$backup_path" ]] || die "Backup file already exists: $backup_path"
+  fi
+
+  prepare_gpg_runtime
+
+  archive_stream | compress_stream | encrypt_stream | write_destination
+
+  if (( upload_to_s3 )); then
+    log INFO "Backup uploaded successfully: $s3_url"
+  else
+    mv "$tmp_backup_path" "$backup_path"
+    tmp_backup_path=""
+
+    [[ -s "$backup_path" ]] || die "Backup file is empty: $backup_path"
+    write_checksum "$backup_path"
+
+    log INFO "Backup created successfully: $backup_path"
+    log INFO "Backup size: $(file_size_human "$backup_path")"
+  fi
+
+  log INFO "Done"
+}
+
+run_all_backups() {
+  validate_common_options
+  collect_selected_volumes_for_all_mode
+  build_child_args
+
+  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+    wait_supports_p=1
+  fi
+
+  log INFO "Found ${#SELECTED_VOLUMES[@]} volume(s) to back up"
+  log INFO "Backup timestamp: $backup_timestamp"
+  log INFO "Parallel jobs: $jobs"
+
+  while IFS= read -r vol; do
+    local fname
+    local destination
+    fname="$(build_filename_for_volume "$vol")"
+    destination="$(build_destination_for_filename "$fname")"
+    log INFO "  $vol  ->  $destination"
+  done < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort)
+
+  if (( dry_run )); then
+    log INFO "Dry-run mode: validating each volume"
+
+    failed=0
+    while IFS= read -r vol; do
+      log INFO "--- $vol ---"
+      BACKUP_ROOT="$backup_root" \
+      BACKUP_TIMESTAMP="$backup_timestamp" \
+      bash "$SELF_SCRIPT" -v "$vol" -n "${CHILD_ARGS[@]}" || {
+        log ERROR "Validation failed: $vol"
+        failed=1
+      }
+    done < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort)
+
+    (( failed == 0 )) || die "One or more volumes failed validation"
+    log INFO "Dry-run completed successfully"
+    return 0
+  fi
+
+  failed=0
+
+  while IFS= read -r vol; do
+    while (( ${#running_pids[@]} >= jobs )); do
+      reap_one_child
+    done
+
+    launch_child_backup "$vol"
+  done < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort)
+
+  wait_for_all_children
+
+  (( failed == 0 )) || die "One or more backups failed"
+  log INFO "All backups completed successfully"
+}
+
+# ------------------------------------------------------------------------------
+# Parse args
+# ------------------------------------------------------------------------------
+
+while getopts ':ad:T:j:ceshb:f:k:v:n' flag; do
+  case "$flag" in
+    a) all_volumes=1 ;;
+    d) backup_root="$OPTARG" ;;
+    T) backup_timestamp="$OPTARG" ;;
+    j) jobs="$OPTARG" ;;
+    c) compress=1 ;;
+    e) encrypt=1 ;;
+    s) symmetric=1 ;;
+    b)
+      upload_to_s3=1
+      s3_bucket="$OPTARG"
+      ;;
+    f) s3_folder="$OPTARG" ;;
+    k) pgp_key="$OPTARG" ;;
+    v)
+      validate_volume_name "$OPTARG"
+      requested_volumes+=("$OPTARG")
+      ;;
+    n) dry_run=1 ;;
+    h)
+      usage
+      exit 0
+      ;;
+    :)
+      die "Option -$OPTARG requires an argument"
+      ;;
+    \?)
+      die "Unsupported flag: -$OPTARG"
+      ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+[[ $# -eq 0 ]] || die "Unexpected extra arguments: $*"
+
+# ------------------------------------------------------------------------------
+# Mode selection
+# ------------------------------------------------------------------------------
+
+[[ -d "$VOLUMES_ROOT" ]] || die "Volumes root not found: $VOLUMES_ROOT"
+
+if (( all_volumes )); then
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "Invalid -j value: '$jobs'. Expected positive integer"
+else
+  (( jobs == 1 )) || die "Option -j can only be used with -a"
+  (( ${#requested_volumes[@]} == 1 )) || die \
+    "Use exactly one -v <VOLUME_NAME> for single backup, or use -a for multi-volume backup"
+  volume="${requested_volumes[0]}"
+fi
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+if (( all_volumes )); then
+  run_all_backups
+else
+  run_single_backup
+fi

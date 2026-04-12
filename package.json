@@ -1,7 +1,23 @@
 {
-  "name": "docker-ghcr-template",
+  "name": "@vansergen/vb",
+  "description": "Docker Volume Backup",
   "version": "1.0.0",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vansergen/vb.git"
+  },
+  "keywords": [
+    "podman",
+    "docker",
+    "volume",
+    "backup",
+    "restore"
+  ],
+  "bugs": {
+    "url": "https://github.com/vansergen/vb/issues"
+  },
+  "homepage": "https://github.com/vansergen/vb#readme",
   "scripts": {
     "commitlint": "commitlint --verbose --from=$( git rev-list --max-parents=0 $( git rev-parse --abbrev-ref HEAD ) )",
     "install:clean": "npm install",
@@ -13,9 +29,9 @@
   "license": "AGPL-3.0-only",
   "devDependencies": {
     "@binden/commitlint-config": "^2.1.0",
-    "@binden/semantic-release-config": "^3.0.0",
+    "@binden/semantic-release-config": "^3.0.2",
     "husky": "^9.1.7",
-    "lint-staged": "^15.5.1",
-    "prettier": "^3.5.3"
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.2"
   }
 }
