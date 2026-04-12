@@ -29,7 +29,7 @@
   "license": "AGPL-3.0-only",
   "devDependencies": {
     "@binden/commitlint-config": "^2.1.0",
-    "@binden/semantic-release-config": "^3.0.2",
+    "@binden/semantic-release-config": "^3.0.4",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
     "prettier": "^3.8.2"
