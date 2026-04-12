@@ -1,0 +1,47 @@
+x-test-env: &test-env
+  BACKUP_BIN: /usr/local/bin/backup
+  RESTORE_BIN: /usr/local/bin/restore
+  AWS_ACCESS_KEY_ID: minio_root_user
+  AWS_SECRET_ACCESS_KEY: minio_root_password
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://minio:9000
+  TEST_S3_BUCKET: vb-test
+  TEST_S3_PREFIX: docker-volume-tests
+
+x-minio-env: &minio-env
+  MINIO_ROOT_USER: minio_root_user
+  MINIO_ROOT_PASSWORD: minio_root_password
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment: *minio-env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  test:
+    build: .
+    entrypoint: []
+    command:
+      - bash
+      - -ec
+      - |
+        # Keep bootstrap values literal here because Docker Compose may interpolate
+        # variable-like syntax in command strings before container environment is applied.
+        mc alias set local http://minio:9000 minio_root_user minio_root_password >/dev/null
+        mc ready local >/dev/null
+        mc mb --ignore-existing "local/vb-test" >/dev/null
+
+        exec bash /usr/local/bin/vb-test
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment: *test-env
+    develop:
+      watch:
+        - action: rebuild
+          path: ./bin

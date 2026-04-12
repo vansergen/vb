@@ -1,0 +1,813 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKUP_BIN="${BACKUP_BIN:-$SCRIPT_DIR/backup}"
+RESTORE_BIN="${RESTORE_BIN:-$SCRIPT_DIR/restore}"
+
+readonly SKIP_RC=200
+
+TEST_ROOT="$(mktemp -d)"
+CURRENT_CASE=""
+CASE_ROOT=""
+TEST_BACKUP_ROOT=""
+TEST_VOLUMES_ROOT=""
+TEST_GPG_ROOT=""
+
+TESTS_TOTAL=0
+TESTS_PASSED=0
+TESTS_FAILED=0
+TESTS_SKIPPED=0
+
+# Optional S3 integration test:
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   AWS_SESSION_TOKEN   (optional)
+#   AWS_REGION          (optional, default us-east-1)
+#   AWS_ENDPOINT_URL    (optional)
+#   TEST_S3_BUCKET      (required for S3 tests)
+#   TEST_S3_PREFIX      (optional)
+
+# ------------------------------------------------------------------------------
+# Logging helpers
+# ------------------------------------------------------------------------------
+
+log() {
+  printf '[test] %s\n' "$*" >&2
+}
+
+pass() {
+  printf '[PASS] %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[FAIL] %s\n' "$*" >&2
+}
+
+skip() {
+  printf '[SKIP] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[FATAL] %s\n' "$*" >&2
+  exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup
+# ------------------------------------------------------------------------------
+
+cleanup() {
+  rm -rf "$TEST_ROOT"
+}
+
+trap cleanup EXIT
+
+# ------------------------------------------------------------------------------
+# Assertions
+# ------------------------------------------------------------------------------
+
+assert_file_exists() {
+  local path="$1"
+  [[ -f "$path" ]] || {
+    log "Expected file to exist: $path"
+    return 1
+  }
+}
+
+assert_file_not_exists() {
+  local path="$1"
+  [[ ! -e "$path" ]] || {
+    log "Expected path NOT to exist: $path"
+    return 1
+  }
+}
+
+assert_dir_exists() {
+  local path="$1"
+  [[ -d "$path" ]] || {
+    log "Expected directory to exist: $path"
+    return 1
+  }
+}
+
+assert_dirs_equal() {
+  local left="$1"
+  local right="$2"
+
+  diff -ruN "$left" "$right" >/dev/null 2>&1 || {
+    log "Directories differ:"
+    log "  left:  $left"
+    log "  right: $right"
+    diff -ruN "$left" "$right" >&2 || true
+    return 1
+  }
+}
+
+assert_text_file_contains() {
+  local path="$1"
+  local expected="$2"
+
+  grep -Fqx "$expected" "$path" || {
+    log "Expected file '$path' to contain exact line: $expected"
+    return 1
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Command helpers
+# ------------------------------------------------------------------------------
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+run_backup() {
+  env \
+    NO_COLOR=1 \
+    BACKUP_ROOT="$TEST_BACKUP_ROOT" \
+    VOLUMES_ROOT="$TEST_VOLUMES_ROOT" \
+    GPG_ROOT="$TEST_GPG_ROOT" \
+    bash "$BACKUP_BIN" "$@"
+}
+
+run_backup_with_env() {
+  local -a env_args=()
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == -- ]]; then
+      shift
+      break
+    fi
+    env_args+=("$1")
+    shift
+  done
+
+  env \
+    NO_COLOR=1 \
+    BACKUP_ROOT="$TEST_BACKUP_ROOT" \
+    VOLUMES_ROOT="$TEST_VOLUMES_ROOT" \
+    GPG_ROOT="$TEST_GPG_ROOT" \
+    "${env_args[@]}" \
+    bash "$BACKUP_BIN" "$@"
+}
+
+run_restore() {
+  env \
+    NO_COLOR=1 \
+    BACKUP_ROOT="$TEST_BACKUP_ROOT" \
+    VOLUMES_ROOT="$TEST_VOLUMES_ROOT" \
+    GPG_ROOT="$TEST_GPG_ROOT" \
+    bash "$RESTORE_BIN" "$@"
+}
+
+run_restore_with_env() {
+  local -a env_args=()
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == -- ]]; then
+      shift
+      break
+    fi
+    env_args+=("$1")
+    shift
+  done
+
+  env \
+    NO_COLOR=1 \
+    BACKUP_ROOT="$TEST_BACKUP_ROOT" \
+    VOLUMES_ROOT="$TEST_VOLUMES_ROOT" \
+    GPG_ROOT="$TEST_GPG_ROOT" \
+    "${env_args[@]}" \
+    bash "$RESTORE_BIN" "$@"
+}
+
+# ------------------------------------------------------------------------------
+# Test workspace helpers
+# ------------------------------------------------------------------------------
+
+setup_case() {
+  local name="$1"
+
+  CURRENT_CASE="$name"
+  CASE_ROOT="$TEST_ROOT/$name"
+  TEST_BACKUP_ROOT="$CASE_ROOT/backups"
+  TEST_VOLUMES_ROOT="$CASE_ROOT/volumes"
+  TEST_GPG_ROOT="$CASE_ROOT/gpg"
+
+  mkdir -p "$TEST_BACKUP_ROOT" "$TEST_VOLUMES_ROOT" "$TEST_GPG_ROOT"
+
+  unset GPG_PUBLIC_KEY
+  unset GPG_PRIVATE_KEY
+  unset GPG_PASSPHRASE
+}
+
+make_volume_content() {
+  local vol="$1"
+  local root="$TEST_VOLUMES_ROOT/$vol"
+
+  mkdir -p "$root/subdir" "$root/config"
+
+  printf 'hello from %s\n' "$vol" > "$root/hello.txt"
+  printf 'nested file for %s\n' "$vol" > "$root/subdir/nested.txt"
+  printf '{"volume":"%s","ok":true}\n' "$vol" > "$root/config/app.json"
+
+  # small binary-ish content
+  dd if=/dev/zero of="$root/subdir/blob.bin" bs=64 count=1 >/dev/null 2>&1
+  printf 'tail-%s\n' "$vol" >> "$root/subdir/blob.bin"
+}
+
+copy_volume_snapshot() {
+  local vol="$1"
+  local dst="$2"
+
+  mkdir -p "$dst"
+  cp -a "$TEST_VOLUMES_ROOT/$vol/." "$dst/"
+}
+
+clear_volume_dir() {
+  local vol="$1"
+  rm -rf "$TEST_VOLUMES_ROOT/$vol"
+  mkdir -p "$TEST_VOLUMES_ROOT/$vol"
+}
+
+replace_volume_with_marker() {
+  local vol="$1"
+  local marker="$2"
+
+  rm -rf "$TEST_VOLUMES_ROOT/$vol"
+  mkdir -p "$TEST_VOLUMES_ROOT/$vol"
+  printf '%s\n' "$marker" > "$TEST_VOLUMES_ROOT/$vol/marker.txt"
+}
+
+# ------------------------------------------------------------------------------
+# GPG helpers
+# ------------------------------------------------------------------------------
+
+generate_gpg_keypair_files() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+
+  local keyhome="$CASE_ROOT/keygen-gnupg"
+  mkdir -p "$keyhome"
+  chmod 700 "$keyhome"
+  printf 'allow-loopback-pinentry\n' > "$keyhome/gpg-agent.conf"
+
+  GNUPGHOME="$keyhome" gpgconf --launch gpg-agent >/dev/null 2>&1 || true
+
+  cat > "$CASE_ROOT/gpg-batch.conf" <<'EOF'
+%no-protection
+%transient-key
+Key-Type: RSA
+Key-Length: 2048
+Subkey-Type: RSA
+Subkey-Length: 2048
+Name-Real: Backup Test
+Name-Email: backup-test@example.invalid
+Expire-Date: 0
+%commit
+EOF
+
+  GNUPGHOME="$keyhome" gpg --batch --gen-key "$CASE_ROOT/gpg-batch.conf" >/dev/null 2>&1 || {
+    log "Failed to generate test GPG keypair"
+    GNUPGHOME="$keyhome" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+    return 1
+  }
+
+  GNUPGHOME="$keyhome" gpg --armor --export > "$TEST_GPG_ROOT/public.asc" || return 1
+  GNUPGHOME="$keyhome" gpg --armor --export-secret-keys > "$TEST_GPG_ROOT/private.asc" || return 1
+
+  GNUPGHOME="$keyhome" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------------------
+# Optional S3 helpers
+# ------------------------------------------------------------------------------
+
+s3_tests_enabled() {
+  [[ -n "${TEST_S3_BUCKET:-}" ]] || return 1
+  [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] || return 1
+  [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] || return 1
+  command -v mc >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Test functions
+# ------------------------------------------------------------------------------
+
+test_single_backup_restore_plain() {
+  setup_case "single_backup_restore_plain"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_010101"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+  local checksum="${archive}.sha256"
+
+  run_backup -v alpha -T "$ts" || return 1
+  assert_file_exists "$archive" || return 1
+  assert_file_exists "$checksum" || return 1
+
+  run_restore -i "$archive" -t alpha_restore || return 1
+  assert_dir_exists "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_single_backup_restore_compressed() {
+  setup_case "single_backup_restore_compressed"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_010102"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz"
+
+  run_backup -v alpha -T "$ts" -c || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_single_backup_restore_symmetric() {
+  setup_case "single_backup_restore_symmetric"
+
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_010103"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz.gpg"
+
+  export GPG_PASSPHRASE="test-symmetric-passphrase"
+
+  run_backup -v alpha -T "$ts" -c -s || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t alpha_restore -s || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_single_backup_restore_asymmetric() {
+  setup_case "single_backup_restore_asymmetric"
+
+  generate_gpg_keypair_files || return $?
+
+  make_volume_content "alpha"
+
+  local ts="20250101_010104"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz.gpg"
+
+  run_backup -v alpha -T "$ts" -c -e -k public.asc || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t alpha_restore -k private.asc || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_all_mode_with_filters_and_parallel() {
+  setup_case "all_mode_with_filters_and_parallel"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  make_volume_content "gamma"
+
+  mkdir -p "$CASE_ROOT/expected-alpha" "$CASE_ROOT/expected-beta"
+  copy_volume_snapshot "alpha" "$CASE_ROOT/expected-alpha"
+  copy_volume_snapshot "beta" "$CASE_ROOT/expected-beta"
+
+  local ts="20250101_020000"
+
+  run_backup -a -v alpha -v beta -T "$ts" -c -j 2 || return 1
+
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/beta_${ts}.tar.gz" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/gamma_${ts}.tar.gz" || return 1
+
+  replace_volume_with_marker "alpha" "alpha-mutated"
+  replace_volume_with_marker "beta" "beta-mutated"
+  replace_volume_with_marker "gamma" "gamma-must-stay-untouched"
+
+  run_restore -a -v alpha -v beta -T "$ts" -j 2 -C || return 1
+
+  assert_dirs_equal "$CASE_ROOT/expected-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_dirs_equal "$CASE_ROOT/expected-beta" "$TEST_VOLUMES_ROOT/beta" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/gamma/marker.txt" "gamma-must-stay-untouched" || return 1
+}
+
+test_backup_single_dry_run_creates_nothing() {
+  setup_case "backup_single_dry_run_creates_nothing"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_030001"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz"
+
+  run_backup -v alpha -T "$ts" -c -n || return 1
+  assert_file_not_exists "$archive" || return 1
+}
+
+test_backup_all_dry_run_creates_nothing() {
+  setup_case "backup_all_dry_run_creates_nothing"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_030002"
+
+  run_backup -a -T "$ts" -c -n || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/beta_${ts}.tar.gz" || return 1
+}
+
+test_restore_single_dry_run_changes_nothing() {
+  setup_case "restore_single_dry_run_changes_nothing"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_030003"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+
+  run_backup -v alpha -T "$ts" || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t alpha_restore -n || return 1
+  [[ ! -d "$TEST_VOLUMES_ROOT/alpha_restore" ]] || {
+    log "restore dry-run created target directory unexpectedly"
+    return 1
+  }
+}
+
+test_restore_fails_on_non_empty_without_clear_flag() {
+  setup_case "restore_fails_on_non_empty_without_clear_flag"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_050001"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+
+  run_backup -v alpha -T "$ts" || return 1
+
+  # Put something in the target to make it non-empty
+  mkdir -p "$TEST_VOLUMES_ROOT/alpha_restore"
+  printf 'existing content\n' > "$TEST_VOLUMES_ROOT/alpha_restore/existing.txt"
+
+  set +e
+  run_restore -i "$archive" -t alpha_restore
+  local rc=$?
+  set -e
+
+  (( rc != 0 )) || {
+    log "Expected restore to fail on non-empty volume without -C, but it succeeded"
+    return 1
+  }
+}
+
+test_backup_fails_on_duplicate_timestamp() {
+  setup_case "backup_fails_on_duplicate_timestamp"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_050002"
+
+  run_backup -v alpha -T "$ts" || return 1
+
+  set +e
+  run_backup -v alpha -T "$ts"
+  local rc=$?
+  set -e
+
+  (( rc != 0 )) || {
+    log "Expected second backup with same timestamp to fail, but it succeeded"
+    return 1
+  }
+}
+
+test_restore_all_no_timestamp_picks_latest() {
+  setup_case "restore_all_no_timestamp_picks_latest"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts_old="20250101_060001"
+  local ts_new="20250101_060002"
+
+  # Backup at older timestamp
+  run_backup -v alpha -T "$ts_old" -c || return 1
+  run_backup -v beta  -T "$ts_old" -c || return 1
+
+  # Modify volumes and backup at newer timestamp
+  printf 'newer-alpha\n' > "$TEST_VOLUMES_ROOT/alpha/newer.txt"
+  printf 'newer-beta\n'  > "$TEST_VOLUMES_ROOT/beta/newer.txt"
+
+  run_backup -v alpha -T "$ts_new" -c || return 1
+  run_backup -v beta  -T "$ts_new" -c || return 1
+
+  local snapshot_alpha="$CASE_ROOT/expected-alpha"
+  local snapshot_beta="$CASE_ROOT/expected-beta"
+  copy_volume_snapshot "alpha" "$snapshot_alpha"
+  copy_volume_snapshot "beta"  "$snapshot_beta"
+
+  replace_volume_with_marker "alpha" "alpha-mutated"
+  replace_volume_with_marker "beta"  "beta-mutated"
+
+  # No -T: should pick ts_new (latest) for both, restoring the newer content
+  run_restore -a -C || return 1
+
+  assert_dirs_equal "$snapshot_alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_dirs_equal "$snapshot_beta"  "$TEST_VOLUMES_ROOT/beta"  || return 1
+}
+
+test_restore_all_dry_run_changes_nothing() {
+  setup_case "restore_all_dry_run_changes_nothing"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_070001"
+  run_backup -a -T "$ts" -c || return 1
+
+  replace_volume_with_marker "alpha" "alpha-marker"
+  replace_volume_with_marker "beta"  "beta-marker"
+
+  run_restore -a -T "$ts" -C -n || return 1
+
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "alpha-marker" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt"  "beta-marker"  || return 1
+}
+
+test_restore_single_source_filename_only() {
+  setup_case "restore_single_source_filename_only"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_080001"
+  local filename="alpha_${ts}.tar.gz"
+
+  run_backup -v alpha -T "$ts" -c || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/$filename" || return 1
+
+  # Pass only the filename, not the full path — restore should find it in BACKUP_ROOT
+  run_restore -i "$filename" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_backup_root_override() {
+  setup_case "backup_root_override"
+
+  make_volume_content "alpha"
+
+  local custom_backup_root="$CASE_ROOT/custom-backups"
+  local ts="20250101_090001"
+  local archive="$custom_backup_root/alpha_${ts}.tar.gz"
+
+  run_backup -v alpha -T "$ts" -c -d "$custom_backup_root" || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_backup_restore_asymmetric_env_keys() {
+  setup_case "backup_restore_asymmetric_env_keys"
+
+  generate_gpg_keypair_files || return $?
+  make_volume_content "alpha"
+
+  local ts="20250101_090002"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz.gpg"
+  local public_key
+  local private_key
+
+  public_key="$(cat "$TEST_GPG_ROOT/public.asc")"
+  private_key="$(cat "$TEST_GPG_ROOT/private.asc")"
+  rm -f "$TEST_GPG_ROOT/public.asc" "$TEST_GPG_ROOT/private.asc"
+
+  run_backup_with_env GPG_PUBLIC_KEY="$public_key" -- -v alpha -T "$ts" -c -e || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore_with_env GPG_PRIVATE_KEY="$private_key" -- -i "$archive" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_single_backup_restore_tar_gpg() {
+  setup_case "single_backup_restore_tar_gpg"
+
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_090003"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gpg"
+
+  export GPG_PASSPHRASE="test-tar-gpg-passphrase"
+
+  run_backup -v alpha -T "$ts" -s || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t alpha_restore -s || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_volume_names_with_dots_and_dashes() {
+  setup_case "volume_names_with_dots_and_dashes"
+
+  local volume_name="alpha.beta-gamma"
+  local ts="20250101_090004"
+  local archive="$TEST_BACKUP_ROOT/${volume_name}_${ts}.tar.gz"
+
+  make_volume_content "$volume_name"
+
+  run_backup -v "$volume_name" -T "$ts" -c || return 1
+  assert_file_exists "$archive" || return 1
+
+  run_restore -i "$archive" -t "$volume_name-restore" || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/$volume_name" "$TEST_VOLUMES_ROOT/$volume_name-restore" || return 1
+}
+
+test_backup_timestamp_env_var() {
+  setup_case "backup_timestamp_env_var"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_090005"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz"
+
+  run_backup_with_env BACKUP_TIMESTAMP="$ts" -- -v alpha -c || return 1
+  assert_file_exists "$archive" || return 1
+}
+
+test_invalid_flags_and_missing_args() {
+  setup_case "invalid_flags_and_missing_args"
+
+  make_volume_content "alpha"
+
+  set +e
+  run_backup -z >/dev/null 2>&1
+  local backup_invalid_flag_rc=$?
+  run_backup -v >/dev/null 2>&1
+  local backup_missing_arg_rc=$?
+  run_restore -z >/dev/null 2>&1
+  local restore_invalid_flag_rc=$?
+  run_restore -i "$TEST_BACKUP_ROOT/missing.tar" >/dev/null 2>&1
+  local restore_missing_arg_rc=$?
+  set -e
+
+  (( backup_invalid_flag_rc != 0 )) || return 1
+  (( backup_missing_arg_rc != 0 )) || return 1
+  (( restore_invalid_flag_rc != 0 )) || return 1
+  (( restore_missing_arg_rc != 0 )) || return 1
+}
+
+test_s3_roundtrip_optional() {
+  s3_tests_enabled || return "$SKIP_RC"
+
+  setup_case "s3_roundtrip_optional"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_040000"
+  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
+  base_prefix="${base_prefix#/}"
+  base_prefix="${base_prefix%/}"
+
+  local suffix="$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+  local prefix="$suffix"
+  if [[ -n "$base_prefix" ]]; then
+    prefix="${base_prefix}/${suffix}"
+  fi
+
+  local key="alpha_${ts}.tar.gz"
+  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+
+  run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  run_restore -i "$s3_uri" -t alpha_restore -C || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_roundtrip_encrypted_optional() {
+  s3_tests_enabled || return "$SKIP_RC"
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+
+  setup_case "s3_roundtrip_encrypted_optional"
+
+  make_volume_content "alpha"
+  export GPG_PASSPHRASE="test-s3-encrypted-passphrase"
+
+  local ts="20250101_090006"
+  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
+  base_prefix="${base_prefix#/}"
+  base_prefix="${base_prefix%/}"
+
+  local suffix="enc-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+  local prefix="$suffix"
+  if [[ -n "$base_prefix" ]]; then
+    prefix="${base_prefix}/${suffix}"
+  fi
+
+  local key="alpha_${ts}.tar.gz.gpg"
+  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+
+  run_backup -v alpha -T "$ts" -c -s -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  run_restore -i "$s3_uri" -t alpha_restore -s -C || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+# ------------------------------------------------------------------------------
+# Test runner
+# ------------------------------------------------------------------------------
+
+run_test() {
+  local name="$1"
+  shift
+
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+  set +e
+  "$@"
+  local rc=$?
+  set -e
+
+  case "$rc" in
+    0)
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      pass "$name"
+      ;;
+    "$SKIP_RC")
+      TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+      skip "$name"
+      ;;
+    *)
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      fail "$name"
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# Preflight
+# ------------------------------------------------------------------------------
+
+[[ -f "$BACKUP_BIN" ]] || die "Backup script not found: $BACKUP_BIN"
+[[ -f "$RESTORE_BIN" ]] || die "Restore script not found: $RESTORE_BIN"
+
+require_command bash
+require_command tar
+require_command find
+require_command diff
+
+if ! command -v gzip >/dev/null 2>&1 && ! command -v pigz >/dev/null 2>&1; then
+  die "Neither gzip nor pigz found; compressed tests cannot run"
+fi
+
+log "Using backup script:  $BACKUP_BIN"
+log "Using restore script: $RESTORE_BIN"
+log "Test root: $TEST_ROOT"
+
+# ------------------------------------------------------------------------------
+# Execute tests
+# ------------------------------------------------------------------------------
+
+run_test "single backup/restore plain"              test_single_backup_restore_plain
+run_test "single backup/restore compressed"         test_single_backup_restore_compressed
+run_test "single backup/restore symmetric"          test_single_backup_restore_symmetric
+run_test "single backup/restore asymmetric"         test_single_backup_restore_asymmetric
+run_test "all-mode filters + parallel"              test_all_mode_with_filters_and_parallel
+run_test "backup single dry-run"                    test_backup_single_dry_run_creates_nothing
+run_test "backup all dry-run"                       test_backup_all_dry_run_creates_nothing
+run_test "restore single dry-run"                   test_restore_single_dry_run_changes_nothing
+run_test "restore fails without -C on non-empty"    test_restore_fails_on_non_empty_without_clear_flag
+run_test "backup fails on duplicate timestamp"      test_backup_fails_on_duplicate_timestamp
+run_test "restore all: picks latest without -T"     test_restore_all_no_timestamp_picks_latest
+run_test "restore all dry-run"                      test_restore_all_dry_run_changes_nothing
+run_test "restore single: filename-only source"     test_restore_single_source_filename_only
+run_test "backup root override (-d)"                test_backup_root_override
+run_test "asymmetric GPG via env vars"              test_backup_restore_asymmetric_env_keys
+run_test "single backup/restore .tar.gpg"           test_single_backup_restore_tar_gpg
+run_test "volume names with dots and dashes"        test_volume_names_with_dots_and_dashes
+run_test "BACKUP_TIMESTAMP via env var"             test_backup_timestamp_env_var
+run_test "invalid flags and missing args"           test_invalid_flags_and_missing_args
+run_test "s3 roundtrip (optional)"                  test_s3_roundtrip_optional
+run_test "s3 roundtrip encrypted (optional)"        test_s3_roundtrip_encrypted_optional
+
+# ------------------------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------------------------
+
+printf '\n' >&2
+printf 'Tests total : %d\n' "$TESTS_TOTAL" >&2
+printf 'Passed      : %d\n' "$TESTS_PASSED" >&2
+printf 'Skipped     : %d\n' "$TESTS_SKIPPED" >&2
+printf 'Failed      : %d\n' "$TESTS_FAILED" >&2
+
+if (( TESTS_FAILED > 0 )); then
+  exit 1
+fi
+
+exit 0
