@@ -1,5 +1,11 @@
 # Changelog
 
+## <small>1.0.1 (2026-04-13)</small>
+
+- fix: dummy commit to trigger a release ([537d296](https://github.com/vansergen/vb/commit/537d296))
+- Merge pull request #10 from vansergen/dependabot/github_actions/actions/upload-artifact-7 ([7783373](https://github.com/vansergen/vb/commit/7783373)), closes [#10](https://github.com/vansergen/vb/issues/10)
+- ci: bump actions/upload-artifact from 6 to 7 ([8cefc3d](https://github.com/vansergen/vb/commit/8cefc3d))
+
 ## 1.0.0 (2026-04-12)
 
 - devDependencies: update semantic-release ([c881f89](https://github.com/vansergen/vb/commit/c881f89))
