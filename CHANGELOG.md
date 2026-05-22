@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0](https://github.com/vansergen/vb/compare/v1.0.1...v1.1.0) (2026-05-22)
+
+### Features
+
+- harden backup/restore reliability and metadata handling ([14d6ca6](https://github.com/vansergen/vb/commit/14d6ca66797d1aeec19b37e52a1a6b24540be15c))
+
 ## <small>1.0.1 (2026-04-13)</small>
 
 - fix: dummy commit to trigger a release ([537d296](https://github.com/vansergen/vb/commit/537d296))
