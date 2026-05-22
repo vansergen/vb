@@ -49,6 +49,8 @@ filename=""
 compressor_cmd=()
 compressor_name="none"
 
+tar_extra_flags=()
+
 declare -A pid_to_volume=()
 declare -a running_pids=()
 
@@ -367,6 +369,12 @@ prepare_compressor() {
   fi
 }
 
+prepare_tar_flags() {
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    tar_extra_flags=(--acls --xattrs '--xattrs-include=*' --sparse)
+  fi
+}
+
 prepare_gpg_runtime() {
   if (( symmetric )); then
     prepare_gpg_home
@@ -376,7 +384,7 @@ prepare_gpg_runtime() {
 }
 
 archive_stream() {
-  tar --create --numeric-owner --directory "$directory" --file - .
+  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" .
 }
 
 compress_stream() {
@@ -416,11 +424,7 @@ encrypt_stream() {
 }
 
 write_destination() {
-  if (( upload_to_s3 )); then
-    mc --config-dir "$mc_config_dir" pipe "$s3_mc_path"
-  else
-    cat > "$tmp_backup_path"
-  fi
+  cat > "$tmp_backup_path"
 }
 
 write_checksum() {
@@ -469,6 +473,7 @@ validate_common_options() {
   fi
 
   prepare_compressor
+  prepare_tar_flags
 }
 
 validate_single_mode() {
@@ -650,11 +655,22 @@ run_single_backup() {
 
   prepare_gpg_runtime
 
-  archive_stream | compress_stream | encrypt_stream | write_destination
-
   if (( upload_to_s3 )); then
+    [[ -n "$tmp_dir" ]] || tmp_dir="$(mktemp -d)"
+    local sha_file="${tmp_dir}/backup.sha"
+    archive_stream | compress_stream | encrypt_stream \
+      | tee >(sha256sum > "$sha_file") \
+      | mc --config-dir "$mc_config_dir" pipe "$s3_mc_path"
+    wait
+    local checksum
+    checksum="$(awk '{print $1}' "$sha_file")"
+    [[ -n "$checksum" ]] || die "Failed to compute backup checksum"
+    printf '%s  %s\n' "$checksum" "$filename" \
+      | mc --config-dir "$mc_config_dir" pipe "${s3_mc_path}.sha256"
+    log INFO "Checksum uploaded: ${s3_url}.sha256"
     log INFO "Backup uploaded successfully: $s3_url"
   else
+    archive_stream | compress_stream | encrypt_stream | write_destination
     mv "$tmp_backup_path" "$backup_path"
     tmp_backup_path=""
 

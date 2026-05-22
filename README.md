@@ -37,6 +37,8 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Encrypt with GPG (symmetric passphrase or asymmetric public key)
 - Run backups for multiple volumes in parallel
 - Assign a shared timestamp to a group of backups
+- Write a SHA256 checksum alongside every archive (local and S3)
+- Preserve sparse files, POSIX ACLs, and extended attributes when GNU `tar` is available
 
 **Restore:**
 
@@ -46,6 +48,8 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Filter by a specific timestamp
 - Clear a volume before restoring (`-C`)
 - Run restores for multiple volumes in parallel
+- Verify the archive against its SHA256 checksum automatically (local and S3) when one is present
+- Atomic extraction: the archive is staged inside the target volume and only swapped in after a successful and verified extract
 
 ---
 
@@ -66,15 +70,17 @@ The filename is generated automatically:
 <VOLUME>_<YYYYMMDD_HHMMSS>.tar.gz.gpg
 ```
 
-For local backups, a `.sha256` checksum file is written alongside each archive.
+A `.sha256` checksum file is written alongside each archive — for both local backups and uploads to S3.
 
 ### Restore
 
 ```
-local file or S3 → [GPG decryption] → [gzip decompression] → Docker volume
+local file or S3 → [SHA256 verification] → [GPG decryption] → [gzip decompression] → Docker volume
 ```
 
 The format is detected automatically from the file extension.
+
+If a `.sha256` companion file is present, the archive is verified against it. A mismatch aborts the restore and leaves the target volume untouched.
 
 ---
 
@@ -294,7 +300,7 @@ Runs up to 3 backups concurrently.
 | `-n`          | Dry run: validate and print what would be done without restoring        |
 | `-h`          | Show help                                                               |
 
-> **Note on `-C`:** Without `-C`, restore will fail if the target volume is not empty. This protects against accidental data loss.
+> **Note on `-C`:** Without `-C`, restore will fail if the target volume is not empty. This protects against accidental data loss. Restore with `-C` is safe against extraction failures: the archive is fully extracted into a staging directory inside the target volume before any existing data is touched, so a failure during the operation (network drop, disk error, wrong passphrase, checksum mismatch) leaves the original data intact.
 
 ### Specifying the source (`-i`)
 
@@ -762,6 +768,10 @@ Add to `crontab -e`:
 
 ## Production Recommendations
 
+### Supported platforms
+
+The published image supports `linux/amd64`, `linux/arm64/v8`, and `linux/ppc64le`. 32-bit ARM platforms (`linux/arm/v6`, `linux/arm/v7`, e.g. Raspberry Pi Zero / 1 / 2 / 3 running a 32-bit OS) are no longer published, because the MinIO client (`mc`) bundled in the image no longer ships 32-bit ARM builds. Use a 64-bit OS on supported ARM boards.
+
 ### Stop stateful services before restore
 
 Before restoring data for databases or other stateful services, stop their containers first:
@@ -858,6 +868,10 @@ This is a warning, not an error: backups for different volumes have different ti
 ### GPG errors inside the container
 
 The scripts create a temporary `GNUPGHOME` with correct permissions automatically. If GPG still fails, pull the latest image: `docker pull ghcr.io/vansergen/vb`.
+
+### Unexpected `.restore-in-progress.*` directories
+
+At the start of each restore, any `.restore-in-progress.*` directories left behind by a previously interrupted restore are automatically removed from the target volume. Do not use this prefix for your own data inside a volume.
 
 ---
 

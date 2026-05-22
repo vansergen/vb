@@ -37,6 +37,9 @@ src_path=""
 source_name=""
 target_dir=""
 tmp_dir=""
+tmp_restore_dir=""
+s3_expected_checksum=""
+s3_sha_file=""
 mc_config_dir=""
 s3_mc_path=""
 
@@ -54,6 +57,8 @@ aws_endpoint_url="${AWS_ENDPOINT_URL:-}"
 
 decompressor_cmd=()
 decompressor_name="none"
+
+tar_extra_flags=()
 
 failed=0
 wait_supports_p=0
@@ -205,6 +210,10 @@ EOF
 # ------------------------------------------------------------------------------
 
 cleanup() {
+  if [[ -n "$tmp_restore_dir" && -d "$tmp_restore_dir" ]]; then
+    rm -rf "$tmp_restore_dir"
+  fi
+
   if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
     rm -rf "$tmp_dir"
   fi
@@ -244,7 +253,7 @@ validate_volume_name() {
 dir_has_entries() {
   local dir="$1"
   [[ -d "$dir" ]] || return 1
-  [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+  [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 ! -name '.restore-in-progress.*' -print -quit 2>/dev/null)" ]]
 }
 
 resolve_source() {
@@ -321,6 +330,12 @@ prepare_s3_client() {
     || die "Failed to configure S3 client"
 }
 
+prepare_tar_flags() {
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    tar_extra_flags=(--acls --xattrs '--xattrs-include=*' --sparse)
+  fi
+}
+
 prepare_gpg_home() {
   tmp_dir="$(mktemp -d)"
   export GNUPGHOME="${tmp_dir}/gnupg"
@@ -352,7 +367,7 @@ prepare_asymmetric_gpg() {
 }
 
 verify_local_checksum_if_present() {
-  (( download_from_s3 )) && return 0
+  (( download_from_s3 == 0 )) || return 0
 
   local checksum_file="${src_path}.sha256"
   [[ -f "$checksum_file" ]] || return 0
@@ -368,6 +383,34 @@ verify_local_checksum_if_present() {
   else
     log WARN "sha256sum/shasum not found, checksum verification skipped"
   fi
+}
+
+setup_s3_checksum_verification() {
+  (( download_from_s3 )) || return 0
+
+  [[ -n "$tmp_dir" ]] || tmp_dir="$(mktemp -d)"
+  local s3_sha_mc_path="${s3_mc_path}.sha256"
+  local checksum_file="${tmp_dir}/expected.sha256"
+
+  if ! mc --config-dir "$mc_config_dir" cat "$s3_sha_mc_path" > "$checksum_file" 2>/dev/null; then
+    log WARN "No checksum file found in S3, skipping verification"
+    return 0
+  fi
+
+  s3_expected_checksum="$(awk '{print $1}' "$checksum_file")"
+  s3_sha_file="${tmp_dir}/actual.sha"
+  log INFO "S3 checksum file found (will verify after restore)"
+}
+
+verify_s3_checksum_after_restore() {
+  [[ -n "$s3_expected_checksum" ]] || return 0
+
+  local actual_checksum
+  actual_checksum="$(awk '{print $1}' "$s3_sha_file")"
+  [[ -n "$actual_checksum" ]] || die "S3 checksum computation produced no output"
+  [[ "$actual_checksum" == "$s3_expected_checksum" ]] \
+    || die "S3 checksum verification failed (expected: $s3_expected_checksum, got: $actual_checksum)"
+  log INFO "S3 checksum verification passed"
 }
 
 validate_single_mode() {
@@ -417,6 +460,8 @@ validate_single_mode() {
     prepare_s3_client
     construct_s3_path
   fi
+
+  prepare_tar_flags
 }
 
 clear_target_contents() {
@@ -429,7 +474,7 @@ clear_target_contents() {
   fi
 
   log INFO "Clearing target volume: $target_dir"
-  find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  find "$target_dir" -mindepth 1 -maxdepth 1 ! -name "$(basename "$tmp_restore_dir")" -exec rm -rf -- {} +
 }
 
 source_stream() {
@@ -479,10 +524,11 @@ extract_stream() {
   tar \
     --extract \
     --file - \
-    --directory "$target_dir" \
+    --directory "$tmp_restore_dir" \
     --numeric-owner \
     --same-owner \
-    --preserve-permissions
+    --preserve-permissions \
+    "${tar_extra_flags[@]}"
 }
 
 parse_backup_filename() {
@@ -652,6 +698,7 @@ wait_for_all_children() {
 run_single_restore() {
   validate_single_mode
   verify_local_checksum_if_present
+  setup_s3_checksum_verification
 
   log INFO "Starting restore"
   log INFO "Source: $src_path"
@@ -694,11 +741,32 @@ run_single_restore() {
 
   mkdir -p "$target_dir"
 
+  find "$target_dir" -mindepth 1 -maxdepth 1 -name '.restore-in-progress.*' -exec rm -rf -- {} +
+
+  tmp_restore_dir="$(mktemp -d "${target_dir}/.restore-in-progress.XXXXXX")"
+
+  if [[ -n "$s3_sha_file" ]]; then
+    source_stream \
+      | tee >(sha256sum > "$s3_sha_file") \
+      | decrypt_stream | decompress_stream | extract_stream
+    wait
+  else
+    source_stream | decrypt_stream | decompress_stream | extract_stream
+  fi
+
+  verify_s3_checksum_after_restore
+
   if (( clear_target )); then
     clear_target_contents
   fi
 
-  source_stream | decrypt_stream | decompress_stream | extract_stream
+  (
+    shopt -s dotglob nullglob
+    set -- "$tmp_restore_dir"/*
+    (( $# > 0 )) && mv -- "$@" "$target_dir/"
+  )
+  rm -rf "$tmp_restore_dir"
+  tmp_restore_dir=""
 
   log INFO "Restore completed successfully"
 }
