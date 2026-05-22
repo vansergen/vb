@@ -99,8 +99,20 @@ assert_dirs_equal() {
   local left="$1"
   local right="$2"
 
+  local l_list r_list
+  l_list="$(cd "$left" 2>/dev/null && find . -mindepth 1 | sort)" || true
+  r_list="$(cd "$right" 2>/dev/null && find . -mindepth 1 | sort)" || true
+
+  [[ "$l_list" == "$r_list" ]] || {
+    log "Directory listings differ:"
+    log "  left:  $left"
+    log "  right: $right"
+    diff <(printf '%s\n' "$l_list") <(printf '%s\n' "$r_list") >&2 || true
+    return 1
+  }
+
   diff -ruN "$left" "$right" >/dev/null 2>&1 || {
-    log "Directories differ:"
+    log "File contents differ:"
     log "  left:  $left"
     log "  right: $right"
     diff -ruN "$left" "$right" >&2 || true
@@ -663,6 +675,109 @@ test_invalid_flags_and_missing_args() {
   (( restore_missing_arg_rc != 0 )) || return 1
 }
 
+test_restore_leftover_tmp_does_not_block() {
+  setup_case "restore_leftover_tmp_does_not_block"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_011112"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+  local snapshot="$CASE_ROOT/expected-alpha"
+
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "alpha" "$snapshot"
+
+  clear_volume_dir "alpha"
+
+  # Simulate a leftover tmp dir (with content) from a previously killed restore
+  mkdir -p "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER"
+  printf 'stale content\n' > "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER/stale.txt"
+
+  # Restore without -C: target looks empty (only leftover present), should succeed
+  run_restore -i "$archive" -t alpha || return 1
+
+  assert_dirs_equal "$snapshot" "$TEST_VOLUMES_ROOT/alpha" || return 1
+
+  [[ ! -e "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER" ]] || {
+    log "BUG: leftover staging dir survived restore"
+    return 1
+  }
+}
+
+test_restore_is_atomic_on_failure() {
+  setup_case "restore_is_atomic_on_failure"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_011111"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+
+  run_backup -v alpha -T "$ts" || return 1
+
+  # Remove the checksum so verification doesn't catch the corruption before clear_target_contents runs
+  rm -f "${archive}.sha256"
+
+  # Corrupt the archive so extraction will fail mid-stream
+  printf 'this is not a valid tar archive' > "$archive"
+
+  # Put a distinct marker in the volume — this must survive a failed restore
+  replace_volume_with_marker "alpha" "original-content-must-survive"
+
+  # Attempt restore with -C: currently clears the volume BEFORE extracting,
+  # so if extraction fails the volume is left empty — the bug we want to catch.
+  local rc=0
+  run_restore -i "$archive" -t alpha -C 2>/dev/null || rc=$?
+
+  (( rc != 0 )) || {
+    log "BUG: restore succeeded with a corrupt archive"
+    return 1
+  }
+
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "original-content-must-survive" || {
+    log "BUG: non-atomic restore cleared the volume but failed to complete it — volume left empty"
+    return 1
+  }
+}
+
+test_backup_restore_sparse_file() {
+  tar --version 2>/dev/null | grep -q 'GNU tar' || return "$SKIP_RC"
+
+  setup_case "backup_restore_sparse_file"
+
+  local ts="20250101_120001"
+  local sparse_file="$TEST_VOLUMES_ROOT/alpha/sparse.img"
+
+  mkdir -p "$TEST_VOLUMES_ROOT/alpha"
+
+  # Create a 4MB sparse file (only last byte written — minimal actual disk use)
+  dd if=/dev/zero of="$sparse_file" bs=1 count=1 seek=$((4*1024*1024-1)) 2>/dev/null
+
+  local apparent_size
+  apparent_size="$(wc -c < "$sparse_file")"
+
+  run_backup -v alpha -T "$ts" || return 1
+
+  # With --sparse, the archive should be much smaller than the apparent file size
+  local archive_size
+  archive_size="$(wc -c < "$TEST_BACKUP_ROOT/alpha_${ts}.tar")"
+  (( archive_size < apparent_size / 2 )) || {
+    log "BUG: archive ($archive_size bytes) is not smaller than apparent file size ($apparent_size bytes) — --sparse flag may be missing"
+    return 1
+  }
+
+  clear_volume_dir "alpha"
+
+  run_restore -i "$TEST_BACKUP_ROOT/alpha_${ts}.tar" -t alpha || return 1
+
+  # Restored file must have the same apparent size
+  local restored_size
+  restored_size="$(wc -c < "$TEST_VOLUMES_ROOT/alpha/sparse.img")"
+  (( restored_size == apparent_size )) || {
+    log "Apparent size mismatch after restore: expected $apparent_size, got $restored_size"
+    return 1
+  }
+}
+
 test_s3_roundtrip_optional() {
   s3_tests_enabled || return "$SKIP_RC"
 
@@ -686,6 +801,52 @@ test_s3_roundtrip_optional() {
 
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
+  run_restore -i "$s3_uri" -t alpha_restore -C || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_checksum_roundtrip_optional() {
+  s3_tests_enabled || return "$SKIP_RC"
+
+  setup_case "s3_checksum_roundtrip_optional"
+
+  make_volume_content "alpha"
+
+  local ts="20250101_040001"
+  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
+  base_prefix="${base_prefix#/}"
+  base_prefix="${base_prefix%/}"
+
+  local suffix="chk-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+  local prefix="$suffix"
+  if [[ -n "$base_prefix" ]]; then
+    prefix="${base_prefix}/${suffix}"
+  fi
+
+  local key="alpha_${ts}.tar.gz"
+  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+
+  run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  # Verify .sha256 was uploaded alongside the archive using mc directly
+  local mc_cfg
+  mc_cfg="$(mktemp -d)"
+  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  local -a st_flags=()
+  [[ -z "${AWS_SESSION_TOKEN:-}" ]] || st_flags=(--session-token "$AWS_SESSION_TOKEN")
+  mc --config-dir "$mc_cfg" alias set vb "$endpoint" \
+    "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "${st_flags[@]}" >/dev/null 2>&1
+  local sha_exists=0
+  mc --config-dir "$mc_cfg" stat "vb/${TEST_S3_BUCKET}/${prefix}/${key}.sha256" \
+    >/dev/null 2>&1 && sha_exists=1
+  rm -rf "$mc_cfg"
+
+  (( sha_exists )) || {
+    log "BUG: .sha256 was not uploaded to S3 alongside the archive"
+    return 1
+  }
+
+  # Restore normally — checksum is verified automatically during download
   run_restore -i "$s3_uri" -t alpha_restore -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
 }
@@ -793,7 +954,11 @@ run_test "single backup/restore .tar.gpg"           test_single_backup_restore_t
 run_test "volume names with dots and dashes"        test_volume_names_with_dots_and_dashes
 run_test "BACKUP_TIMESTAMP via env var"             test_backup_timestamp_env_var
 run_test "invalid flags and missing args"           test_invalid_flags_and_missing_args
+run_test "restore: leftover tmp does not block"     test_restore_leftover_tmp_does_not_block
+run_test "restore is atomic on failure"             test_restore_is_atomic_on_failure
+run_test "backup/restore sparse file"               test_backup_restore_sparse_file
 run_test "s3 roundtrip (optional)"                  test_s3_roundtrip_optional
+run_test "s3 checksum roundtrip (optional)"         test_s3_checksum_roundtrip_optional
 run_test "s3 roundtrip encrypted (optional)"        test_s3_roundtrip_encrypted_optional
 
 # ------------------------------------------------------------------------------
