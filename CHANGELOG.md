@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.1](https://github.com/vansergen/vb/compare/v1.1.0...v1.1.1) (2026-06-12)
+
+### Bug Fixes
+
+- harden backup and restore safety checks ([f3aafc7](https://github.com/vansergen/vb/commit/f3aafc72a971467330775072e12e2b3182e527b4))
+
 ## [1.1.0](https://github.com/vansergen/vb/compare/v1.0.1...v1.1.0) (2026-05-22)
 
 ### Features
