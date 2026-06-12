@@ -18,6 +18,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - [Examples: Compression and Encryption](#examples-compression-and-encryption)
 - [Examples: S3](#examples-s3)
 - [Examples: All Volumes](#examples-all-volumes)
+- [Backing up every Docker volume on the host](#backing-up-every-docker-volume-on-the-host)
 - [Dry Run](#dry-run)
 - [Automation with cron](#automation-with-cron)
 - [Production Recommendations](#production-recommendations)
@@ -49,7 +50,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Clear a volume before restoring (`-C`)
 - Run restores for multiple volumes in parallel
 - Verify the archive against its SHA256 checksum automatically (local and S3) when one is present
-- Atomic extraction: the archive is staged inside the target volume and only swapped in after a successful and verified extract
+- Staged extraction: the archive is unpacked and verified in a staging directory inside the target volume, and only swapped in after a successful and verified extract — a failure during extract/verify leaves the original data intact
 
 ---
 
@@ -300,7 +301,7 @@ Runs up to 3 backups concurrently.
 | `-n`          | Dry run: validate and print what would be done without restoring        |
 | `-h`          | Show help                                                               |
 
-> **Note on `-C`:** Without `-C`, restore will fail if the target volume is not empty. This protects against accidental data loss. Restore with `-C` is safe against extraction failures: the archive is fully extracted into a staging directory inside the target volume before any existing data is touched, so a failure during the operation (network drop, disk error, wrong passphrase, checksum mismatch) leaves the original data intact.
+> **Note on `-C`:** Without `-C`, restore will fail if the target volume is not empty. This protects against accidental data loss. With `-C`, the archive is fully extracted **and** verified in a staging directory inside the target volume **before** any existing data is touched, so a failure during extraction, decryption, decompression, or checksum verification (network drop, disk error, wrong passphrase, checksum mismatch) leaves the original data intact. After verification succeeds, the script clears the old contents and moves the new ones in — an interruption during this final step (`SIGKILL`, power loss, disk error) can leave the volume in a partially restored state.
 
 ### Specifying the source (`-i`)
 
@@ -693,6 +694,98 @@ docker run --rm \
 
 ---
 
+## Backing up every Docker volume on the host
+
+The `-a` mode backs up everything mounted under `/volumes`, but the container only sees what you mount in. The patterns below build the mount list dynamically from `docker volume ls`.
+
+### One-liner
+
+```bash
+docker run --rm \
+  $(docker volume ls -q | sed 's|.*|--volume &:/volumes/&|') \
+  --volume "$(pwd)/backups:/backups" \
+  ghcr.io/vansergen/vb backup -a -c
+```
+
+`docker volume ls -q` lists every named volume on the host; `sed` expands each name into a `--volume <name>:/volumes/<name>` pair.
+
+### Safer wrapper script
+
+Better suited for cron and scripts: skips anonymous volumes (64-char hex names), handles names with special characters, and accepts a shared timestamp for atomic per-snapshot restore.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mounts=()
+while IFS= read -r vol; do
+  # skip anonymous volumes (Docker autogenerates 64-char hex names)
+  [[ "$vol" =~ ^[a-f0-9]{64}$ ]] && continue
+  mounts+=(--volume "$vol:/volumes/$vol")
+done < <(docker volume ls -q)
+
+docker run --rm \
+  "${mounts[@]}" \
+  --volume "$(pwd)/backups:/backups" \
+  ghcr.io/vansergen/vb backup -a -c -j 2 -T "$(date -u +%Y%m%d_%H%M%S)"
+```
+
+Use Docker labels to opt volumes in explicitly — recommended for production so the script never picks up volumes you didn't intend to back up:
+
+```bash
+docker volume ls -q --filter label=backup=true
+```
+
+```yaml
+# in your application's compose.yaml
+volumes:
+  postgres_data:
+    labels:
+      backup: "true"
+```
+
+### Docker Compose
+
+Declare a one-shot `backup` service alongside your application and reuse the same named volumes. The `profiles: [backup]` line keeps the service out of regular `docker compose up`.
+
+```yaml
+services:
+  postgres:
+    image: postgres:17
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    volumes:
+      - redis_data:/data
+
+  backup:
+    image: ghcr.io/vansergen/vb
+    profiles: [backup]
+    command: backup -a -c -s -j 2
+    environment:
+      GPG_PASSPHRASE: ${GPG_PASSPHRASE}
+    volumes:
+      - postgres_data:/volumes/postgres_data
+      - redis_data:/volumes/redis_data
+      - ./backups:/backups
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+Run it on demand:
+
+```bash
+GPG_PASSPHRASE=secret docker compose run --rm backup
+```
+
+To restore the same snapshot, replace `command:` with `restore -a -T <timestamp> -C` (or run a sibling `restore` service the same way).
+
+---
+
 ## Dry Run
 
 Dry run validates parameters and prints what would be done, without creating files or modifying volumes.
@@ -823,6 +916,10 @@ High `-j` with compression can saturate CPU, disk, and network simultaneously. S
 ### S3 uploads use the MinIO client (`mc`)
 
 `mc pipe` handles upload from a stream and uses multipart upload internally when needed. It works with AWS S3, MinIO, Yandex Cloud Object Storage, DigitalOcean Spaces, and other S3-compatible endpoints.
+
+### Protect recovery points with bucket-side versioning
+
+Before uploading, the backup script checks that the target S3 object does not already exist and refuses to proceed otherwise (a stat error that is not a confirmed "not found" is also treated as fatal — fail-closed). This handles accidental reruns and most ambiguous failures, but it does not give strict atomicity: two parallel backups racing on the same key may both pass the existence check, and S3-side write ordering then decides the winner. For production, enable bucket-side **object versioning** (and ideally retention / object lock) so that even a same-key upload preserves the previous recovery point as a prior version. AWS S3, Yandex Cloud Object Storage, MinIO, and most S3-compatible stores expose this as a bucket-level setting.
 
 ---
 

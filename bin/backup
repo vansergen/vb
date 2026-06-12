@@ -375,6 +375,27 @@ prepare_tar_flags() {
   fi
 }
 
+# Returns 0 if the S3 object exists, 1 if it confirmedly does not.
+# Any other error (auth denied, network failure, malformed credentials) is
+# treated as fatal — we must never proceed to overwrite when stat is ambiguous.
+s3_object_exists() {
+  local path="$1"
+  local stat_output stat_rc
+
+  stat_output="$(mc --config-dir "$mc_config_dir" stat "$path" 2>&1)"
+  stat_rc=$?
+
+  if (( stat_rc == 0 )); then
+    return 0
+  fi
+
+  if grep -qiE 'does not exist|not found|no such (key|object|file)' <<<"$stat_output"; then
+    return 1
+  fi
+
+  die "Failed to check S3 object existence at $path: $stat_output"
+}
+
 prepare_gpg_runtime() {
   if (( symmetric )); then
     prepare_gpg_home
@@ -429,16 +450,22 @@ write_destination() {
 
 write_checksum() {
   local target="$1"
+  local hash
 
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$target" > "${target}.sha256"
-    log INFO "Checksum written: ${target}.sha256"
+    hash="$(sha256sum "$target" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$target" > "${target}.sha256"
-    log INFO "Checksum written: ${target}.sha256"
+    hash="$(shasum -a 256 "$target" | awk '{print $1}')"
   else
     log WARN "sha256sum/shasum not found, checksum skipped"
+    return 0
   fi
+
+  # Store only the basename — sidecars must stay portable when the archive
+  # is moved or copied. Verification on restore re-hashes src_path directly
+  # and compares to the recorded digest, ignoring the filename field.
+  printf '%s  %s\n' "$hash" "$(basename -- "$target")" > "${target}.sha256"
+  log INFO "Checksum written: ${target}.sha256"
 }
 
 validate_common_options() {
@@ -644,6 +671,9 @@ run_single_backup() {
     if (( upload_to_s3 == 0 )) && [[ -e "$backup_path" ]]; then
       die "Backup file already exists: $backup_path"
     fi
+    if (( upload_to_s3 )) && s3_object_exists "$s3_mc_path"; then
+      die "Backup object already exists in S3: $s3_url"
+    fi
     log INFO "Dry-run: no changes made"
     return 0
   fi
@@ -651,6 +681,10 @@ run_single_backup() {
   if (( upload_to_s3 == 0 )); then
     mkdir -p "$backup_root"
     [[ ! -e "$backup_path" ]] || die "Backup file already exists: $backup_path"
+  else
+    if s3_object_exists "$s3_mc_path"; then
+      die "Backup object already exists in S3: $s3_url"
+    fi
   fi
 
   prepare_gpg_runtime
