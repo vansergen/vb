@@ -363,7 +363,7 @@ t_s3_init() {
   T_S3_CONFIG="$TEST_ROOT/curl-s3.conf"
   (
     umask 077
-    printf 'silent\nshow-error\npath-as-is\n'
+    printf 'silent\nshow-error\n'
     printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
     printf 'aws-sigv4 = "aws:amz:%s:s3"\n' "${AWS_REGION:-us-east-1}"
     if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then

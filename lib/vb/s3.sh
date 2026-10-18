@@ -173,7 +173,7 @@ s3_init() {
   (
     umask 077
     {
-      printf 'silent\nshow-error\npath-as-is\nconnect-timeout = 30\n'
+      printf 'silent\nshow-error\nconnect-timeout = 30\n'
       printf 'user = %s\n' "$(s3__config_quote "${access_key}:${secret_key}")"
       printf 'aws-sigv4 = %s\n' "$(s3__config_quote "aws:amz:${s3_region}:s3")"
       if [[ -n "$session_token" ]]; then
