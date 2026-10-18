@@ -354,11 +354,12 @@ s3_put_file() {
   die "Failed to upload s3://${bucket}/${key} after retries: $(s3__describe "$body")"
 }
 
-# Deletes an object only if it still has the given ETag.
+# Deletes an object, only if it still has <etag> when one is given.
 # Returns 0 when deleted (or already gone), 3 when the object changed and
 # 4 when the provider does not support conditional deletes.
-s3_delete_if_match() {
-  local bucket="$1" key="$2" etag="$3"
+#   s3__delete <bucket> <key> [<etag>]
+s3__delete() {
+  local bucket="$1" key="$2" etag="${3:-}"
   local body="${work_dir}/delete.body"
   local -a cond=()
   [[ -z "$etag" ]] || cond=(-H "If-Match: ${etag}")
@@ -381,10 +382,23 @@ s3_delete_if_match() {
   die "Failed to delete s3://${bucket}/${key} after retries: $(s3__describe "$body")"
 }
 
-# Decodes XML character references, both named (&quot;) and numeric (&#34;,
-# &#x22;): providers differ in which form they use.
+# Deletes an object only if it still has the given ETag (results as for
+# s3__delete). An empty ETag is refused: it must never turn into a DELETE
+# without If-Match.
+s3_delete_if_match() {
+  [[ -n "$3" ]] || die "Refusing to delete s3://$1/$2: no ETag to match"
+  s3__delete "$1" "$2" "$3"
+}
+
+# Deletes an object unconditionally: only the probe object, and rotation
+# with S3_ALLOW_UNCONDITIONAL_DELETE=1 on a provider that ignores If-Match.
+s3_delete_object() {
+  s3__delete "$1" "$2"
+}
+
 # Checks with a probe object below <prefix> that the provider honours
-# If-Match on DELETE. Returns 1 if it does not (the probe is removed anyway).
+# If-Match on DELETE. Returns 1 if it does not, or if it gives the probe no
+# ETag (the probe is removed anyway).
 s3_probe_conditional_delete() {
   local bucket="$1" prefix="$2" key file etag rc=0
 
@@ -393,7 +407,11 @@ s3_probe_conditional_delete() {
   printf 'vb conditional delete probe\n' > "$file"
   s3_put_file "$bucket" "$key" "$file" probe || die "Failed to write the probe object s3://${bucket}/${key}"
   s3_head "$bucket" "$key" || die "The probe object s3://${bucket}/${key} disappeared"
-  etag="$(s3__header "$s3_head_headers" etag)"
+  etag="$(s3__header "$s3_head_headers" etag)" || die "Failed to read the headers of s3://${bucket}/${key}"
+  if [[ -z "$etag" ]]; then
+    s3_delete_object "$bucket" "$key" || true
+    return 1
+  fi
 
   s3_delete_if_match "$bucket" "$key" '"00000000000000000000000000000000"' || rc=$?
   case "$rc" in
@@ -408,12 +426,14 @@ s3_probe_conditional_delete() {
       return 1
       ;;
     *)
-      s3_delete_if_match "$bucket" "$key" "" || true
+      s3_delete_object "$bucket" "$key" || true
       return 1
       ;;
   esac
 }
 
+# Decodes XML character references, both named (&quot;) and numeric (&#34;,
+# &#x22;): providers differ in which form they use.
 s3__xml_unescape() {
   awk '
     {

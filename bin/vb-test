@@ -567,6 +567,8 @@ t_s3_delete_prefix() {
 #   list-paged-fail        list two keys per page and answer 503 to every page
 #                          after the first
 #   list-malformed         drop the <Key> of every beta entry from listings
+#   list-no-etag           drop the <ETag> of every entry from listings
+#   list-no-sidecar-etag   drop the <ETag> of every checksum file from listings
 #   list-truncated         cut a listing after its second entry, as a broken
 #                          transfer (HTTP 200, curl exit 18)
 #   get-truncated          cut a downloaded checksum file after the digest, as a
@@ -626,6 +628,26 @@ case "\$mode" in
       cut="\$(sed 's:<Key>[^<]*/beta_[^<]*</Key>::g' <<< "\$body")"
       [[ "\$cut" == "\$body" ]] || : > "\$state/fired"
       printf '%s' "\$cut" > "\$out"
+      printf '%s' "\$code"
+      exit 0
+    fi
+    ;;
+  list-no-etag | list-no-sidecar-etag)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      rest="\$(cat "\$out")"
+      new=""
+      while [[ "\$rest" == *"</Contents>"* ]]; do
+        chunk="\${rest%%</Contents>*}</Contents>"
+        rest="\${rest#*</Contents>}"
+        if [[ "\$mode" == list-no-etag || "\$chunk" == *".sha256</Key>"* ]]; then
+          stripped="\${chunk/<ETag>*<\/ETag>/}"
+          [[ "\$stripped" == "\$chunk" ]] || : > "\$state/fired"
+          chunk="\$stripped"
+        fi
+        new+="\$chunk"
+      done
+      printf '%s' "\$new\$rest" > "\$out"
       printf '%s' "\$code"
       exit 0
     fi
@@ -3791,13 +3813,13 @@ test_failed_sort_stops_backup() {
   done
 
   # The backups of a volume, newest first, come from sort -r for rotation
-  run_backup -v alpha -T 20250101_904310 || return 1
-  run_backup -v alpha -T 20250101_904311 || return 1
+  run_backup -v alpha -T 20250102_020000 || return 1
+  run_backup -v alpha -T 20250102_020001 || return 1
   write_sort_wrapper "$stub" -r
   rm -f "$stub/fired"
   expect_injected_failure "$stub/fired" \
-    run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250101_904312 -R 1 || return 1
-  for ts in 20250101_904310 20250101_904311; do
+    run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250102_020002 -R 1 || return 1
+  for ts in 20250102_020000 20250102_020001; do
     assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar" || return 1
     assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256" || return 1
   done
@@ -3833,6 +3855,45 @@ test_failed_sort_stops_restore() {
   write_sort_wrapper "$stub" '*-k2,2'
   rm -f "$stub/fired"
   expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- -l || return 1
+}
+
+# Rotation deletes nothing when the listing gives no ETag for an object it
+# would delete, whatever S3_ALLOW_UNCONDITIONAL_DELETE says
+test_s3_rotation_requires_etags_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_rotation_requires_etags_optional"
+  make_volume_content "alpha"
+
+  local prefix stub="$CASE_ROOT/stub" variant ts n=0 keys key line
+  local -a env_args=()
+  prefix="$(t_s3_prefix rotation-requires-etags)"
+  run_backup -v alpha -T 20250102_010000 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  run_backup -v alpha -T 20250102_010001 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  for variant in list-no-etag list-no-sidecar-etag list-no-etag:opt-in; do
+    n=$((n + 1))
+    ts="20250102_01001${n}"
+    rm -rf "$stub"
+    make_curl_stub "$stub" "${variant%:opt-in}"
+    env_args=(PATH="$stub:$PATH")
+    [[ "$variant" != *:opt-in ]] || env_args+=(S3_ALLOW_UNCONDITIONAL_DELETE=1)
+
+    expect_injected_failure "$stub/fired" run_backup_with_env "${env_args[@]}" -- \
+      -v alpha -T "$ts" -R 1 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+    keys=" $(t_s3_list_keys "$prefix/") "
+    for key in alpha_20250102_010000.tar alpha_20250102_010001.tar; do
+      [[ "$keys" == *"/${key} "* && "$keys" == *"/${key}.sha256 "* ]] || {
+        log "BUG: rotation deleted part of ${key} ($variant)"
+        return 1
+      }
+    done
+    while IFS= read -r line; do
+      if [[ "$line" == *"-X DELETE"* && "$line" == *"/alpha_"* ]]; then
+        log "BUG: rotation sent a DELETE for a listed backup ($variant): $line"
+        return 1
+      fi
+    done < "$stub/curl.trace"
+  done
 }
 
 test_restore_refuses_unreadable_mount_table() {
@@ -4112,6 +4173,7 @@ run_test "unreadable checksum file fails the catalog"  test_unreadable_checksum_
 run_test "restore refuses unreadable mount table"      test_restore_refuses_unreadable_mount_table
 run_test "failed sort stops backup"                    test_failed_sort_stops_backup
 run_test "failed sort stops restore"                   test_failed_sort_stops_restore
+run_test "s3 rotation requires ETags"                  test_s3_rotation_requires_etags_optional
 
 # ------------------------------------------------------------------------------
 # Summary

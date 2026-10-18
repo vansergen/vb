@@ -1058,7 +1058,7 @@ docker run --rm ... ghcr.io/vansergen/vb backup -a -z -R 7 -D 30
 
 **Locally**, the listing, the plan, and the deletions run under the same lock on `BACKUP_ROOT` as publishing, so a rotation never races a concurrent backup.
 
-**In S3**, every `DELETE` carries `If-Match` with the ETag seen while planning, so an object replaced in the meantime is kept. Before the first deletion, the backup checks with a probe object (`<prefix>/.vb-probe-…`) that the provider honours `If-Match` on `DELETE`, and refuses to rotate otherwise (set `S3_ALLOW_UNCONDITIONAL_DELETE=1` to accept the risk). Orphaned checksum files are never deleted in S3. On a versioned bucket, a deletion adds a delete marker and keeps the previous versions; remove those with a lifecycle rule (`NoncurrentVersionExpiration`).
+**In S3**, every `DELETE` carries `If-Match` with the ETag seen while planning, so an object replaced in the meantime is kept. Before the first deletion, the backup checks with a probe object (`<prefix>/.vb-probe-…`) that the provider honours `If-Match` on `DELETE`, and refuses to rotate otherwise (set `S3_ALLOW_UNCONDITIONAL_DELETE=1` to accept the risk). If the listing gives no ETag for an object that rotation would delete, it refuses before deleting anything; `S3_ALLOW_UNCONDITIONAL_DELETE=1` does not change that, it only covers providers that ignore `If-Match`. Orphaned checksum files are never deleted in S3. On a versioned bucket, a deletion adds a delete marker and keeps the previous versions; remove those with a lifecycle rule (`NoncurrentVersionExpiration`).
 
 ---
 
@@ -1239,6 +1239,10 @@ The directory is empty or the files do not match the expected naming pattern:
 ### `does not honour If-Match on DELETE`
 
 Rotation in S3 needs conditional deletes, and the provider ignored or rejected them. Nothing was deleted. Set `S3_ALLOW_UNCONDITIONAL_DELETE=1` if you accept that a backup replaced during the rotation could be deleted.
+
+### `Rotation needs the ETag of every object it deletes`
+
+The S3 listing gave no ETag for an object that rotation planned to delete, so the delete could not be made conditional. Nothing was deleted. Check the provider or proxy in front of it: S3 listings always include ETags.
 
 ### `Both … and …_FILE are set`
 

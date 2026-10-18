@@ -862,10 +862,27 @@ rotate_local() {
   exec {lock_fd}>&-
 }
 
+# Refuses a conditional rotation before its first DELETE when the listing
+# gave no ETag for an object it would delete: missing metadata must never
+# turn into a DELETE without If-Match.
+rotation_require_etags() {
+  local i
+  local -a missing=()
+
+  for i in "${rotation_deletes[@]}"; do
+    [[ -n "${cat_etags[i]}" ]] || missing+=("s3://${s3_bucket}/${cat_keys[i]}")
+    if (( cat_sidecars[i] )) && [[ -z "${cat_sidecar_etags[i]}" ]]; then
+      missing+=("s3://${s3_bucket}/${cat_keys[i]}.sha256")
+    fi
+  done
+  (( ${#missing[@]} == 0 )) || die \
+    "Rotation needs the ETag of every object it deletes, but the listing gave none for: ${missing[*]}. Nothing was deleted"
+}
+
 # S3 has no locks, so every DELETE is conditional on the ETag seen when the
 # plan was made: an object replaced in the meantime is kept.
 rotate_s3() {
-  local i rc conditional=1 etag
+  local i rc conditional=1
 
   catalog_scan_s3 "$s3_bucket" "$s3_prefix" 1
   plan_rotation
@@ -879,15 +896,20 @@ rotate_s3() {
     log WARN "The S3 provider ignores If-Match on DELETE; rotating without that protection because S3_ALLOW_UNCONDITIONAL_DELETE=1"
     conditional=0
   fi
+  # The opt-in only covers a provider that ignores If-Match, never objects
+  # listed without an ETag
+  (( ! conditional )) || rotation_require_etags
 
   vb_test_point "rotate_planned" "$volume"
 
   for i in "${rotation_deletes[@]}"; do
     if (( cat_sidecars[i] )); then
-      etag="${cat_sidecar_etags[i]}"
-      (( conditional )) || etag=""
       rc=0
-      s3_delete_if_match "$s3_bucket" "${cat_keys[i]}.sha256" "$etag" || rc=$?
+      if (( conditional )); then
+        s3_delete_if_match "$s3_bucket" "${cat_keys[i]}.sha256" "${cat_sidecar_etags[i]}" || rc=$?
+      else
+        s3_delete_object "$s3_bucket" "${cat_keys[i]}.sha256" || rc=$?
+      fi
       if (( rc == 3 )); then
         log WARN "Rotation kept ${cat_names[i]}: its checksum file changed after it was checked"
         continue
@@ -896,10 +918,12 @@ rotate_s3() {
       vb_test_point "rotate_pair" "$volume"
     fi
 
-    etag="${cat_etags[i]}"
-    (( conditional )) || etag=""
     rc=0
-    s3_delete_if_match "$s3_bucket" "${cat_keys[i]}" "$etag" || rc=$?
+    if (( conditional )); then
+      s3_delete_if_match "$s3_bucket" "${cat_keys[i]}" "${cat_etags[i]}" || rc=$?
+    else
+      s3_delete_object "$s3_bucket" "${cat_keys[i]}" || rc=$?
+    fi
     if (( rc == 3 )); then
       log WARN "Rotation kept ${cat_names[i]}: the archive changed after it was checked"
       continue
