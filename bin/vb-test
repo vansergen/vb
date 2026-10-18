@@ -121,6 +121,17 @@ assert_dirs_equal() {
   }
 }
 
+# Runs the given command (with its arguments kept intact) and fails if it succeeds.
+expect_rejected() {
+  local rc=0
+  "$@" 2>/dev/null || rc=$?
+
+  (( rc != 0 )) || {
+    log "BUG: expected failure, but succeeded: $*"
+    return 1
+  }
+}
+
 assert_text_file_contains() {
   local path="$1"
   local expected="$2"
@@ -1001,43 +1012,23 @@ test_jobs_value_is_validated_before_use() {
   make_volume_content "alpha"
 
   local marker="$CASE_ROOT/injected"
+  # Must reach the script as ONE argument: a subscript with a command
+  # substitution that bash would run if -j were used in (( )) unvalidated.
   local payload="PATH[\$(touch $marker)]"
-  local rc
 
-  local -a invalid_runs=(
-    "backup -v alpha -n -j $payload"
-    "backup -a -n -j $payload"
-    "restore -i missing.tar -t alpha -j $payload"
-    "restore -a -n -j $payload"
-    "backup -a -n -j 0"
-    "backup -a -n -j 100"
-    "backup -a -n -j 1x"
-  )
-
-  local entry tool
-  local -a args
-  for entry in "${invalid_runs[@]}"; do
-    read -r -a args <<<"$entry"
-    tool="${args[0]}"
-    args=("${args[@]:1}")
-
-    rc=0
-    if [[ "$tool" == backup ]]; then
-      run_backup "${args[@]}" 2>/dev/null || rc=$?
-    else
-      run_restore "${args[@]}" 2>/dev/null || rc=$?
-    fi
-
-    (( rc != 0 )) || {
-      log "BUG: '$entry' was accepted"
-      return 1
-    }
-  done
+  expect_rejected run_backup -v alpha -n -j "$payload" || return 1
+  expect_rejected run_backup -a -n -j "$payload" || return 1
+  expect_rejected run_restore -i missing.tar -t alpha -j "$payload" || return 1
+  expect_rejected run_restore -a -n -j "$payload" || return 1
 
   assert_file_not_exists "$marker" || {
     log "BUG: -j value was evaluated as an arithmetic expression"
     return 1
   }
+
+  expect_rejected run_backup -a -n -j 0 || return 1
+  expect_rejected run_backup -a -n -j 100 || return 1
+  expect_rejected run_backup -a -n -j 1x || return 1
 
   run_backup -a -n -j 99 2>/dev/null || {
     log "Expected -j 99 to be accepted"
