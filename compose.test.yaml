@@ -1,47 +1,110 @@
 x-test-env: &test-env
   BACKUP_BIN: /usr/local/bin/backup
   RESTORE_BIN: /usr/local/bin/restore
-  AWS_ACCESS_KEY_ID: minio_root_user
-  AWS_SECRET_ACCESS_KEY: minio_root_password
+  AWS_ACCESS_KEY_ID: vb_test_access_key
+  AWS_SECRET_ACCESS_KEY: vb_test_secret_key
   AWS_REGION: us-east-1
-  AWS_ENDPOINT_URL: http://minio:9000
   TEST_S3_BUCKET: vb-test
   TEST_S3_PREFIX: docker-volume-tests
-
-x-minio-env: &minio-env
-  MINIO_ROOT_USER: minio_root_user
-  MINIO_ROOT_PASSWORD: minio_root_password
+  TEST_S3_CREATE_BUCKETS: "1"
+  REQUIRE_S3_TESTS: "1"
+  REQUIRE_XATTR_TESTS: "1"
 
 services:
-  minio:
-    image: quay.io/minio/minio:latest
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment: *minio-env
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+  # versitygw: the default target, runs the whole suite
+  s3:
+    image: versity/versitygw:v1.8.0
+    command: ["--port", ":7070", "posix", "/data"]
+    environment:
+      ROOT_ACCESS_KEY: vb_test_access_key
+      ROOT_SECRET_KEY: vb_test_secret_key
+    volumes:
+      - s3-data:/data
+
+  # A second versitygw with bucket versioning, for the rotation test
+  s3v:
+    image: versity/versitygw:v1.8.0
+    command:
+      ["--port", ":7070", "posix", "--versioning-dir", "/versions", "/data"]
+    environment:
+      ROOT_ACCESS_KEY: vb_test_access_key
+      ROOT_SECRET_KEY: vb_test_secret_key
+    volumes:
+      - s3v-data:/data
+      - s3v-versions:/versions
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: vb_test_access_key
+      AWS_SECRET_ACCESS_KEY: vb_test_secret_key
+    volumes:
+      - seaweedfs-data:/data
+
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    environment:
+      RUSTFS_ACCESS_KEY: vb_test_access_key
+      RUSTFS_SECRET_KEY: vb_test_secret_key
+    volumes:
+      - rustfs-data:/data
 
   test:
-    build: .
+    build:
+      context: .
+      target: test
     entrypoint: []
+    # The nested mount test needs to bind-mount inside the test container
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    # TEST_S3_TARGET picks the S3 server: versitygw (default) runs the whole
+    # suite, the others the S3 tests. vb-test waits for the server and
+    # creates the buckets (TEST_S3_CREATE_BUCKETS).
     command:
       - bash
       - -ec
       - |
-        # Keep bootstrap values literal here because Docker Compose may interpolate
-        # variable-like syntax in command strings before container environment is applied.
-        mc alias set local http://minio:9000 minio_root_user minio_root_password >/dev/null
-        mc ready local >/dev/null
-        mc mb --ignore-existing "local/vb-test" >/dev/null
-
+        case "$${TEST_S3_TARGET:-versitygw}" in
+          versitygw)
+            export AWS_ENDPOINT_URL=http://s3:7070
+            export TEST_S3_VERSIONED_ENDPOINT=http://s3v:7070
+            ;;
+          seaweedfs)
+            export AWS_ENDPOINT_URL=http://seaweedfs:8333
+            export TEST_S3_VERSIONED_BUCKET=vb-test-versioned
+            export TEST_FILTER="$${TEST_FILTER:-s3}"
+            ;;
+          rustfs)
+            export AWS_ENDPOINT_URL=http://rustfs:9000
+            export TEST_S3_VERSIONED_BUCKET=vb-test-versioned
+            export TEST_FILTER="$${TEST_FILTER:-s3}"
+            ;;
+          *)
+            echo "Unknown TEST_S3_TARGET: $${TEST_S3_TARGET}" >&2
+            exit 2
+            ;;
+        esac
+        export TEST_S3_PROVIDER="$${TEST_S3_TARGET:-versitygw}"
         exec bash /usr/local/bin/vb-test
     depends_on:
-      minio:
-        condition: service_healthy
+      - s3
+      - s3v
+      - seaweedfs
+      - rustfs
     environment: *test-env
     develop:
       watch:
         - action: rebuild
           path: ./bin
+        - action: rebuild
+          path: ./lib
+
+volumes:
+  s3-data:
+  s3v-data:
+  s3v-versions:
+  seaweedfs-data:
+  rustfs-data:

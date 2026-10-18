@@ -1,9 +1,14 @@
 name: CI
 
-on: push
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,11 +30,88 @@ jobs:
       - name: commitlint
         run: npm run commitlint
 
+      - name: ShellCheck
+        run: shellcheck -x bin/* lib/vb/*.sh
+
+  # The suite in the test image, against S3 servers
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
       - name: Test
         run: docker compose -f compose.test.yaml run --rm --build test
 
+  # The S3 tests against other S3-compatible servers
+  test-s3-compat:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        target:
+          - seaweedfs
+          - rustfs
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test
+        run: docker compose -f compose.test.yaml run --rm --build -e TEST_S3_TARGET=${{ matrix.target }} test
+
+  # The suite with the runner's bash, GNU userland and filesystem (no S3)
+  test-runner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends acl attr zstd
+
+      - name: Test
+        run: sudo env "PATH=$PATH" REQUIRE_XATTR_TESTS=1 bash bin/vb-test
+
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      # https://github.com/marketplace/actions/docker-setup-qemu
+      - uses: docker/setup-qemu-action@v4
+      # https://github.com/marketplace/actions/docker-setup-buildx
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build for every published platform
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64/v8,linux/arm/v7,linux/arm/v6,linux/ppc64le
+          push: false
+
+      - name: Build the runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: vb:ci
+
+      - name: Check the runtime image
+        run: |
+          docker run --rm --entrypoint sh vb:ci -ec '
+            test ! -e /usr/local/bin/vb-test
+            backup -h > /dev/null
+            restore -h > /dev/null
+          '
+
   release:
-    needs: [test]
+    needs: [lint, test, test-s3-compat, test-runner, build]
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     runs-on: ubuntu-latest
 
@@ -42,20 +124,24 @@ jobs:
           check-latest: true
 
       - name: Import GPG key
-        run: echo $GPG_KEY | base64 --decode | gpg --batch --import
+        run: echo "$GPG_KEY" | base64 --decode | gpg --batch --import
         env:
           GPG_KEY: ${{ secrets.GPG_KEY }}
 
+      # Git calls this as its gpg program; the passphrase goes through a file
+      # descriptor instead of the command line
       - name: Add the custom gpg executable
         run: |
-          rm -rf /tmp/gpg.sh
-          echo 'gpg --batch --pinentry-mode=loopback --passphrase $GPG_KEY_PASSPHRASE $@' >> /tmp/gpg.sh
+          cat > /tmp/gpg.sh <<'EOF'
+          #!/usr/bin/env bash
+          exec gpg --batch --pinentry-mode=loopback --passphrase-fd 3 "$@" 3<<< "$GPG_KEY_PASSPHRASE"
+          EOF
           chmod +x /tmp/gpg.sh
 
       - name: Setup git
         run: |
           git config commit.gpgsign true
-          git config user.signingkey $GPG_KEY_ID
+          git config user.signingkey "$GPG_KEY_ID"
           git config gpg.program /tmp/gpg.sh
         env:
           GPG_KEY_ID: ${{ vars.GPG_KEY_ID }}

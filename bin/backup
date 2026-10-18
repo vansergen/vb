@@ -2,8 +2,27 @@
 set -Eeuo pipefail
 umask 077
 
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly SELF_SCRIPT="${DVB_SELF:-$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")}"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+SCRIPT_REAL="$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")"
+readonly SCRIPT_REAL
+readonly SELF_SCRIPT="${DVB_SELF:-$SCRIPT_REAL}"
+readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
+
+[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" && -r "${VB_LIB_DIR}/catalog.sh" ]] || {
+  printf '%s: library directory not found: %s (set VB_LIB_DIR)\n' "$SCRIPT_NAME" "$VB_LIB_DIR" >&2
+  exit 1
+}
+# shellcheck source=SCRIPTDIR/../lib/vb/common.sh
+source "${VB_LIB_DIR}/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/s3.sh
+source "${VB_LIB_DIR}/s3.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/txn.sh
+source "${VB_LIB_DIR}/txn.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/catalog.sh
+source "${VB_LIB_DIR}/catalog.sh"
+
+load_secret_files GPG_PASSPHRASE GPG_PUBLIC_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
@@ -15,103 +34,47 @@ backup_timestamp="${BACKUP_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
 all_volumes=0
 jobs=1
 dry_run=0
+strict_tar=0
 
-compress=0
+compression=""
+compression_level=""
 encrypt=0
 symmetric=0
 upload_to_s3=0
 
-pgp_key="public.gpg"
+declare -a pgp_keys=()
 s3_bucket=""
 s3_folder=""
+s3_prefix=""
+s3_key=""
 
 volume=""
 declare -a requested_volumes=()
+declare -a exclude_patterns=()
+keep_count=""
+keep_days=""
 
 gpg_raw_key="${GPG_PUBLIC_KEY:-}"
 gpg_passphrase="${GPG_PASSPHRASE:-}"
-aws_access_key_id="${AWS_ACCESS_KEY_ID:-}"
-aws_secret_access_key="${AWS_SECRET_ACCESS_KEY:-}"
-aws_session_token="${AWS_SESSION_TOKEN:-}"
-aws_region="${AWS_REGION:-us-east-1}"
-aws_endpoint_url="${AWS_ENDPOINT_URL:-}"
 
-tmp_dir=""
 tmp_backup_path=""
-recipient_fpr=""
+tmp_sidecar_path=""
+declare -a public_key_sources=()
+declare -a recipient_fprs=()
 backup_path=""
 s3_url=""
-mc_config_dir=""
-s3_mc_path=""
 directory=""
 filename=""
 
 compressor_cmd=()
 compressor_name="none"
 
-tar_extra_flags=()
-
 declare -A pid_to_volume=()
 declare -a running_pids=()
+pipeline_pid=""
+checksum_pid=""
 
 failed=0
-wait_supports_p=0
-
-# ------------------------------------------------------------------------------
-# Colors
-# ------------------------------------------------------------------------------
-
-if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
-  readonly COLOR_RESET=$'\033[0m'
-  readonly COLOR_RED=$'\033[0;31m'
-  readonly COLOR_YELLOW=$'\033[0;33m'
-  readonly COLOR_GREEN=$'\033[0;32m'
-else
-  readonly COLOR_RESET=""
-  readonly COLOR_RED=""
-  readonly COLOR_YELLOW=""
-  readonly COLOR_GREEN=""
-fi
-
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
-
-log() {
-  local level="INFO"
-  local color="$COLOR_GREEN"
-
-  case "${1:-}" in
-    ERROR)
-      level="ERROR"
-      color="$COLOR_RED"
-      shift
-      ;;
-    WARN)
-      level="WARN"
-      color="$COLOR_YELLOW"
-      shift
-      ;;
-    INFO)
-      level="INFO"
-      color="$COLOR_GREEN"
-      shift
-      ;;
-  esac
-
-  printf '[%s] %s %b[%s]%b %s\n' \
-    "$SCRIPT_NAME" \
-    "$(date '+%Y-%m-%d %H:%M:%S')" \
-    "$color" \
-    "$level" \
-    "$COLOR_RESET" \
-    "$*" >&2
-}
-
-die() {
-  log ERROR "$*"
-  exit 1
-}
 
 # ------------------------------------------------------------------------------
 # Usage
@@ -139,34 +102,63 @@ Options:
   General:
     -d <dir>    Local backup directory override (default: ${DEFAULT_BACKUP_ROOT})
     -T <ts>     Backup timestamp override (format: YYYYMMDD_HHMMSS)
-    -j <N>      Number of parallel backups in -a mode (default: 1)
+    -j <N>      Number of parallel backups in -a mode (1-99, default: 1)
     -n          Dry-run: validate and print what would be backed up
+    -S          Strict: fail when files change while they are archived
+                (by default this is a warning)
+    -x <pattern> Exclude files matching a tar --exclude pattern (repeatable).
+                A pattern without "/" matches names at any depth; "./path"
+                matches a path from the volume root
     -h          Show help
 
+  Rotation (after a successful backup, for the backed up volume only):
+    -R <N>      Keep the N newest complete backups
+    -D <days>   Keep backups younger than this many days
+                With both, a backup is kept if either rule keeps it. The newest
+                complete backup is never deleted, and incomplete backups are
+                only deleted by -D.
+
   Backup options:
-    -c          Compress backup (pigz if available, otherwise gzip)
+    -c          Compress backup with gzip (pigz if available)
+    -z          Compress backup with zstd
+    -L <level>  Compression level (gzip: 1-9, zstd: 1-19)
     -e          Encrypt backup with public key (asymmetric GPG)
     -s          Encrypt backup with passphrase (symmetric GPG)
     -b <bucket> Upload backup to S3 bucket
     -f <path>   S3 folder/prefix inside bucket
-    -k <file>   Public key filename inside ${GPG_ROOT} (default: public.gpg)
+    -k <file>   Public key file for -e: absolute path or file inside ${GPG_ROOT}
+                (default: public.gpg). Repeatable: the backup is encrypted to
+                every key of every file
 
 Environment variables:
   BACKUP_ROOT           Local backup directory (default: /backups)
   VOLUMES_ROOT          Mounted volumes root (default: /volumes)
   GPG_ROOT              Mounted GPG directory (default: /gpg)
   BACKUP_TIMESTAMP      Override backup timestamp (default: current time, format: YYYYMMDD_HHMMSS)
+  VB_LOCK_TIMEOUT       Seconds to wait for the lock on BACKUP_ROOT (default: 300)
+  *_FILE                Read GPG_PASSPHRASE, GPG_PUBLIC_KEY, AWS_ACCESS_KEY_ID,
+                        AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN from a file
+                        (e.g. GPG_PASSPHRASE_FILE=/run/secrets/passphrase)
   GPG_PUBLIC_KEY        Public key content for asymmetric encryption
   GPG_PASSPHRASE        Passphrase for symmetric encryption
   AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 upload)
   AWS_SECRET_ACCESS_KEY S3 secret access key (required for S3 upload)
   AWS_SESSION_TOKEN     S3 session token for temporary credentials (STS/IAM roles)
-  AWS_REGION            S3 region (default: us-east-1)
-  AWS_ENDPOINT_URL      Optional custom S3 endpoint (Yandex Cloud, MinIO, DO Spaces, etc.)
+  AWS_REGION            S3 region (AWS: detected from the bucket when unset; custom endpoints: us-east-1)
+  AWS_DEFAULT_REGION    Fallback for AWS_REGION
+  AWS_ENDPOINT_URL      Optional custom S3 endpoint, scheme://host[:port] (Yandex Cloud, MinIO, DO Spaces, etc.)
+  S3_ADDRESSING_STYLE   auto (default), path or virtual
+  S3_PART_SIZE          Multipart part size in MiB, 5-5120 (default: 64); max object size is 10000 parts
+  S3_ALLOW_UNCONDITIONAL_WRITES
+                        Set to 1 to publish on providers without conditional writes (loses overwrite protection)
+  S3_ALLOW_UNCONDITIONAL_DELETE
+                        Set to 1 to rotate on providers that ignore If-Match on DELETE (loses protection
+                        against deleting an object that was replaced meanwhile)
   NO_COLOR              Disable colors in logs
 
 Notes:
-  - S3 upload uses the MinIO client (mc). Compatible with AWS S3, MinIO, Yandex Cloud, DO Spaces, and other S3-compatible stores.
+  - S3 uploads use curl with AWS Signature V4 and multipart uploads. Compatible with AWS S3, Yandex Cloud, MinIO, DO Spaces, and other S3-compatible stores.
+  - Objects are published with If-None-Match, so an existing recovery point is never overwritten.
   - Use the same backup timestamp across multiple runs to create one logical snapshot set.
   - For consistency-sensitive apps (databases), stop writes or use app-aware dumps.
 
@@ -201,45 +193,51 @@ EOF
 # ------------------------------------------------------------------------------
 
 cleanup() {
+  local pid
+
+  # Children of an "all" backup stop their own pipelines and uploads on TERM
+  for pid in "${running_pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${running_pids[@]}"; do
+    stop_process_tree "$pid" TERM
+  done
+  running_pids=()
+
+  if [[ -n "$pipeline_pid" ]]; then
+    stop_process_tree "$pipeline_pid" TERM
+    pipeline_pid=""
+  fi
+  if [[ -n "$checksum_pid" ]]; then
+    stop_process_tree "$checksum_pid" TERM
+    checksum_pid=""
+  fi
+
   if [[ -n "$tmp_backup_path" && -f "$tmp_backup_path" ]]; then
     rm -f "$tmp_backup_path"
   fi
-
-  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
-    rm -rf "$tmp_dir"
+  if [[ -n "$tmp_sidecar_path" && -f "$tmp_sidecar_path" ]]; then
+    rm -f "$tmp_sidecar_path"
   fi
 
-  if [[ -n "$mc_config_dir" && -d "$mc_config_dir" ]]; then
-    rm -rf "$mc_config_dir"
-  fi
+  s3_cleanup
+  cleanup_work_dir
 }
 
-terminate_children() {
-  local pid
-  for pid in "${!pid_to_volume[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
+on_signal() {
+  trap '' INT TERM
+  log WARN "Received SIG$1, stopping"
+  exit "$2"
 }
 
 trap cleanup EXIT
-trap 'log WARN "Interrupted"; terminate_children; wait || true; exit 130' INT
-trap 'log WARN "Terminated"; terminate_children; wait || true; exit 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'report_unexpected_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
-}
-
-validate_volume_name() {
-  local name="$1"
-  [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || die \
-    "Volume name must contain only alphanumeric characters, dots, dashes, and underscores"
-}
 
 file_size_human() {
   local path="$1"
@@ -250,9 +248,10 @@ build_filename_for_volume() {
   local vol="$1"
   local name="${vol}_${backup_timestamp}.tar"
 
-  if (( compress )); then
-    name+=".gz"
-  fi
+  case "$compression" in
+    gzip) name+=".gz" ;;
+    zstd) name+=".zst" ;;
+  esac
 
   if (( symmetric || encrypt )); then
     name+=".gpg"
@@ -265,135 +264,107 @@ build_destination_for_filename() {
   local fname="$1"
 
   if (( upload_to_s3 )); then
-    local folder="${s3_folder#/}"
-    folder="${folder%/}"
-    if [[ -n "$folder" ]]; then
-      printf 's3://%s/%s/%s\n' "$s3_bucket" "$folder" "$fname"
-    else
-      printf 's3://%s/%s\n' "$s3_bucket" "$fname"
-    fi
+    printf 's3://%s/%s\n' "$s3_bucket" "${s3_prefix:+${s3_prefix}/}${fname}"
   else
     printf '%s/%s\n' "${backup_root%/}" "$fname"
   fi
 }
 
 construct_s3_url() {
-  local folder="${s3_folder#/}"
-  folder="${folder%/}"
+  s3_key="${s3_prefix:+${s3_prefix}/}${filename}"
+  s3_url="s3://${s3_bucket}/${s3_key}"
+}
 
+# Public keys for -e: the keys in GPG_PUBLIC_KEY plus every -k file; without
+# either, ${GPG_ROOT}/public.gpg.
+collect_public_key_sources() {
   local key
-  if [[ -n "$folder" ]]; then
-    key="${folder}/${filename}"
-  else
-    key="${filename}"
-  fi
+  public_key_sources=()
 
-  s3_url="s3://${s3_bucket}/${key}"
-  s3_mc_path="vb/${s3_bucket}/${key}"
-}
-
-prepare_s3_client() {
-  mc_config_dir="$(mktemp -d)"
-
-  local endpoint
-  if [[ -n "$aws_endpoint_url" ]]; then
-    endpoint="$aws_endpoint_url"
-  else
-    endpoint="https://s3.${aws_region}.amazonaws.com"
-  fi
-
-  local -a session_token_flag=()
-  if [[ -n "$aws_session_token" ]]; then
-    session_token_flag=(--session-token "$aws_session_token")
-  fi
-
-  mc --config-dir "$mc_config_dir" alias set vb \
-    "$endpoint" \
-    "$aws_access_key_id" \
-    "$aws_secret_access_key" \
-    "${session_token_flag[@]}" \
-    >/dev/null 2>&1 \
-    || die "Failed to configure S3 client"
-}
-
-prepare_gpg_home() {
-  tmp_dir="$(mktemp -d)"
-  export GNUPGHOME="${tmp_dir}/gnupg"
-  mkdir -p "$GNUPGHOME"
-  chmod 700 "$GNUPGHOME"
-  printf 'allow-loopback-pinentry\n' > "${GNUPGHOME}/gpg-agent.conf"
-  gpgconf --launch gpg-agent >/dev/null 2>&1 || true
-}
-
-prepare_asymmetric_gpg() {
-  local key_source
-
-  prepare_gpg_home
+  for key in "${pgp_keys[@]}"; do
+    [[ "$key" == /* ]] || key="${GPG_ROOT%/}/${key}"
+    [[ -f "$key" ]] || die "Public key file not found: $key"
+    public_key_sources+=("$key")
+  done
 
   if [[ -n "$gpg_raw_key" ]]; then
-    key_source="${tmp_dir}/public.key"
-    printf '%s' "$gpg_raw_key" > "$key_source"
-    chmod 600 "$key_source"
-  else
-    key_source="${GPG_ROOT%/}/${pgp_key}"
+    public_key_sources+=(env:GPG_PUBLIC_KEY)
+  elif (( ${#pgp_keys[@]} == 0 )); then
+    key="${GPG_ROOT%/}/public.gpg"
+    [[ -f "$key" ]] || die "Either GPG_PUBLIC_KEY or ${key} must be provided (or pass -k)"
+    public_key_sources+=("$key")
   fi
+}
 
-  [[ -f "$key_source" ]] || die "Public key file not found: $key_source"
+# Imports the public keys and selects every primary key as a recipient. Keys
+# that are expired, revoked or cannot encrypt are refused instead of being
+# skipped, so that no intended recipient silently loses access.
+prepare_asymmetric_gpg() {
+  local source file listing fpr validity caps
+  recipient_fprs=()
 
-  recipient_fpr="$(
-    gpg --batch --with-colons --import-options show-only --import "$key_source" 2>/dev/null \
-      | awk -F: '/^fpr:/ { print $10; exit }'
-  )"
+  prepare_gpg_home
+  collect_public_key_sources
 
-  [[ -n "$recipient_fpr" ]] || die "Unable to extract recipient fingerprint from public key"
+  for source in "${public_key_sources[@]}"; do
+    file="$source"
+    if [[ "$source" == env:GPG_PUBLIC_KEY ]]; then
+      file="${work_dir}/public.key"
+      printf '%s' "$gpg_raw_key" > "$file"
+      chmod 600 "$file"
+    fi
 
-  gpg --batch --import "$key_source" >/dev/null 2>&1 || die "Failed to import public key"
+    listing="$(gpg --batch --with-colons --import-options show-only --import "$file" 2>/dev/null \
+      | awk -F: '
+        $1 == "pub" { want = 1; validity = $2; caps = $12; next }
+        $1 == "fpr" && want { print $10 ":" validity ":" caps; want = 0 }
+        $1 == "sub" { want = 0 }
+      ')" || true
+    [[ -n "$listing" ]] || die "No public key found in ${source}"
+
+    while IFS=: read -r fpr validity caps; do
+      [[ "$validity" != e ]] || die "Public key ${fpr} from ${source} has expired"
+      [[ "$validity" != r ]] || die "Public key ${fpr} from ${source} is revoked"
+      [[ "$caps" == *E* ]] || die "Public key ${fpr} from ${source} has no usable encryption key"
+      recipient_fprs+=("$fpr")
+    done <<< "$listing"
+
+    gpg --batch --import "$file" >/dev/null 2>&1 || die "Failed to import public key from ${source}"
+  done
+
+  log INFO "Recipients: ${recipient_fprs[*]}"
 }
 
 prepare_compressor() {
-  if (( compress == 0 )); then
-    compressor_cmd=()
-    compressor_name="none"
-    return 0
+  local -a level=()
+  [[ -z "$compression_level" ]] || level=("-${compression_level}")
+
+  case "$compression" in
+    "")
+      compressor_cmd=()
+      compressor_name="none"
+      ;;
+    zstd)
+      command -v zstd >/dev/null 2>&1 || die "Compression with zstd requested (-z), but zstd is not installed"
+      compressor_cmd=(zstd -q -c -T0 "${level[@]}")
+      compressor_name="zstd"
+      ;;
+    gzip)
+      if command -v pigz >/dev/null 2>&1; then
+        compressor_cmd=(pigz -c "${level[@]}")
+        compressor_name="pigz"
+      elif command -v gzip >/dev/null 2>&1; then
+        compressor_cmd=(gzip -c "${level[@]}")
+        compressor_name="gzip"
+        log WARN "pigz not found, falling back to gzip"
+      else
+        die "Compression requested, but neither pigz nor gzip is installed"
+      fi
+      ;;
+  esac
+  if [[ -n "$compression_level" ]]; then
+    compressor_name+=" (level ${compression_level})"
   fi
-
-  if command -v pigz >/dev/null 2>&1; then
-    compressor_cmd=(pigz -c)
-    compressor_name="pigz"
-  elif command -v gzip >/dev/null 2>&1; then
-    compressor_cmd=(gzip -c)
-    compressor_name="gzip"
-    log WARN "pigz not found, falling back to gzip"
-  else
-    die "Compression requested, but neither pigz nor gzip is installed"
-  fi
-}
-
-prepare_tar_flags() {
-  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
-    tar_extra_flags=(--acls --xattrs '--xattrs-include=*' --sparse)
-  fi
-}
-
-# Returns 0 if the S3 object exists, 1 if it confirmedly does not.
-# Any other error (auth denied, network failure, malformed credentials) is
-# treated as fatal — we must never proceed to overwrite when stat is ambiguous.
-s3_object_exists() {
-  local path="$1"
-  local stat_output stat_rc
-
-  stat_output="$(mc --config-dir "$mc_config_dir" stat "$path" 2>&1)"
-  stat_rc=$?
-
-  if (( stat_rc == 0 )); then
-    return 0
-  fi
-
-  if grep -qiE 'does not exist|not found|no such (key|object|file)' <<<"$stat_output"; then
-    return 1
-  fi
-
-  die "Failed to check S3 object existence at $path: $stat_output"
 }
 
 prepare_gpg_runtime() {
@@ -404,12 +375,27 @@ prepare_gpg_runtime() {
   fi
 }
 
+# GNU tar exits with 1 when files changed while they were read, which is
+# common on live volumes; that is a warning unless -S was given.
 archive_stream() {
-  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" .
+  local rc=0 pattern
+  local -a excludes=()
+  for pattern in "${exclude_patterns[@]}"; do
+    excludes+=("--exclude=${pattern}")
+  done
+  vb_test_point "archive_stream" "$volume"
+  # --exclude is positional in GNU tar: it must precede the member list
+  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" "${excludes[@]}" . || rc=$?
+
+  if (( rc == 1 && ! strict_tar )); then
+    log WARN "Some files changed while they were archived; their copies may be inconsistent (use -S to fail instead)"
+    return 0
+  fi
+  return "$rc"
 }
 
 compress_stream() {
-  if (( compress )); then
+  if [[ -n "$compression" ]]; then
     "${compressor_cmd[@]}"
   else
     cat
@@ -431,41 +417,22 @@ encrypt_stream() {
       --compress-algo none \
       3<<<"$gpg_passphrase"
   elif (( encrypt )); then
+    local fpr
+    local -a recipients=()
+    for fpr in "${recipient_fprs[@]}"; do
+      recipients+=(--recipient "$fpr")
+    done
     gpg \
       --batch \
       --yes \
       --no-tty \
       --trust-model always \
       --encrypt \
-      --recipient "$recipient_fpr" \
+      "${recipients[@]}" \
       --compress-algo none
   else
     cat
   fi
-}
-
-write_destination() {
-  cat > "$tmp_backup_path"
-}
-
-write_checksum() {
-  local target="$1"
-  local hash
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    hash="$(sha256sum "$target" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    hash="$(shasum -a 256 "$target" | awk '{print $1}')"
-  else
-    log WARN "sha256sum/shasum not found, checksum skipped"
-    return 0
-  fi
-
-  # Store only the basename — sidecars must stay portable when the archive
-  # is moved or copied. Verification on restore re-hashes src_path directly
-  # and compares to the recorded digest, ignoring the filename field.
-  printf '%s  %s\n' "$hash" "$(basename -- "$target")" > "${target}.sha256"
-  log INFO "Checksum written: ${target}.sha256"
 }
 
 validate_common_options() {
@@ -476,24 +443,26 @@ validate_common_options() {
 
   if (( symmetric )); then
     [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
+    check_passphrase_newline "$gpg_passphrase"
   fi
 
   if (( encrypt )); then
-    [[ -n "$gpg_raw_key" || -f "${GPG_ROOT%/}/${pgp_key}" ]] || die \
-      "Either GPG_PUBLIC_KEY env var or ${GPG_ROOT%/}/${pgp_key} must be provided"
+    collect_public_key_sources
+  elif (( ${#pgp_keys[@]} > 0 )); then
+    log WARN "Option -k is only used with -e; ignoring it"
   fi
 
   if (( upload_to_s3 )); then
     [[ -n "$s3_bucket" ]] || die "S3 bucket must be provided with -b"
-    [[ -n "$aws_access_key_id" ]] || die "AWS_ACCESS_KEY_ID environment variable is not set"
-    [[ -n "$aws_secret_access_key" ]] || die "AWS_SECRET_ACCESS_KEY environment variable is not set"
-    require_command mc
-    prepare_s3_client
+    s3_validate_bucket "$s3_bucket"
+    s3_prefix="$(s3_normalize_prefix "$s3_folder")"
+    s3_init "$s3_bucket"
   else
     [[ -n "$backup_root" ]] || die "Backup directory is empty"
   fi
 
   require_command tar
+  require_command flock
 
   if (( symmetric || encrypt )); then
     require_command gpg
@@ -504,45 +473,87 @@ validate_common_options() {
 }
 
 validate_single_mode() {
-  directory="${VOLUMES_ROOT%/}/${volume}"
-  [[ -d "$directory" ]] || die "Volume '$volume' is not mounted into ${VOLUMES_ROOT}"
+  [[ -d "${VOLUMES_ROOT%/}/${volume}" ]] || die "Volume '$volume' is not mounted into ${VOLUMES_ROOT}"
+  directory="$(resolve_volume_dir "$volume")" || die \
+    "Refusing volume '$volume': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
+  check_source_has_no_reserved_entries
+  check_backup_root_outside_volume
+
+  local mounts
+  # Only a warning depends on it: the backup itself is the same either way
+  mounts="$(mounts_below "$directory")" || log WARN \
+    "Cannot read the mount table; mount points inside volume '$volume' were not checked"
+  [[ -z "$mounts" ]] || log WARN \
+    "Volume '$volume' contains other mount points ($(printf '%s ' "$mounts")); their contents are included in the backup, but a restore refuses targets with mount points"
 
   validate_common_options
+}
+
+# The archive is written to BACKUP_ROOT while the volume is read, so a
+# BACKUP_ROOT inside the volume would end up in its own backup.
+check_backup_root_outside_volume() {
+  (( ! upload_to_s3 )) || return 0
+  local real_root
+  real_root="$(realpath -m -- "$backup_root")"
+  [[ "$real_root" != "$directory" && "$real_root" != "$directory"/* ]] || die \
+    "The backup directory ${backup_root} is inside volume '$volume'; the backup would contain itself. Use another directory (-d)"
 }
 
 collect_selected_volumes_for_all_mode() {
   declare -ga SELECTED_VOLUMES=()
 
   if (( ${#requested_volumes[@]} > 0 )); then
-    while IFS= read -r vol; do
+    local -a requested=()
+    vb_collect requested line vb_sort_lines -u -- "${requested_volumes[@]}"
+    for vol in "${requested[@]}"; do
       local dir="${VOLUMES_ROOT%/}/${vol}"
       [[ -d "$dir" ]] || die "Requested volume is not mounted into ${VOLUMES_ROOT}: $vol"
       SELECTED_VOLUMES+=("$vol")
-    done < <(printf '%s\n' "${requested_volumes[@]}" | sort -u)
+    done
     return
   fi
 
-  while IFS= read -r -d '' dir; do
+  local -a dirs=()
+  vb_collect dirs nul find "$VOLUMES_ROOT" -mindepth 1 -maxdepth 1 -type d -print0
+  for dir in "${dirs[@]}"; do
     local vol
     vol="$(basename "$dir")"
 
-    if [[ ! "$vol" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    if ! is_valid_volume_name "$vol"; then
       log WARN "Skipping directory with unsafe volume name: $vol"
       continue
     fi
 
     SELECTED_VOLUMES+=("$vol")
-  done < <(find "$VOLUMES_ROOT" -mindepth 1 -maxdepth 1 -type d -print0)
+  done
 
   (( ${#SELECTED_VOLUMES[@]} > 0 )) || die "No mounted volumes found in ${VOLUMES_ROOT}"
-  mapfile -t SELECTED_VOLUMES < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort -u)
+  vb_collect SELECTED_VOLUMES line vb_sort_lines -u -- "${SELECTED_VOLUMES[@]}"
 }
 
 build_child_args() {
   declare -ga CHILD_ARGS=()
 
-  if (( compress )); then
-    CHILD_ARGS+=(-c)
+  case "$compression" in
+    gzip) CHILD_ARGS+=(-c) ;;
+    zstd) CHILD_ARGS+=(-z) ;;
+  esac
+  if [[ -n "$compression_level" ]]; then
+    CHILD_ARGS+=(-L "$compression_level")
+  fi
+  local pattern
+  for pattern in "${exclude_patterns[@]}"; do
+    CHILD_ARGS+=(-x "$pattern")
+  done
+  if [[ -n "$keep_count" ]]; then
+    CHILD_ARGS+=(-R "$keep_count")
+  fi
+  if [[ -n "$keep_days" ]]; then
+    CHILD_ARGS+=(-D "$keep_days")
+  fi
+
+  if (( strict_tar )); then
+    CHILD_ARGS+=(-S)
   fi
 
   if (( encrypt )); then
@@ -560,23 +571,10 @@ build_child_args() {
     fi
   fi
 
-  if (( encrypt )) && [[ -n "$pgp_key" ]]; then
-    CHILD_ARGS+=(-k "$pgp_key")
-  fi
-}
-
-remove_running_pid() {
-  local pid_to_remove="$1"
-  local pid
-  local new_running=()
-
-  for pid in "${running_pids[@]}"; do
-    if [[ "$pid" != "$pid_to_remove" ]]; then
-      new_running+=("$pid")
-    fi
+  local key
+  for key in "${pgp_keys[@]}"; do
+    CHILD_ARGS+=(-k "$key")
   done
-
-  running_pids=("${new_running[@]}")
 }
 
 launch_child_backup() {
@@ -593,41 +591,345 @@ launch_child_backup() {
   log INFO "Launched backup: $vol (pid=$pid)"
 }
 
-reap_one_child() {
-  local pid=""
-  local vol=""
-  local status=0
+# Waits until at least one running child has finished and records its result.
+reap_children() {
+  local i pid vol
+  local -a running=()
 
-  if (( wait_supports_p )); then
-    if wait -n -p pid; then
-      status=0
+  vb_wait_any "${running_pids[@]}"
+  for i in "${!vb_done_pids[@]}"; do
+    pid="${vb_done_pids[i]}"
+    vol="${pid_to_volume[$pid]:-unknown}"
+    unset 'pid_to_volume[$pid]'
+    if (( vb_done_status[i] == 0 )); then
+      log INFO "Backup completed: $vol"
     else
-      status=$?
+      log ERROR "Backup failed: $vol"
+      failed=1
     fi
-  else
-    pid="${running_pids[0]}"
-    if wait "$pid"; then
-      status=0
-    else
-      status=$?
-    fi
-  fi
+  done
 
-  vol="${pid_to_volume[$pid]:-unknown}"
-  remove_running_pid "$pid"
-  unset 'pid_to_volume[$pid]'
-
-  if (( status == 0 )); then
-    log INFO "Backup completed: $vol"
-  else
-    log ERROR "Backup failed: $vol"
-    failed=1
-  fi
+  for pid in "${running_pids[@]}"; do
+    [[ " ${vb_done_pids[*]} " == *" ${pid} "* ]] || running+=("$pid")
+  done
+  running_pids=("${running[@]}")
 }
 
 wait_for_all_children() {
   while (( ${#running_pids[@]} > 0 )); do
-    reap_one_child
+    reap_children
+  done
+}
+
+# Refuses to start when the archive already exists, or when a checksum
+# sidecar without its archive occupies the name (it could later be mistaken
+# for the checksum of a new archive).
+check_s3_destination_is_free() {
+  if s3_head "$s3_bucket" "$s3_key"; then
+    die "Backup object already exists in S3: $s3_url"
+  fi
+  if s3_head "$s3_bucket" "${s3_key}.sha256"; then
+    die "A checksum sidecar without its archive already exists in S3: ${s3_url}.sha256. Inspect and remove it before reusing this timestamp"
+  fi
+}
+
+# Streams the archive as a multipart upload. The object only becomes visible
+# when every stage of the pipeline succeeded; otherwise the upload is aborted.
+# The checksum sidecar is published last and marks the backup as complete.
+upload_backup_to_s3() {
+  local token sha_fifo sha_out digest stream_ok=1 rc=0
+
+  ensure_work_dir
+  token="$(random_hex 16)"
+  sha_fifo="${work_dir}/sha.fifo"
+  sha_out="${work_dir}/sha.out"
+  mkfifo "$sha_fifo"
+
+  s3_mp_begin "$s3_bucket" "$s3_key" "$token"
+
+  sha256sum < "$sha_fifo" > "$sha_out" &
+  checksum_pid=$!
+
+  # In the background, so that signals are handled while it runs
+  (archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" | s3_mp_upload_parts) &
+  pipeline_pid=$!
+  wait "$pipeline_pid" || stream_ok=0
+  pipeline_pid=""
+  wait "$checksum_pid" || stream_ok=0
+  checksum_pid=""
+
+  if (( ! stream_ok )); then
+    s3_mp_abort
+    die "Backup stream failed; the multipart upload was aborted and nothing was published"
+  fi
+
+  digest="$(awk '{ print $1 }' "$sha_out")"
+  if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    s3_mp_abort
+    die "Failed to compute backup checksum"
+  fi
+
+  vb_test_point "s3_before_complete"
+  s3_mp_complete || rc=$?
+  (( rc == 0 )) || die "Backup object appeared in S3 while uploading (concurrent backup?): $s3_url. The upload was aborted"
+  log INFO "Backup uploaded: $s3_url"
+
+  printf '%s  %s\n' "$digest" "$filename" > "${work_dir}/sidecar.sha256"
+  vb_test_point "s3_before_sidecar"
+  rc=0
+  s3_put_file "$s3_bucket" "${s3_key}.sha256" "${work_dir}/sidecar.sha256" "$token" || rc=$?
+  (( rc == 0 )) || die \
+    "Publication incomplete: ${s3_url} was uploaded, but ${s3_url}.sha256 is occupied by another object. The archive was kept and counts as incomplete; inspect both objects"
+
+  log INFO "Checksum uploaded: ${s3_url}.sha256"
+  log INFO "Backup uploaded successfully: $s3_url"
+}
+
+# Reserved entries mean an unfinished restore (or a name the restore would
+# refuse); archiving them would produce an inconsistent or unrestorable backup.
+check_source_has_no_reserved_entries() {
+  local reserved
+  reserved="$(txn_describe_reserved "$directory")" || die "Failed to inspect ${directory}"
+  [[ -z "$reserved" ]] || die \
+    "Volume '$volume' holds reserved entries ($(printf '%s; ' "$reserved")). If a restore was interrupted, run 'restore -X'; otherwise rename them"
+}
+
+check_local_destination_is_free() {
+  [[ ! -e "$backup_path" ]] || die "Backup file already exists: $backup_path"
+  [[ ! -e "${backup_path}.sha256" ]] || die \
+    "A checksum file without its archive already exists: ${backup_path}.sha256. Inspect and remove it before reusing this timestamp"
+}
+
+# Writes the archive to a private temporary file, then publishes the archive
+# and its checksum sidecar under the BACKUP_ROOT lock. Every operation on
+# backup names (publishing, rotation) runs under that lock, so the check and
+# the renames cannot interleave with another backup. The sidecar is renamed
+# last and marks the backup as complete.
+publish_local_backup() {
+  local sha_fifo sha_out digest lock_fd stream_ok=1
+
+  mkdir -p "$backup_root"
+  check_local_destination_is_free
+
+  ensure_work_dir
+  tmp_backup_path="$(mktemp "${backup_path}.XXXXXX.part")"
+  sha_fifo="${work_dir}/sha.fifo"
+  sha_out="${work_dir}/sha.out"
+  mkfifo "$sha_fifo"
+
+  sha256sum < "$sha_fifo" > "$sha_out" &
+  checksum_pid=$!
+
+  # In the background, so that signals are handled while it runs
+  (archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" > "$tmp_backup_path") &
+  pipeline_pid=$!
+  wait "$pipeline_pid" || stream_ok=0
+  pipeline_pid=""
+  wait "$checksum_pid" || stream_ok=0
+  checksum_pid=""
+  (( stream_ok )) || die "Backup stream failed; nothing was published"
+
+  digest="$(awk '{ print $1 }' "$sha_out")"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "Failed to compute backup checksum"
+  [[ -s "$tmp_backup_path" ]] || die "Backup file is empty"
+
+  tmp_sidecar_path="$(mktemp "${backup_path}.sha256.XXXXXX.part")"
+  printf '%s  %s\n' "$digest" "$filename" > "$tmp_sidecar_path"
+  sync -- "$tmp_backup_path" "$tmp_sidecar_path"
+
+  exec {lock_fd}>>"${backup_root%/}/.vb.lock"
+  flock -x -w "${VB_LOCK_TIMEOUT:-300}" "$lock_fd" || die "Timed out waiting for the lock on ${backup_root}"
+
+  check_local_destination_is_free
+  vb_test_point "local_publish" "$volume"
+  mv -T -- "$tmp_backup_path" "$backup_path"
+  tmp_backup_path=""
+  mv -T -- "$tmp_sidecar_path" "${backup_path}.sha256"
+  tmp_sidecar_path=""
+  sync -- "$backup_root"
+
+  exec {lock_fd}>&-
+
+  log INFO "Checksum written: ${backup_path}.sha256"
+}
+
+# ------------------------------------------------------------------------------
+# Rotation
+# ------------------------------------------------------------------------------
+
+# Decides which backups of $volume to delete from the current catalog and
+# fills rotation_deletes with their catalog indices. A complete backup stays
+# if it is the newest complete one, among the -R newest complete ones, or
+# younger than -D days. Incomplete backups stay unless -D expires them, and
+# orphaned checksum files in S3 always stay (they are only reported).
+plan_rotation() {
+  local cutoff=0 rank=0 i keep epoch
+  local -a indices=()
+  rotation_deletes=()
+
+  if [[ -n "$keep_days" ]]; then
+    cutoff=$(( $(date -u +%s) - keep_days * 86400 ))
+  fi
+  vb_collect indices line catalog_indices_for_volume "$volume"
+
+  for i in "${indices[@]}"; do
+    keep=0
+    if ! epoch="$(catalog_ts_epoch "${cat_ts[i]}")"; then
+      log WARN "Rotation: keeping ${cat_names[i]}: its timestamp is not a valid date"
+      [[ "${cat_status[i]}" != complete ]] || rank=$((rank + 1))
+      continue
+    fi
+    if [[ "${cat_names[i]}" == "$filename" ]]; then
+      # Never the backup that was just made, whatever its timestamp
+      keep=1
+      [[ "${cat_status[i]}" != complete ]] || rank=$((rank + 1))
+    elif [[ "${cat_status[i]}" == complete ]]; then
+      (( rank > 0 )) || keep=1
+      if [[ -n "$keep_count" ]] && (( rank < keep_count )); then
+        keep=1
+      fi
+      if [[ -n "$keep_days" ]] && (( epoch >= cutoff )); then
+        keep=1
+      fi
+      rank=$((rank + 1))
+    elif [[ "${cat_status[i]}" == orphan ]] && (( upload_to_s3 )); then
+      keep=1
+      log WARN "Rotation: ${cat_locations[i]}.sha256 has no archive; orphaned checksum files are not deleted in S3"
+    elif [[ -z "$keep_days" ]] || (( epoch >= cutoff )); then
+      keep=1
+      log WARN "Rotation: keeping ${cat_status[i]} backup ${cat_names[i]} (${cat_reasons[i]}); only -D deletes incomplete backups"
+    fi
+    (( keep )) || rotation_deletes+=("$i")
+  done
+}
+
+rotation_entry_label() {
+  local i="$1"
+  if [[ "${cat_status[i]}" == complete ]]; then
+    printf '%s\n' "${cat_names[i]}"
+  else
+    printf '%s (%s: %s)\n' "${cat_names[i]}" "${cat_status[i]}" "${cat_reasons[i]}"
+  fi
+}
+
+# Shows what a rotation after this backup would delete.
+preview_rotation() {
+  local i
+  if (( upload_to_s3 )); then
+    catalog_scan_s3 "$s3_bucket" "$s3_prefix" 1
+  elif [[ -d "$backup_root" ]]; then
+    catalog_scan_local "$backup_root"
+  else
+    catalog_reset
+  fi
+  catalog_add_virtual "$filename"
+  plan_rotation
+
+  for i in "${rotation_deletes[@]}"; do
+    log INFO "Rotation would delete: $(rotation_entry_label "$i")"
+  done
+  (( ${#rotation_deletes[@]} > 0 )) || log INFO "Rotation would delete nothing"
+}
+
+# Local rotation runs entirely under the BACKUP_ROOT lock, like publishing:
+# the listing, the plan and the deletions cannot interleave with another
+# backup. A pair loses its checksum file first, so an interrupted deletion
+# leaves an incomplete archive, never a checksum file without its archive.
+rotate_local() {
+  local lock_fd i path
+
+  exec {lock_fd}>>"${backup_root%/}/.vb.lock"
+  flock -x -w "${VB_LOCK_TIMEOUT:-300}" "$lock_fd" || die "Timed out waiting for the lock on ${backup_root}"
+
+  catalog_scan_local "$backup_root"
+  plan_rotation
+  vb_test_point "rotate_planned" "$volume"
+
+  for i in "${rotation_deletes[@]}"; do
+    path="${cat_locations[i]}"
+    if (( cat_sidecars[i] )); then
+      rm -f -- "${path}.sha256" || die "Rotation failed to delete ${path}.sha256"
+      sync -- "$backup_root" || die "Rotation failed to sync ${backup_root}"
+      vb_test_point "rotate_pair" "$volume"
+    fi
+    if [[ "${cat_status[i]}" != orphan ]]; then
+      rm -f -- "$path" || die "Rotation failed to delete ${path}"
+    fi
+    log INFO "Rotation deleted: $(rotation_entry_label "$i")"
+  done
+  sync -- "$backup_root" || die "Rotation failed to sync ${backup_root}"
+
+  exec {lock_fd}>&-
+}
+
+# Refuses a conditional rotation before its first DELETE when the listing
+# gave no ETag for an object it would delete: missing metadata must never
+# turn into a DELETE without If-Match.
+rotation_require_etags() {
+  local i
+  local -a missing=()
+
+  for i in "${rotation_deletes[@]}"; do
+    [[ -n "${cat_etags[i]}" ]] || missing+=("s3://${s3_bucket}/${cat_keys[i]}")
+    if (( cat_sidecars[i] )) && [[ -z "${cat_sidecar_etags[i]}" ]]; then
+      missing+=("s3://${s3_bucket}/${cat_keys[i]}.sha256")
+    fi
+  done
+  (( ${#missing[@]} == 0 )) || die \
+    "Rotation needs the ETag of every object it deletes, but the listing gave none for: ${missing[*]}. Nothing was deleted"
+}
+
+# S3 has no locks, so every DELETE is conditional on the ETag seen when the
+# plan was made: an object replaced in the meantime is kept.
+rotate_s3() {
+  local i rc conditional=1
+
+  catalog_scan_s3 "$s3_bucket" "$s3_prefix" 1
+  plan_rotation
+  if (( ${#rotation_deletes[@]} == 0 )); then
+    return 0
+  fi
+
+  if ! s3_probe_conditional_delete "$s3_bucket" "$s3_prefix"; then
+    [[ "${S3_ALLOW_UNCONDITIONAL_DELETE:-0}" == 1 ]] || die \
+      "The S3 provider does not honour If-Match on DELETE, so rotation could delete a backup that was replaced after it was checked. Set S3_ALLOW_UNCONDITIONAL_DELETE=1 to accept that risk"
+    log WARN "The S3 provider ignores If-Match on DELETE; rotating without that protection because S3_ALLOW_UNCONDITIONAL_DELETE=1"
+    conditional=0
+  fi
+  # The opt-in only covers a provider that ignores If-Match, never objects
+  # listed without an ETag
+  (( ! conditional )) || rotation_require_etags
+
+  vb_test_point "rotate_planned" "$volume"
+
+  for i in "${rotation_deletes[@]}"; do
+    if (( cat_sidecars[i] )); then
+      rc=0
+      if (( conditional )); then
+        s3_delete_if_match "$s3_bucket" "${cat_keys[i]}.sha256" "${cat_sidecar_etags[i]}" || rc=$?
+      else
+        s3_delete_object "$s3_bucket" "${cat_keys[i]}.sha256" || rc=$?
+      fi
+      if (( rc == 3 )); then
+        log WARN "Rotation kept ${cat_names[i]}: its checksum file changed after it was checked"
+        continue
+      fi
+      (( rc == 0 )) || die "The S3 provider rejected a conditional DELETE (HTTP 501) of s3://${s3_bucket}/${cat_keys[i]}.sha256"
+      vb_test_point "rotate_pair" "$volume"
+    fi
+
+    rc=0
+    if (( conditional )); then
+      s3_delete_if_match "$s3_bucket" "${cat_keys[i]}" "${cat_etags[i]}" || rc=$?
+    else
+      s3_delete_object "$s3_bucket" "${cat_keys[i]}" || rc=$?
+    fi
+    if (( rc == 3 )); then
+      log WARN "Rotation kept ${cat_names[i]}: the archive changed after it was checked"
+      continue
+    fi
+    (( rc == 0 )) || die "The S3 provider rejected a conditional DELETE (HTTP 501) of s3://${s3_bucket}/${cat_keys[i]}"
+    log INFO "Rotation deleted: $(rotation_entry_label "$i")"
   done
 }
 
@@ -640,18 +942,13 @@ run_single_backup() {
     construct_s3_url
   else
     backup_path="${backup_root%/}/${filename}"
-    tmp_backup_path="${backup_path}.part"
   fi
 
   log INFO "Starting backup"
   log INFO "Volume: $volume"
   log INFO "Source directory: $directory"
 
-  if (( compress )); then
-    log INFO "Compression: ${compressor_name}"
-  else
-    log INFO "Compression: none"
-  fi
+  log INFO "Compression: ${compressor_name}"
 
   if (( symmetric )); then
     log INFO "Encryption: symmetric GPG"
@@ -668,51 +965,49 @@ run_single_backup() {
   fi
 
   if (( dry_run )); then
-    if (( upload_to_s3 == 0 )) && [[ -e "$backup_path" ]]; then
-      die "Backup file already exists: $backup_path"
+    if (( upload_to_s3 == 0 )); then
+      check_local_destination_is_free
     fi
-    if (( upload_to_s3 )) && s3_object_exists "$s3_mc_path"; then
-      die "Backup object already exists in S3: $s3_url"
+    if (( upload_to_s3 )); then
+      check_s3_destination_is_free
+    fi
+    if (( encrypt )); then
+      prepare_asymmetric_gpg
+    fi
+    if [[ -n "$keep_count$keep_days" ]]; then
+      preview_rotation
     fi
     log INFO "Dry-run: no changes made"
     return 0
   fi
 
   if (( upload_to_s3 == 0 )); then
-    mkdir -p "$backup_root"
-    [[ ! -e "$backup_path" ]] || die "Backup file already exists: $backup_path"
+    check_local_destination_is_free
   else
-    if s3_object_exists "$s3_mc_path"; then
-      die "Backup object already exists in S3: $s3_url"
-    fi
+    check_s3_destination_is_free
   fi
+
+  # Shared lock: concurrent backups are fine, a restore of this volume is not
+  txn_lock s "$directory"
+  check_source_has_no_reserved_entries
 
   prepare_gpg_runtime
 
   if (( upload_to_s3 )); then
-    [[ -n "$tmp_dir" ]] || tmp_dir="$(mktemp -d)"
-    local sha_file="${tmp_dir}/backup.sha"
-    archive_stream | compress_stream | encrypt_stream \
-      | tee >(sha256sum > "$sha_file") \
-      | mc --config-dir "$mc_config_dir" pipe "$s3_mc_path"
-    wait
-    local checksum
-    checksum="$(awk '{print $1}' "$sha_file")"
-    [[ -n "$checksum" ]] || die "Failed to compute backup checksum"
-    printf '%s  %s\n' "$checksum" "$filename" \
-      | mc --config-dir "$mc_config_dir" pipe "${s3_mc_path}.sha256"
-    log INFO "Checksum uploaded: ${s3_url}.sha256"
-    log INFO "Backup uploaded successfully: $s3_url"
+    upload_backup_to_s3
   else
-    archive_stream | compress_stream | encrypt_stream | write_destination
-    mv "$tmp_backup_path" "$backup_path"
-    tmp_backup_path=""
-
-    [[ -s "$backup_path" ]] || die "Backup file is empty: $backup_path"
-    write_checksum "$backup_path"
+    publish_local_backup
 
     log INFO "Backup created successfully: $backup_path"
     log INFO "Backup size: $(file_size_human "$backup_path")"
+  fi
+
+  if [[ -n "$keep_count$keep_days" ]]; then
+    if (( upload_to_s3 )); then
+      rotate_s3
+    else
+      rotate_local
+    fi
   fi
 
   log INFO "Done"
@@ -723,27 +1018,24 @@ run_all_backups() {
   collect_selected_volumes_for_all_mode
   build_child_args
 
-  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
-    wait_supports_p=1
-  fi
-
   log INFO "Found ${#SELECTED_VOLUMES[@]} volume(s) to back up"
   log INFO "Backup timestamp: $backup_timestamp"
   log INFO "Parallel jobs: $jobs"
 
-  while IFS= read -r vol; do
+  # SELECTED_VOLUMES is sorted and unique already
+  for vol in "${SELECTED_VOLUMES[@]}"; do
     local fname
     local destination
     fname="$(build_filename_for_volume "$vol")"
     destination="$(build_destination_for_filename "$fname")"
     log INFO "  $vol  ->  $destination"
-  done < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort)
+  done
 
   if (( dry_run )); then
     log INFO "Dry-run mode: validating each volume"
 
     failed=0
-    while IFS= read -r vol; do
+    for vol in "${SELECTED_VOLUMES[@]}"; do
       log INFO "--- $vol ---"
       BACKUP_ROOT="$backup_root" \
       BACKUP_TIMESTAMP="$backup_timestamp" \
@@ -751,7 +1043,7 @@ run_all_backups() {
         log ERROR "Validation failed: $vol"
         failed=1
       }
-    done < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort)
+    done
 
     (( failed == 0 )) || die "One or more volumes failed validation"
     log INFO "Dry-run completed successfully"
@@ -760,13 +1052,13 @@ run_all_backups() {
 
   failed=0
 
-  while IFS= read -r vol; do
+  for vol in "${SELECTED_VOLUMES[@]}"; do
     while (( ${#running_pids[@]} >= jobs )); do
-      reap_one_child
+      reap_children
     done
 
     launch_child_backup "$vol"
-  done < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort)
+  done
 
   wait_for_all_children
 
@@ -778,13 +1070,27 @@ run_all_backups() {
 # Parse args
 # ------------------------------------------------------------------------------
 
-while getopts ':ad:T:j:ceshb:f:k:v:n' flag; do
+while getopts ':ad:T:j:cezshb:f:k:v:nSL:x:R:D:' flag; do
   case "$flag" in
     a) all_volumes=1 ;;
     d) backup_root="$OPTARG" ;;
     T) backup_timestamp="$OPTARG" ;;
     j) jobs="$OPTARG" ;;
-    c) compress=1 ;;
+    c)
+      [[ "$compression" != zstd ]] || die "Use either -c or -z, not both"
+      compression=gzip
+      ;;
+    z)
+      [[ "$compression" != gzip ]] || die "Use either -c or -z, not both"
+      compression=zstd
+      ;;
+    L) compression_level="$OPTARG" ;;
+    x)
+      [[ -n "$OPTARG" ]] || die "Option -x needs a non-empty pattern"
+      exclude_patterns+=("$OPTARG")
+      ;;
+    R) keep_count="$OPTARG" ;;
+    D) keep_days="$OPTARG" ;;
     e) encrypt=1 ;;
     s) symmetric=1 ;;
     b)
@@ -792,12 +1098,13 @@ while getopts ':ad:T:j:ceshb:f:k:v:n' flag; do
       s3_bucket="$OPTARG"
       ;;
     f) s3_folder="$OPTARG" ;;
-    k) pgp_key="$OPTARG" ;;
+    k) pgp_keys+=("$OPTARG") ;;
     v)
       validate_volume_name "$OPTARG"
       requested_volumes+=("$OPTARG")
       ;;
     n) dry_run=1 ;;
+    S) strict_tar=1 ;;
     h)
       usage
       exit 0
@@ -814,15 +1121,28 @@ done
 shift $((OPTIND - 1))
 [[ $# -eq 0 ]] || die "Unexpected extra arguments: $*"
 
+# Validate before any arithmetic: bash evaluates array subscripts in (( )).
+[[ "$jobs" =~ ^[1-9][0-9]?$ ]] || die "Invalid -j value: '$jobs'. Expected an integer from 1 to 99"
+
+if [[ -n "$compression_level" ]]; then
+  case "$compression" in
+    gzip) [[ "$compression_level" =~ ^[1-9]$ ]] || die "Invalid -L value: '$compression_level'. gzip levels are 1-9" ;;
+    zstd) [[ "$compression_level" =~ ^(1[0-9]|[1-9])$ ]] || die "Invalid -L value: '$compression_level'. zstd levels are 1-19" ;;
+    *) die "Option -L requires -c or -z" ;;
+  esac
+fi
+[[ -z "$keep_count" || "$keep_count" =~ ^[1-9][0-9]{0,3}$ ]] || die \
+  "Invalid -R value: '$keep_count'. Expected an integer from 1 to 9999"
+[[ -z "$keep_days" || "$keep_days" =~ ^[1-9][0-9]{0,4}$ ]] || die \
+  "Invalid -D value: '$keep_days'. Expected an integer from 1 to 99999"
+
 # ------------------------------------------------------------------------------
 # Mode selection
 # ------------------------------------------------------------------------------
 
-[[ -d "$VOLUMES_ROOT" ]] || die "Volumes root not found: $VOLUMES_ROOT"
+init_volumes_root
 
-if (( all_volumes )); then
-  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "Invalid -j value: '$jobs'. Expected positive integer"
-else
+if (( ! all_volumes )); then
   (( jobs == 1 )) || die "Option -j can only be used with -a"
   (( ${#requested_volumes[@]} == 1 )) || die \
     "Use exactly one -v <VOLUME_NAME> for single backup, or use -a for multi-volume backup"

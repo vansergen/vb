@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
+# Test functions are only called through run_test:
+# shellcheck disable=SC2317,SC2329
 set -Eeuo pipefail
 
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
 BACKUP_BIN="${BACKUP_BIN:-$SCRIPT_DIR/backup}"
 RESTORE_BIN="${RESTORE_BIN:-$SCRIPT_DIR/restore}"
 
 readonly SKIP_RC=200
 
 TEST_ROOT="$(mktemp -d)"
-CURRENT_CASE=""
 CASE_ROOT=""
 TEST_BACKUP_ROOT=""
 TEST_VOLUMES_ROOT=""
@@ -31,6 +33,20 @@ TESTS_SKIPPED=0
 #   AWS_ENDPOINT_URL    (optional)
 #   TEST_S3_BUCKET      (required for S3 tests)
 #   TEST_S3_PREFIX      (optional)
+#   REQUIRE_S3_TESTS=1  (optional, turn S3 skips into failures)
+#   TEST_S3_VERSIONED_ENDPOINT  (optional, default AWS_ENDPOINT_URL) and
+#   TEST_S3_VERSIONED_BUCKET    (optional, default TEST_S3_BUCKET): where
+#                               the rotation test finds a bucket with
+#                               versioning; at least one must be set
+#   TEST_S3_CREATE_BUCKETS=1    (optional) wait for the server, create the
+#                               buckets and enable versioning on the
+#                               versioned one before the tests
+#   TEST_S3_PROVIDER            (optional) name of the S3 server, for the log
+#
+# TEST_FILTER=<regex> runs only the tests whose function name matches.
+#
+# REQUIRE_XATTR_TESTS=1 fails the run when extended attributes or ACLs cannot
+# be tested (missing tools or no user xattr support under TMPDIR).
 
 # ------------------------------------------------------------------------------
 # Logging helpers
@@ -62,6 +78,9 @@ die() {
 # ------------------------------------------------------------------------------
 
 cleanup() {
+  if [[ -n "${T_S3_CONFIG:-}" && -f "$T_S3_CONFIG" ]]; then
+    t_s3_delete_prefix "$S3_RUN_PREFIX" || true
+  fi
   rm -rf "$TEST_ROOT"
 }
 
@@ -95,27 +114,103 @@ assert_dir_exists() {
   }
 }
 
+# Prints a canonical manifest of a tree: one line per entry below the root
+# with type, mode, owner, group, size (files), whole-second mtime (not for
+# symlinks) and symlink target.
+tree_manifest() {
+  (
+    cd "$1" || exit 1
+    find . -mindepth 1 -printf '%P\t%y\t%m\t%U\t%G\t%s\t%T@\t%l\n' \
+      | awk -F'\t' 'BEGIN { OFS = "\t" }
+        {
+          split($7, t, ".")
+          $7 = t[1]
+          if ($2 == "d") $6 = "-"
+          if ($2 == "l") $7 = "-"
+          print
+        }' \
+      | LC_ALL=C sort
+  )
+}
+
+# Prints groups of hard-linked paths (one sorted, space-separated group per line)
+hardlink_groups() {
+  (
+    cd "$1" || exit 1
+    find . -mindepth 1 -type f -links +1 -printf '%i\t%P\n' \
+      | LC_ALL=C sort \
+      | awk -F'\t' '
+        $1 != prev { if (line != "") print line; line = $2; prev = $1; next }
+        { line = line " " $2 }
+        END { if (line != "") print line }' \
+      | LC_ALL=C sort
+  )
+}
+
+# Prints the ACLs and extended attributes of every entry (when the tools exist)
+tree_extended_attributes() {
+  (
+    cd "$1" || exit 1
+    local path
+    while IFS= read -r -d '' path; do
+      if command -v getfacl >/dev/null 2>&1; then
+        printf '%s\tacl\t%s\n' "$path" "$(getfacl -p -n --omit-header -- "$path" 2>/dev/null | grep -v '^$' | tr '\n' ' ')"
+      fi
+      if command -v getfattr >/dev/null 2>&1; then
+        printf '%s\txattr\t%s\n' "$path" "$(getfattr -h -d -m - --absolute-names -- "$path" 2>/dev/null \
+          | grep -v -e '^#' -e '^$' -e '^security\.selinux=' | LC_ALL=C sort | tr '\n' ' ')"
+      fi
+    done < <(find . -mindepth 1 ! -type l -print0 | LC_ALL=C sort -z)
+  )
+}
+
 assert_dirs_equal() {
   local left="$1"
   local right="$2"
+  local kind l_out r_out
 
-  local l_list r_list
-  l_list="$(cd "$left" 2>/dev/null && find . -mindepth 1 | sort)" || true
-  r_list="$(cd "$right" 2>/dev/null && find . -mindepth 1 | sort)" || true
+  for kind in tree_manifest hardlink_groups tree_extended_attributes; do
+    l_out="$("$kind" "$left")" || true
+    r_out="$("$kind" "$right")" || true
+    [[ "$l_out" == "$r_out" ]] || {
+      log "Trees differ ($kind):"
+      log "  left:  $left"
+      log "  right: $right"
+      diff <(printf '%s\n' "$l_out") <(printf '%s\n' "$r_out") >&2 || true
+      return 1
+    }
+  done
 
-  [[ "$l_list" == "$r_list" ]] || {
-    log "Directory listings differ:"
-    log "  left:  $left"
-    log "  right: $right"
-    diff <(printf '%s\n' "$l_list") <(printf '%s\n' "$r_list") >&2 || true
-    return 1
-  }
-
-  diff -ruN "$left" "$right" >/dev/null 2>&1 || {
+  diff -r "$left" "$right" >/dev/null 2>&1 || {
     log "File contents differ:"
     log "  left:  $left"
     log "  right: $right"
-    diff -ruN "$left" "$right" >&2 || true
+    diff -r "$left" "$right" >&2 || true
+    return 1
+  }
+}
+
+# Owner, group, mode and whole-second mtime of a directory itself
+dir_root_metadata() {
+  local mtime
+  mtime="$(stat -c '%Y' "$1")"
+  printf '%s\t%s\n' "$(stat -c '%u:%g %a' "$1")" "$mtime"
+}
+
+xattr_tests_enabled() {
+  command -v setfattr >/dev/null 2>&1 && command -v getfattr >/dev/null 2>&1 || return 1
+  local probe="$TEST_ROOT/.xattr-probe"
+  : > "$probe"
+  setfattr -n user.vbtest -v 1 "$probe" 2>/dev/null
+}
+
+# Runs the given command (with its arguments kept intact) and fails if it succeeds.
+expect_rejected() {
+  local rc=0
+  "$@" 2>/dev/null || rc=$?
+
+  (( rc != 0 )) || {
+    log "BUG: expected failure, but succeeded: $*"
     return 1
   }
 }
@@ -133,6 +228,13 @@ assert_text_file_contains() {
 # ------------------------------------------------------------------------------
 # Command helpers
 # ------------------------------------------------------------------------------
+
+# Not `tar --version | grep -q`: with pipefail, tar can die of SIGPIPE
+is_gnu_tar() {
+  local version
+  version="$(tar --version 2>/dev/null)" || true
+  [[ "$version" == *"GNU tar"* ]]
+}
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
@@ -205,7 +307,6 @@ run_restore_with_env() {
 setup_case() {
   local name="$1"
 
-  CURRENT_CASE="$name"
   CASE_ROOT="$TEST_ROOT/$name"
   TEST_BACKUP_ROOT="$CASE_ROOT/backups"
   TEST_VOLUMES_ROOT="$CASE_ROOT/volumes"
@@ -222,7 +323,7 @@ make_volume_content() {
   local vol="$1"
   local root="$TEST_VOLUMES_ROOT/$vol"
 
-  mkdir -p "$root/subdir" "$root/config"
+  mkdir -p "$root/subdir" "$root/config" "$root/empty-dir" "$root/shared"
 
   printf 'hello from %s\n' "$vol" > "$root/hello.txt"
   printf 'nested file for %s\n' "$vol" > "$root/subdir/nested.txt"
@@ -231,6 +332,28 @@ make_volume_content() {
   # small binary-ish content
   dd if=/dev/zero of="$root/subdir/blob.bin" bs=64 count=1 >/dev/null 2>&1
   printf 'tail-%s\n' "$vol" >> "$root/subdir/blob.bin"
+
+  # names with spaces and non-ASCII characters
+  printf 'spaces\n' > "$root/subdir/file with spaces.txt"
+  printf 'unicode\n' > "$root/subdir/юникод-ñ.txt"
+
+  # symlinks, hard links, special modes
+  ln -s nested.txt "$root/subdir/link-to-nested"
+  ln -s ../config "$root/subdir/link-to-config"
+  printf 'linked\n' > "$root/shared/original.txt"
+  ln "$root/shared/original.txt" "$root/shared/hardlink.txt"
+  chmod 2750 "$root/shared"
+  chmod 0640 "$root/config/app.json"
+  chown 1234:2345 "$root/subdir/nested.txt" 2>/dev/null || true
+  touch -d '2020-02-03 04:05:06' "$root/hello.txt"
+
+  # extended attributes and ACLs, when the filesystem supports them
+  if command -v setfattr >/dev/null 2>&1; then
+    setfattr -n user.vbtest -v "value-$vol" "$root/hello.txt" 2>/dev/null || true
+  fi
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:4321:r "$root/config/app.json" 2>/dev/null || true
+  fi
 }
 
 copy_volume_snapshot() {
@@ -243,7 +366,7 @@ copy_volume_snapshot() {
 
 clear_volume_dir() {
   local vol="$1"
-  rm -rf "$TEST_VOLUMES_ROOT/$vol"
+  rm -rf "${TEST_VOLUMES_ROOT:?}/$vol"
   mkdir -p "$TEST_VOLUMES_ROOT/$vol"
 }
 
@@ -259,7 +382,7 @@ replace_volume_with_marker() {
   local vol="$1"
   local marker="$2"
 
-  rm -rf "$TEST_VOLUMES_ROOT/$vol"
+  rm -rf "${TEST_VOLUMES_ROOT:?}/$vol"
   mkdir -p "$TEST_VOLUMES_ROOT/$vol"
   printf '%s\n' "$marker" > "$TEST_VOLUMES_ROOT/$vol/marker.txt"
 }
@@ -268,24 +391,27 @@ replace_volume_with_marker() {
 # GPG helpers
 # ------------------------------------------------------------------------------
 
+# Writes <prefix>public.asc and <prefix>private.asc to TEST_GPG_ROOT
 generate_gpg_keypair_files() {
   command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
 
-  local keyhome="$CASE_ROOT/keygen-gnupg"
-  mkdir -p "$keyhome"
+  local prefix="${1:-}"
+  # Short path: the agent socket path must fit in 108 bytes
+  local keyhome
+  keyhome="$(mktemp -d "$TEST_ROOT/kg.XXXXXX")"
   chmod 700 "$keyhome"
   printf 'allow-loopback-pinentry\n' > "$keyhome/gpg-agent.conf"
 
   GNUPGHOME="$keyhome" gpgconf --launch gpg-agent >/dev/null 2>&1 || true
 
-  cat > "$CASE_ROOT/gpg-batch.conf" <<'EOF'
+  cat > "$CASE_ROOT/gpg-batch.conf" <<EOF
 %no-protection
 %transient-key
 Key-Type: RSA
 Key-Length: 2048
 Subkey-Type: RSA
 Subkey-Length: 2048
-Name-Real: Backup Test
+Name-Real: Backup Test ${prefix}
 Name-Email: backup-test@example.invalid
 Expire-Date: 0
 %commit
@@ -297,8 +423,8 @@ EOF
     return 1
   }
 
-  GNUPGHOME="$keyhome" gpg --armor --export > "$TEST_GPG_ROOT/public.asc" || return 1
-  GNUPGHOME="$keyhome" gpg --armor --export-secret-keys > "$TEST_GPG_ROOT/private.asc" || return 1
+  GNUPGHOME="$keyhome" gpg --armor --export > "$TEST_GPG_ROOT/${prefix}public.asc" || return 1
+  GNUPGHOME="$keyhome" gpg --armor --export-secret-keys > "$TEST_GPG_ROOT/${prefix}private.asc" || return 1
 
   GNUPGHOME="$keyhome" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
 }
@@ -307,12 +433,531 @@ EOF
 # Optional S3 helpers
 # ------------------------------------------------------------------------------
 
+# These helpers talk to S3 with plain curl on purpose: the tests must not rely
+# on the S3 client code they are testing.
+
+S3_RUN_PREFIX=""
+T_S3_CONFIG=""
+
 s3_tests_enabled() {
   [[ -n "${TEST_S3_BUCKET:-}" ]] || return 1
   [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] || return 1
   [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] || return 1
-  command -v mc >/dev/null 2>&1 || return 1
+  command -v curl >/dev/null 2>&1 || return 1
   return 0
+}
+
+# Returns 0 when S3 tests can run, SKIP_RC when they cannot, and 1 instead of
+# skipping when REQUIRE_S3_TESTS=1 (CI must not go green on silent skips).
+require_s3_or_skip() {
+  if s3_tests_enabled; then
+    t_s3_init
+    return 0
+  fi
+
+  if [[ "${REQUIRE_S3_TESTS:-0}" == 1 ]]; then
+    log "S3 tests are required (REQUIRE_S3_TESTS=1) but S3 is not configured"
+    return 1
+  fi
+
+  return "$SKIP_RC"
+}
+
+t_s3_init() {
+  [[ -z "$T_S3_CONFIG" ]] || return 0
+
+  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
+  base_prefix="${base_prefix#/}"
+  base_prefix="${base_prefix%/}"
+  S3_RUN_PREFIX="${base_prefix:+${base_prefix}/}run-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+
+  T_S3_CONFIG="$TEST_ROOT/curl-s3.conf"
+  (
+    umask 077
+    printf 'silent\nshow-error\n'
+    printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+    printf 'aws-sigv4 = "aws:amz:%s:s3"\n' "${AWS_REGION:-us-east-1}"
+    if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
+      printf 'header = "x-amz-security-token: %s"\n' "$AWS_SESSION_TOKEN"
+    fi
+  ) > "$T_S3_CONFIG"
+}
+
+# Creates a bucket (waiting up to 60 seconds for the server to come up) and
+# optionally enables versioning on it.
+#   t_s3_create_bucket <endpoint> <bucket> [versioned]
+t_s3_create_bucket() {
+  local endpoint="${1%/}" bucket="$2" versioned="${3:-}" code="" i
+  for (( i = 0; i < 60; i++ )); do
+    code="$(curl -K "$T_S3_CONFIG" -o "$TEST_ROOT/bucket.body" -w '%{http_code}' -X PUT "${endpoint}/${bucket}" 2>/dev/null)" || code=000
+    if [[ "$code" == 200 || "$code" == 409 ]]; then
+      break
+    fi
+    sleep 1
+  done
+  [[ "$code" == 200 || "$code" == 409 ]] || die "Could not create the bucket ${bucket} on ${endpoint} (HTTP ${code})"
+
+  if [[ -n "$versioned" ]]; then
+    code="$(curl -K "$T_S3_CONFIG" -o "$TEST_ROOT/bucket.body" -w '%{http_code}' -X PUT -H 'Content-Type: application/xml' \
+      --data-binary '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' \
+      "${endpoint}/${bucket}?versioning")" || code=000
+    [[ "$code" == 200 ]] || die "Could not enable versioning on the bucket ${bucket} on ${endpoint} (HTTP ${code})"
+  fi
+}
+
+# Unique per-test prefix below the per-run prefix
+t_s3_prefix() {
+  printf '%s/%s\n' "$S3_RUN_PREFIX" "$1"
+}
+
+t_s3_url() {
+  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  printf '%s/%s/%s' "${endpoint%/}" "$TEST_S3_BUCKET" "$1"
+}
+
+# Prints the HTTP status of a HEAD request for the key
+t_s3_head() {
+  curl -K "$T_S3_CONFIG" -o /dev/null -w '%{http_code}' --head "$(t_s3_url "$1")" || true
+}
+
+t_s3_get() {
+  curl -K "$T_S3_CONFIG" --fail -o "$2" "$(t_s3_url "$1")"
+}
+
+# Uploads a file unconditionally; prints the HTTP status
+t_s3_put() {
+  local key="$1" file="$2"
+  shift 2
+  curl -K "$T_S3_CONFIG" -o /dev/null -w '%{http_code}' --upload-file "$file" "$@" "$(t_s3_url "$key")" || true
+}
+
+# Prints the number of in-progress multipart uploads for the key
+t_s3_pending_uploads() {
+  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${TEST_S3_BUCKET}?uploads&prefix=$1" \
+    | grep -o '<UploadId>' | wc -l
+}
+
+# Deletes every object below a prefix (test cleanup only)
+t_s3_delete_prefix() {
+  local prefix="$1" endpoint key
+  endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  [[ -n "$prefix" ]] || return 0
+
+  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${TEST_S3_BUCKET}?list-type=2&prefix=${prefix}/" 2>/dev/null \
+    | tr '<' '\n' | awk -F'>' '$1 == "Key" { print $2 }' \
+    | while IFS= read -r key; do
+      curl -K "$T_S3_CONFIG" -o /dev/null -X DELETE "$(t_s3_url "$key")" || true
+    done
+}
+
+# Creates a curl wrapper in <dir> that records every invocation's arguments in
+# <dir>/curl.trace and can simulate S3 behaviour selected by <mode>:
+#   trace                  pass everything through
+#   deny                   answer every request with HTTP 403
+#   complete-501           answer conditional CompleteMultipartUpload with 501
+#   complete-lost          run the first CompleteMultipartUpload, then report a
+#                          transport error (the response got lost)
+#   complete-lost-foreign  instead of the first CompleteMultipartUpload, store a
+#                          foreign object at the key and report a transport error
+#   delete-ignores-if-match
+#                          drop the If-Match header of every DELETE (a provider
+#                          that ignores conditional deletes)
+#   list-paged             list two keys per page
+#   list-paged-fail        list two keys per page and answer 503 to every page
+#                          after the first
+#   list-malformed         drop the <Key> of every beta entry from listings
+#   list-no-etag           drop the <ETag> of every entry from listings
+#   list-no-sidecar-etag   drop the <ETag> of every checksum file from listings
+#   list-truncated         cut a listing after its second entry, as a broken
+#                          transfer (HTTP 200, curl exit 18)
+#   get-truncated          cut a downloaded checksum file after the digest, as a
+#                          broken transfer (HTTP 200, curl exit 18)
+# The failure modes touch <dir>/fired when they inject something.
+make_curl_stub() {
+  local dir="$1" mode="$2" real_curl
+  real_curl="$(command -v curl)"
+  mkdir -p "$dir"
+
+  cat > "$dir/curl" <<STUB
+#!/usr/bin/env bash
+real_curl='$real_curl'
+mode='$mode'
+state='$dir'
+printf '%s\n' "\$*" >> "\$state/curl.trace"
+
+out="" url="" conditional=0 is_post=0 is_delete=0 is_head=0 has_w=0 prev=""
+for arg in "\$@"; do
+  [[ "\$arg" == --head ]] && is_head=1
+  case "\$prev" in
+    -o) out="\$arg" ;;
+    -w) has_w=1 ;;
+    -X)
+      [[ "\$arg" == POST ]] && is_post=1
+      [[ "\$arg" == DELETE ]] && is_delete=1
+      ;;
+    -H) [[ "\$arg" == "If-None-Match: *" ]] && conditional=1 ;;
+  esac
+  [[ "\$arg" == http://* || "\$arg" == https://* ]] && url="\$arg"
+  prev="\$arg"
+done
+is_complete=0
+[[ \$is_post == 1 && "\$url" == *"?uploadId="* ]] && is_complete=1
+
+case "\$mode" in
+  list-paged | list-paged-fail)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      if [[ "\$mode" == list-paged-fail && "\$url" == *"continuation-token="* ]]; then
+        : > "\$state/fired"
+        printf '<Error><Code>ServiceUnavailable</Code></Error>' > "\$out"
+        printf '503'
+        exit 0
+      fi
+      args=()
+      for arg in "\$@"; do
+        [[ "\$arg" == "\$url" ]] && arg="\${url}&max-keys=2"
+        args+=("\$arg")
+      done
+      exec "\$real_curl" "\${args[@]}"
+    fi
+    ;;
+  list-malformed)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      body="\$(cat "\$out")"
+      cut="\$(sed 's:<Key>[^<]*/beta_[^<]*</Key>::g' <<< "\$body")"
+      [[ "\$cut" == "\$body" ]] || : > "\$state/fired"
+      printf '%s' "\$cut" > "\$out"
+      printf '%s' "\$code"
+      exit 0
+    fi
+    ;;
+  list-no-etag | list-no-sidecar-etag)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      rest="\$(cat "\$out")"
+      new=""
+      while [[ "\$rest" == *"</Contents>"* ]]; do
+        chunk="\${rest%%</Contents>*}</Contents>"
+        rest="\${rest#*</Contents>}"
+        if [[ "\$mode" == list-no-etag || "\$chunk" == *".sha256</Key>"* ]]; then
+          stripped="\${chunk/<ETag>*<\/ETag>/}"
+          [[ "\$stripped" == "\$chunk" ]] || : > "\$state/fired"
+          chunk="\$stripped"
+        fi
+        new+="\$chunk"
+      done
+      printf '%s' "\$new\$rest" > "\$out"
+      printf '%s' "\$code"
+      exit 0
+    fi
+    ;;
+  list-truncated)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      body="\$(cat "\$out")"
+      rest="\${body#*</Contents>}"
+      rest="\${rest#*</Contents>}"
+      if [[ "\$rest" != "\$body" ]]; then
+        : > "\$state/fired"
+        head -c \$(( \${#body} - \${#rest} + 16 )) <<< "\$body" > "\$out"
+      fi
+      printf '%s' "\$code"
+      exit 18
+    fi
+    ;;
+  get-truncated)
+    if (( ! is_head )) && [[ "\$url" == *.sha256 && -n "\$out" ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      : > "\$state/fired"
+      head -c 69 "\$out" > "\$out.cut" && mv "\$out.cut" "\$out"
+      printf '%s' "\$code"
+      exit 18
+    fi
+    ;;
+  delete-ignores-if-match)
+    if (( is_delete )); then
+      args=() header=0
+      for arg in "\$@"; do
+        if (( header )); then
+          header=0
+          [[ "\$arg" == If-Match:* ]] || args+=(-H "\$arg")
+          continue
+        fi
+        if [[ "\$arg" == -H ]]; then
+          header=1
+          continue
+        fi
+        args+=("\$arg")
+      done
+      exec "\$real_curl" "\${args[@]}"
+    fi
+    ;;
+  deny)
+    [[ -n "\$out" && "\$out" != /dev/null && "\$out" != - ]] && printf '<Error><Code>AccessDenied</Code></Error>' > "\$out"
+    if (( has_w )); then
+      printf '403'
+      exit 0
+    fi
+    exit 22
+    ;;
+  complete-501)
+    if (( is_complete && conditional )); then
+      printf '<Error><Code>NotImplemented</Code></Error>' > "\$out"
+      printf '501'
+      exit 0
+    fi
+    ;;
+  complete-lost)
+    if (( is_complete )) && [[ ! -e "\$state/lost.done" ]]; then
+      : > "\$state/lost.done"
+      "\$real_curl" "\$@" > /dev/null 2>&1
+      printf '000'
+      exit 52
+    fi
+    ;;
+  complete-lost-foreign)
+    if (( is_complete )) && [[ ! -e "\$state/lost.done" ]]; then
+      : > "\$state/lost.done"
+      printf 'foreign' > "\$state/foreign.bin"
+      "\$real_curl" -K '$T_S3_CONFIG' -o /dev/null --upload-file "\$state/foreign.bin" "\${url%%\?*}"
+      printf '000'
+      exit 52
+    fi
+    ;;
+esac
+
+exec "\$real_curl" "\$@"
+STUB
+  chmod +x "$dir/curl"
+}
+
+# Prints the PIDs of a process and all of its descendants
+process_tree_pids() {
+  local root="$1" stat_file content pid ppid current
+  local -A children=()
+
+  for stat_file in /proc/[0-9]*/stat; do
+    content="$(cat "$stat_file" 2>/dev/null)" || continue
+    pid="${content%% *}"
+    content="${content##*) }"
+    ppid="${content#* }"
+    ppid="${ppid%% *}"
+    children[$ppid]+=" $pid"
+  done
+
+  local -a queue=("$root")
+  while (( ${#queue[@]} > 0 )); do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+    printf '%s\n' "$current"
+    for pid in ${children[$current]:-}; do
+      queue+=("$pid")
+    done
+  done
+}
+
+# Runs backup in the background, pausing at a test point:
+#   start_paused_backup <point> [env assignments...] -- <backup args...>
+start_paused_backup() {
+  local point="$1"
+  shift
+  PAUSE_DIR="$CASE_ROOT/pause"
+  mkdir -p "$PAUSE_DIR"
+
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_PAUSE_AT="$point" VB_TEST_PAUSE_DIR="$PAUSE_DIR" "$@" \
+    > "$CASE_ROOT/paused.log" 2>&1 &
+  PAUSED_PID=$!
+}
+
+wait_for_point() {
+  local point="$1" i
+  for (( i = 0; i < 600; i++ )); do
+    [[ -e "$PAUSE_DIR/${point}.reached" ]] && return 0
+    kill -0 "$PAUSED_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  log "Process did not reach test point '$point'"
+  cat "$CASE_ROOT/paused.log" >&2 || true
+  return 1
+}
+
+resume_and_wait() {
+  local point="$1" rc=0
+  : > "$PAUSE_DIR/${point}.continue"
+  wait "$PAUSED_PID" || rc=$?
+  cat "$CASE_ROOT/paused.log" >&2 || true
+  return "$rc"
+}
+
+# Runs restore in the background, pausing at a test point:
+#   start_paused_restore <point> [env assignments...] -- <restore args...>
+start_paused_restore() {
+  local point="$1"
+  shift
+  PAUSE_DIR="$CASE_ROOT/pause"
+  mkdir -p "$PAUSE_DIR"
+
+  run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_PAUSE_AT="$point" VB_TEST_PAUSE_DIR="$PAUSE_DIR" "$@" \
+    > "$CASE_ROOT/paused.log" 2>&1 &
+  PAUSED_PID=$!
+}
+
+# Prints the PID of the backup or restore script started in the background
+paused_script_pid() {
+  local pid cmdline
+  while IFS= read -r pid; do
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || continue
+    if [[ "$cmdline" == *" $BACKUP_BIN "* || "$cmdline" == *" $RESTORE_BIN "* ]]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done < <(process_tree_pids "$PAUSED_PID")
+  log "Could not find the script process below $PAUSED_PID"
+  return 1
+}
+
+# Sends a signal to the paused script (only to it, not to its children) and
+# checks that it exits with <expected rc> and leaves no process behind.
+#   signal_paused_script <signal> <expected rc>
+signal_paused_script() {
+  local signal="$1" expected="$2" pid rc=0 i survivors=""
+  pid="$(paused_script_pid)" || return 1
+  kill "-$signal" "$pid"
+
+  for (( i = 0; i < 600; i++ )); do
+    kill -0 "$PAUSED_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$PAUSED_PID" 2>/dev/null; then
+    log "BUG: the script did not exit within 60 seconds after SIG$signal"
+    # shellcheck disable=SC2046 # one PID per word
+    kill -KILL $(process_tree_pids "$PAUSED_PID") 2>/dev/null || true
+    wait "$PAUSED_PID" 2>/dev/null || true
+    return 1
+  fi
+  wait "$PAUSED_PID" || rc=$?
+  (( rc == expected )) || {
+    log "Expected exit $expected after SIG$signal, got $rc"
+    cat "$CASE_ROOT/paused.log" >&2 || true
+    return 1
+  }
+
+  # Every process of the run inherited VB_TEST_PAUSE_DIR
+  for (( i = 0; i < 50; i++ )); do
+    survivors="$(processes_with_env "VB_TEST_PAUSE_DIR=$PAUSE_DIR")"
+    [[ -n "$survivors" ]] || return 0
+    sleep 0.1
+  done
+  log "Processes survived SIG$signal:"
+  for pid in $survivors; do
+    log "  $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  done
+  return 1
+}
+
+# Lists processes whose environment contains <text>
+processes_with_env() {
+  local text="$1" environ pid
+  for environ in /proc/[0-9]*/environ; do
+    pid="${environ#/proc/}"
+    pid="${pid%/environ}"
+    [[ "$pid" != "$$" && "$pid" != "$BASHPID" ]] || continue
+    if grep -qaF -- "$text" "$environ" 2>/dev/null; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
+# Prints a canonical description of volumes, journals included: metadata of
+# every entry and the digest of every file
+volume_state() {
+  local vol
+  for vol in "$@"; do
+    printf '== %s\n' "$vol"
+    tree_manifest "$TEST_VOLUMES_ROOT/$vol"
+    (cd "$TEST_VOLUMES_ROOT/$vol" && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
+  done
+}
+
+# Manifest of a volume without its journal
+volume_manifest_without_journal() {
+  tree_manifest "$1" | grep -v -e '^\.vb-restore' || true
+}
+
+# Writes an executable wrapper <dir>/<command> from stdin
+write_wrapper() {
+  local dir="$1" command="$2"
+  mkdir -p "$dir"
+  cat > "$dir/$command"
+  chmod +x "$dir/$command"
+}
+
+# Writes a wrapper <dir>/<command> that runs the real command, except for the
+# <n>th call whose arguments contain <text>: that call reports an I/O error,
+# touches <dir>/fired and exits 2. Calls are counted in <dir>/<command>.count.
+#   write_failing_wrapper <dir> <command> <text> <n>
+write_failing_wrapper() {
+  local dir="$1" command="$2" text="$3" n="$4" real
+  real="$(command -v "$command")"
+  write_wrapper "$dir" "$command" <<STUB
+#!/usr/bin/env bash
+text=$(printf '%q' "$text")
+if [[ " \$* " == *"\$text"* ]]; then
+  count=\$(( \$(cat '$dir/$command.count' 2>/dev/null || echo 0) + 1 ))
+  echo "\$count" > '$dir/$command.count'
+  if (( count == $n )); then
+    : > '$dir/fired'
+    echo '$command: Input/output error' >&2
+    exit 2
+  fi
+fi
+exec '$real' "\$@"
+STUB
+}
+
+# Writes a sort wrapper into <dir> that sorts correctly but, when its
+# arguments match <glob> ("none": no arguments), touches <dir>/fired and
+# exits 2: the data is intact, only the status reports the failure.
+#   write_sort_wrapper <dir> <glob>
+write_sort_wrapper() {
+  local dir="$1" glob="$2" real
+  real="$(command -v sort)"
+  write_wrapper "$dir" sort <<STUB
+#!/usr/bin/env bash
+glob=$(printf '%q' "$glob")
+fail=0
+if [[ "\$glob" == none ]]; then
+  (( \$# == 0 )) && fail=1
+elif [[ "\$*" == \$glob ]]; then
+  fail=1
+fi
+if (( fail )); then
+  '$real' "\$@" || exit
+  : > '$dir/fired'
+  exit 2
+fi
+exec '$real' "\$@"
+STUB
+}
+
+# Runs a command that must fail because of an injected fault. Checks first
+# that the fault was injected (<marker> exists), then that the command failed.
+#   expect_injected_failure <marker> <command...>
+expect_injected_failure() {
+  local marker="$1" rc=0
+  shift
+  "$@" > "$CASE_ROOT/injected.log" 2>&1 || rc=$?
+  [[ -e "$marker" ]] || {
+    log "The injected fault never happened: $*"
+    cat "$CASE_ROOT/injected.log" >&2
+    return 1
+  }
+  (( rc != 0 )) || {
+    log "BUG: succeeded despite the injected fault: $*"
+    cat "$CASE_ROOT/injected.log" >&2
+    return 1
+  }
 }
 
 # ------------------------------------------------------------------------------
@@ -693,35 +1338,6 @@ test_invalid_flags_and_missing_args() {
   (( restore_missing_arg_rc != 0 )) || return 1
 }
 
-test_restore_leftover_tmp_does_not_block() {
-  setup_case "restore_leftover_tmp_does_not_block"
-
-  make_volume_content "alpha"
-
-  local ts="20250101_011112"
-  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
-  local snapshot="$CASE_ROOT/expected-alpha"
-
-  run_backup -v alpha -T "$ts" || return 1
-  copy_volume_snapshot "alpha" "$snapshot"
-
-  clear_volume_dir "alpha"
-
-  # Simulate a leftover tmp dir (with content) from a previously killed restore
-  mkdir -p "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER"
-  printf 'stale content\n' > "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER/stale.txt"
-
-  # Restore without -C: target looks empty (only leftover present), should succeed
-  run_restore -i "$archive" -t alpha || return 1
-
-  assert_dirs_equal "$snapshot" "$TEST_VOLUMES_ROOT/alpha" || return 1
-
-  [[ ! -e "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER" ]] || {
-    log "BUG: leftover staging dir survived restore"
-    return 1
-  }
-}
-
 test_restore_is_atomic_on_failure() {
   setup_case "restore_is_atomic_on_failure"
 
@@ -732,7 +1348,7 @@ test_restore_is_atomic_on_failure() {
 
   run_backup -v alpha -T "$ts" || return 1
 
-  # Remove the checksum so verification doesn't catch the corruption before clear_target_contents runs
+  # Remove the checksum (and pass -U) so the corruption is only noticed while extracting
   rm -f "${archive}.sha256"
 
   # Corrupt the archive so extraction will fail mid-stream
@@ -744,7 +1360,7 @@ test_restore_is_atomic_on_failure() {
   # Attempt restore with -C: without staged extraction, the volume would be
   # cleared BEFORE extracting, and a failed extract would leave it empty.
   local rc=0
-  run_restore -i "$archive" -t alpha -C 2>/dev/null || rc=$?
+  run_restore -i "$archive" -t alpha -C -U 2>/dev/null || rc=$?
 
   (( rc != 0 )) || {
     log "BUG: restore succeeded with a corrupt archive"
@@ -758,7 +1374,7 @@ test_restore_is_atomic_on_failure() {
 }
 
 test_backup_restore_sparse_file() {
-  tar --version 2>/dev/null | grep -q 'GNU tar' || return "$SKIP_RC"
+  is_gnu_tar || return "$SKIP_RC"
 
   setup_case "backup_restore_sparse_file"
 
@@ -842,7 +1458,7 @@ test_restore_fails_when_target_not_mounted() {
   # does not — equivalent to forgetting --volume <name>:/volumes/<name>
   # while having some other unrelated mount under /volumes.
   local target_name="notmounted"
-  rm -rf "$TEST_VOLUMES_ROOT/$target_name"
+  rm -rf "${TEST_VOLUMES_ROOT:?}/$target_name"
 
   local rc=0
   run_restore -i "$archive" -t "$target_name" 2>/dev/null || rc=$?
@@ -904,146 +1520,254 @@ test_local_checksum_detects_tampering_after_move() {
   }
 }
 
+test_rejects_dot_and_escaping_volume_names() {
+  setup_case "rejects_dot_and_escaping_volume_names"
+
+  make_volume_content "alpha"
+  make_volume_content "victim"
+
+  local ts="20250101_131313"
+  local rejected_ts="20250101_131314"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+  local snapshot="$CASE_ROOT/expected-victim"
+
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "victim" "$snapshot"
+
+  # A symlink inside VOLUMES_ROOT must not be followed out of it
+  mkdir -p "$CASE_ROOT/outside"
+  printf 'outside\n' > "$CASE_ROOT/outside/keep.txt"
+  ln -s ../outside "$TEST_VOLUMES_ROOT/escape"
+
+  local name rc
+  for name in . .. escape; do
+    rc=0
+    run_restore -i "$archive" -t "$name" -C 2>/dev/null || rc=$?
+    (( rc != 0 )) || {
+      log "BUG: restore accepted target volume '$name'"
+      return 1
+    }
+
+    rc=0
+    run_backup -v "$name" -T "$rejected_ts" 2>/dev/null || rc=$?
+    (( rc != 0 )) || {
+      log "BUG: backup accepted volume '$name'"
+      return 1
+    }
+  done
+
+  assert_dirs_equal "$snapshot" "$TEST_VOLUMES_ROOT/victim" || return 1
+  assert_file_exists "$archive" || return 1
+  assert_text_file_contains "$CASE_ROOT/outside/keep.txt" "outside" || return 1
+
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -name "*_${rejected_ts}.tar*")" ]] || {
+    log "BUG: backup wrote an archive for a rejected volume name"
+    return 1
+  }
+}
+
+test_restore_all_skips_dot_named_backup_files() {
+  setup_case "restore_all_skips_dot_named_backup_files"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_141414"
+  local newer="20250101_151515"
+  local snapshot_alpha="$CASE_ROOT/expected-alpha"
+  local snapshot_beta="$CASE_ROOT/expected-beta"
+
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "alpha" "$snapshot_alpha"
+  copy_volume_snapshot "beta" "$snapshot_beta"
+
+  # Stray files whose names parse as volumes '.', '..' and '._alpha'
+  # (e.g. macOS AppleDouble files left on a NAS share)
+  local stray
+  for stray in "._${newer}.tar" ".._${newer}.tar" "._alpha_${newer}.tar"; do
+    cp "$TEST_BACKUP_ROOT/alpha_${ts}.tar" "$TEST_BACKUP_ROOT/$stray"
+  done
+
+  replace_volume_with_marker "alpha" "alpha-mutated"
+
+  run_restore -a -C || return 1
+
+  assert_dirs_equal "$snapshot_alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_dirs_equal "$snapshot_beta" "$TEST_VOLUMES_ROOT/beta" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar" || return 1
+}
+
+test_jobs_value_is_validated_before_use() {
+  setup_case "jobs_value_is_validated_before_use"
+
+  make_volume_content "alpha"
+
+  local marker="$CASE_ROOT/injected"
+  # Must reach the script as ONE argument: a subscript with a command
+  # substitution that bash would run if -j were used in (( )) unvalidated.
+  local payload="PATH[\$(touch $marker)]"
+
+  expect_rejected run_backup -v alpha -n -j "$payload" || return 1
+  expect_rejected run_backup -a -n -j "$payload" || return 1
+  expect_rejected run_restore -i missing.tar -t alpha -j "$payload" || return 1
+  expect_rejected run_restore -a -n -j "$payload" || return 1
+
+  assert_file_not_exists "$marker" || {
+    log "BUG: -j value was evaluated as an arithmetic expression"
+    return 1
+  }
+
+  expect_rejected run_backup -a -n -j 0 || return 1
+  expect_rejected run_backup -a -n -j 100 || return 1
+  expect_rejected run_backup -a -n -j 1x || return 1
+
+  run_backup -a -n -j 99 2>/dev/null || {
+    log "Expected -j 99 to be accepted"
+    return 1
+  }
+}
+
 test_s3_roundtrip_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
 
   setup_case "s3_roundtrip_optional"
 
   make_volume_content "alpha"
 
   local ts="20250101_040000"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
-
-  local suffix="$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  local key="alpha_${ts}.tar.gz"
-  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+  local prefix
+  prefix="$(t_s3_prefix roundtrip)"
 
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
   prepare_target_volume "alpha_restore"
-  run_restore -i "$s3_uri" -t alpha_restore -C || return 1
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar.gz" -t alpha_restore -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
 }
 
 test_s3_checksum_roundtrip_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
 
   setup_case "s3_checksum_roundtrip_optional"
 
   make_volume_content "alpha"
 
   local ts="20250101_040001"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
-
-  local suffix="chk-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  local key="alpha_${ts}.tar.gz"
-  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+  local prefix key
+  prefix="$(t_s3_prefix checksum)"
+  key="${prefix}/alpha_${ts}.tar.gz"
 
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
-  # Verify .sha256 was uploaded alongside the archive using mc directly
-  local mc_cfg
-  mc_cfg="$(mktemp -d)"
-  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
-  local -a st_flags=()
-  [[ -z "${AWS_SESSION_TOKEN:-}" ]] || st_flags=(--session-token "$AWS_SESSION_TOKEN")
-  mc --config-dir "$mc_cfg" alias set vb "$endpoint" \
-    "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "${st_flags[@]}" >/dev/null 2>&1
-  local sha_exists=0
-  mc --config-dir "$mc_cfg" stat "vb/${TEST_S3_BUCKET}/${prefix}/${key}.sha256" \
-    >/dev/null 2>&1 && sha_exists=1
-  rm -rf "$mc_cfg"
-
-  (( sha_exists )) || {
+  [[ "$(t_s3_head "${key}.sha256")" == 200 ]] || {
     log "BUG: .sha256 was not uploaded to S3 alongside the archive"
     return 1
   }
 
-  # Restore normally — checksum is verified automatically during download
-  prepare_target_volume "alpha_restore"
-  run_restore -i "$s3_uri" -t alpha_restore -C || return 1
+  # The archive and its sidecar carry the same publication token
+  local archive_token sidecar_token
+  archive_token="$(curl -K "$T_S3_CONFIG" --head "$(t_s3_url "$key")" | tr -d '\r' | awk 'tolower($1) == "x-amz-meta-vb-token:" { print $2 }')"
+  sidecar_token="$(curl -K "$T_S3_CONFIG" --head "$(t_s3_url "${key}.sha256")" | tr -d '\r' | awk 'tolower($1) == "x-amz-meta-vb-token:" { print $2 }')"
+  [[ -n "$archive_token" && "$archive_token" == "$sidecar_token" ]] || {
+    log "BUG: archive and sidecar tokens differ: '$archive_token' vs '$sidecar_token'"
+    return 1
+  }
+
+  # A corrupted sidecar must make the restore fail and leave the target alone
+  t_s3_get "${key}.sha256" "$CASE_ROOT/good.sha256" || return 1
+  printf '%064d  alpha_%s.tar.gz\n' 0 "$ts" > "$CASE_ROOT/bad.sha256"
+  [[ "$(t_s3_put "${key}.sha256" "$CASE_ROOT/bad.sha256")" == 200 ]] || return 1
+
+  replace_volume_with_marker "alpha_restore" "must-survive"
+  local rc=0
+  run_restore -i "s3://${TEST_S3_BUCKET}/${key}" -t alpha_restore -C 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: restore accepted an archive that does not match its checksum"
+    return 1
+  }
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha_restore/marker.txt" "must-survive" || return 1
+
+  [[ "$(t_s3_put "${key}.sha256" "$CASE_ROOT/good.sha256")" == 200 ]] || return 1
+  run_restore -i "s3://${TEST_S3_BUCKET}/${key}" -t alpha_restore -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
 }
 
-test_s3_backup_fails_closed_on_stat_error() {
-  setup_case "s3_backup_fails_closed_on_stat_error"
+test_s3_backup_fails_closed_on_head_error() {
+  setup_case "s3_backup_fails_closed_on_head_error"
   make_volume_content "alpha"
 
-  # Stub `mc` that simulates a non-"not found" error from `mc stat`
-  # (e.g. access denied, network issue) while letting alias/pipe pass.
-  local stub_bin="$CASE_ROOT/stub-bin"
-  mkdir -p "$stub_bin"
-  cat > "$stub_bin/mc" <<'EOF'
-#!/usr/bin/env bash
-# args: --config-dir <dir> <verb> ...
-verb="$3"
-if [[ "$verb" == "stat" ]]; then
-  printf 'mc: <ERROR> Unable to stat: Access Denied.\n' >&2
-  exit 1
-fi
-# Pretend other verbs succeed silently — the script must die before reaching them.
-exit 0
-EOF
-  chmod +x "$stub_bin/mc"
+  # A HEAD answer other than 200/404 (here: 403) must stop the backup before
+  # anything is uploaded; it must never be read as "object does not exist".
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" deny
 
   local rc=0
-  env \
-    NO_COLOR=1 \
-    BACKUP_ROOT="$TEST_BACKUP_ROOT" \
-    VOLUMES_ROOT="$TEST_VOLUMES_ROOT" \
-    GPG_ROOT="$TEST_GPG_ROOT" \
+  run_backup_with_env \
     AWS_ACCESS_KEY_ID=dummy \
     AWS_SECRET_ACCESS_KEY=dummy \
-    PATH="$stub_bin:$PATH" \
-    bash "$BACKUP_BIN" -v alpha -T 20250101_444444 -c -b irrelevant 2>/dev/null || rc=$?
+    AWS_ENDPOINT_URL=http://127.0.0.1:9 \
+    PATH="$stub:$PATH" \
+    -- -v alpha -T 20250101_444444 -c -b irrelevant 2>/dev/null || rc=$?
 
   (( rc != 0 )) || {
-    log "BUG: backup proceeded despite ambiguous mc stat error — should fail closed"
+    log "BUG: backup proceeded despite an ambiguous HEAD answer — should fail closed"
+    return 1
+  }
+
+  ! grep -q '?uploads' "$stub/curl.trace" || {
+    log "BUG: backup started an upload after an ambiguous HEAD answer"
+    return 1
+  }
+}
+
+test_s3_rejects_unsafe_keys() {
+  setup_case "s3_rejects_unsafe_keys"
+  make_volume_content "alpha"
+  prepare_target_volume "alpha_restore"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" deny
+
+  local -a s3_env=(
+    AWS_ACCESS_KEY_ID=dummy
+    AWS_SECRET_ACCESS_KEY=dummy
+    AWS_ENDPOINT_URL=http://127.0.0.1:9
+    PATH="$stub:$PATH"
+  )
+
+  local folder
+  for folder in 'a/../b' 'a//b' './x' 'a/./b' 'a b' 'a/..'; do
+    expect_rejected run_backup_with_env "${s3_env[@]}" -- -v alpha -T 20250101_454545 -b bucket -f "$folder" || return 1
+  done
+
+  local source
+  for source in 's3://bucket/a/../x.tar' 's3://bucket//x.tar' 's3://bucket/' 's3://Bad_Bucket/x.tar'; do
+    expect_rejected run_restore_with_env "${s3_env[@]}" -- -i "$source" -t alpha_restore || return 1
+  done
+
+  [[ ! -s "$stub/curl.trace" ]] || {
+    log "BUG: an unsafe key reached the network:"
+    cat "$stub/curl.trace" >&2
     return 1
   }
 }
 
 test_s3_backup_fails_on_overwrite_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
 
   setup_case "s3_backup_fails_on_overwrite_optional"
 
   make_volume_content "alpha"
 
   local ts="20250101_333333"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
+  local prefix
+  prefix="$(t_s3_prefix overwrite)"
 
-  local suffix="overwrite-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  # First backup — must succeed
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
   # Mutate the source so a re-run would produce different bytes
   printf 'second-version\n' > "$TEST_VOLUMES_ROOT/alpha/second.txt"
 
-  # Second backup with the same timestamp must fail — the local backup path
-  # already protects against this via [[ ! -e ]], so the default for S3
-  # should match. A silent overwrite destroys the original recovery point.
   local rc=0
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
 
@@ -1054,7 +1778,7 @@ test_s3_backup_fails_on_overwrite_optional() {
 }
 
 test_s3_roundtrip_encrypted_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
   command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
 
   setup_case "s3_roundtrip_encrypted_optional"
@@ -1063,24 +1787,2268 @@ test_s3_roundtrip_encrypted_optional() {
   export GPG_PASSPHRASE="test-s3-encrypted-passphrase"
 
   local ts="20250101_090006"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
-
-  local suffix="enc-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  local key="alpha_${ts}.tar.gz.gpg"
-  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+  local prefix
+  prefix="$(t_s3_prefix encrypted)"
 
   run_backup -v alpha -T "$ts" -c -s -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
   prepare_target_volume "alpha_restore"
-  run_restore -i "$s3_uri" -t alpha_restore -s -C || return 1
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar.gz.gpg" -t alpha_restore -s -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_multipart_roundtrip_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_multipart_roundtrip_optional"
+
+  make_volume_content "alpha"
+  dd if=/dev/urandom of="$TEST_VOLUMES_ROOT/alpha/big.bin" bs=1M count=12 status=none
+
+  local ts="20250101_500000"
+  local prefix
+  prefix="$(t_s3_prefix multipart)"
+
+  # 12 MiB of random data in 5 MiB parts: three parts, the last one short
+  run_backup_with_env S3_PART_SIZE=5 -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_failed_stream_publishes_nothing_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_failed_stream_publishes_nothing_optional"
+  make_volume_content "alpha"
+
+  # A compressor that emits 7 MiB (more than one 5 MiB part) and then fails:
+  # the uploader sees a normal end of stream, but nothing may be published.
+  local stub="$CASE_ROOT/stub"
+  mkdir -p "$stub"
+  printf '#!/usr/bin/env bash\nhead -c 7340032 /dev/urandom\nexit 1\n' > "$stub/pigz"
+  chmod +x "$stub/pigz"
+
+  local ts="20250101_510000"
+  local prefix key
+  prefix="$(t_s3_prefix failed-stream)"
+  key="${prefix}/alpha_${ts}.tar.gz"
+
+  local rc=0
+  run_backup_with_env S3_PART_SIZE=5 PATH="$stub:$PATH" -- \
+    -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
+
+  (( rc != 0 )) || {
+    log "BUG: backup reported success although the compressor failed"
+    return 1
+  }
+
+  [[ "$(t_s3_head "$key")" == 404 ]] || {
+    log "BUG: a truncated archive was published at $key"
+    return 1
+  }
+  [[ "$(t_s3_head "${key}.sha256")" == 404 ]] || return 1
+
+  [[ "$(t_s3_pending_uploads "$key")" == 0 ]] || {
+    log "BUG: the failed multipart upload was not aborted"
+    return 1
+  }
+}
+
+test_s3_concurrent_object_is_not_overwritten_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_concurrent_object_is_not_overwritten_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_520000"
+  local prefix key
+  prefix="$(t_s3_prefix concurrent)"
+  key="${prefix}/alpha_${ts}.tar"
+
+  start_paused_backup s3_before_complete -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point s3_before_complete || return 1
+
+  # Another writer publishes the same key after our existence check
+  printf 'foreign\n' > "$CASE_ROOT/foreign.bin"
+  [[ "$(t_s3_put "$key" "$CASE_ROOT/foreign.bin")" == 200 ]] || return 1
+
+  local rc=0
+  resume_and_wait s3_before_complete 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup overwrote an object that appeared while it was uploading"
+    return 1
+  }
+
+  t_s3_get "$key" "$CASE_ROOT/after.bin" || return 1
+  cmp -s "$CASE_ROOT/foreign.bin" "$CASE_ROOT/after.bin" || {
+    log "BUG: the concurrently written object was replaced"
+    return 1
+  }
+  [[ "$(t_s3_pending_uploads "$key")" == 0 ]] || return 1
+}
+
+test_s3_requires_conditional_writes_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_requires_conditional_writes_optional"
+  make_volume_content "alpha"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" complete-501
+
+  local prefix
+  prefix="$(t_s3_prefix no-conditional)"
+
+  local rc=0
+  run_backup_with_env PATH="$stub:$PATH" -- \
+    -v alpha -T 20250101_530000 -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup published without overwrite protection and without opt-in"
+    return 1
+  }
+  [[ "$(t_s3_head "${prefix}/alpha_20250101_530000.tar")" == 404 ]] || return 1
+
+  # Explicit opt-in publishes without the condition
+  run_backup_with_env PATH="$stub:$PATH" S3_ALLOW_UNCONDITIONAL_WRITES=1 -- \
+    -v alpha -T 20250101_530001 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_20250101_530001.tar" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_lost_complete_response_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_lost_complete_response_optional"
+  make_volume_content "alpha"
+
+  local prefix
+  prefix="$(t_s3_prefix lost-response)"
+
+  # Our own completion succeeded but the response got lost: the retry sees
+  # the object, recognises our token, and the backup succeeds.
+  local stub_ours="$CASE_ROOT/stub-ours"
+  make_curl_stub "$stub_ours" complete-lost
+  run_backup_with_env PATH="$stub_ours:$PATH" -- \
+    -v alpha -T 20250101_540000 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_20250101_540000.tar" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+
+  # Someone else's object occupies the key: the retry sees a foreign token
+  local stub_foreign="$CASE_ROOT/stub-foreign"
+  make_curl_stub "$stub_foreign" complete-lost-foreign
+  local key="${prefix}/alpha_20250101_540001.tar"
+  local rc=0
+  run_backup_with_env PATH="$stub_foreign:$PATH" -- \
+    -v alpha -T 20250101_540001 -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup claimed a foreign object as its own"
+    return 1
+  }
+
+  t_s3_get "$key" "$CASE_ROOT/after.bin" || return 1
+  [[ "$(cat "$CASE_ROOT/after.bin")" == foreign ]] || return 1
+  [[ "$(t_s3_head "${key}.sha256")" == 404 ]] || return 1
+}
+
+test_s3_sidecar_conflict_keeps_archive_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_sidecar_conflict_keeps_archive_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_550000"
+  local prefix key
+  prefix="$(t_s3_prefix sidecar-conflict)"
+  key="${prefix}/alpha_${ts}.tar"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" trace
+
+  start_paused_backup s3_before_sidecar PATH="$stub:$PATH" -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point s3_before_sidecar || return 1
+
+  printf '%064d  foreign\n' 1 > "$CASE_ROOT/foreign.sha256"
+  [[ "$(t_s3_put "${key}.sha256" "$CASE_ROOT/foreign.sha256")" == 200 ]] || return 1
+
+  local rc=0
+  resume_and_wait s3_before_sidecar 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup reported success although its sidecar could not be published"
+    return 1
+  }
+
+  [[ "$(t_s3_head "$key")" == 200 ]] || {
+    log "BUG: the uploaded archive was removed"
+    return 1
+  }
+  t_s3_get "${key}.sha256" "$CASE_ROOT/after.sha256" || return 1
+  cmp -s "$CASE_ROOT/foreign.sha256" "$CASE_ROOT/after.sha256" || {
+    log "BUG: the foreign sidecar was overwritten"
+    return 1
+  }
+
+  # No object DELETE at all (aborting a multipart upload uses ?uploadId=)
+  ! grep -E -- '-X DELETE' "$stub/curl.trace" | grep -vq 'uploadId=' || {
+    log "BUG: backup issued an object DELETE"
+    return 1
+  }
+
+  # Without -U, the archive whose sidecar is foreign must not be restored
+  prepare_target_volume "alpha_restore"
+  rc=0
+  run_restore -i "s3://${TEST_S3_BUCKET}/${key}" -t alpha_restore 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: restore accepted an archive with a mismatching sidecar"
+    return 1
+  }
+}
+
+test_s3_credentials_stay_off_the_command_line_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_credentials_stay_off_the_command_line_optional"
+  make_volume_content "alpha"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" trace
+
+  local ts="20250101_560000"
+  local prefix
+  prefix="$(t_s3_prefix credentials)"
+
+  start_paused_backup s3_before_complete PATH="$stub:$PATH" -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point s3_before_complete || return 1
+
+  # No running process may carry the secret in its command line
+  # No process of the paused backup may carry the secret in its command line.
+  # Compare inside bash: an external grep would carry the secret in its argv.
+  local pid content leaked=0
+  while IFS= read -r pid; do
+    content="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || continue
+    [[ "$content" != *"$AWS_SECRET_ACCESS_KEY"* ]] || leaked=1
+  done < <(process_tree_pids "$PAUSED_PID")
+
+  resume_and_wait s3_before_complete 2>/dev/null || return 1
+
+  (( leaked == 0 )) || {
+    log "BUG: the S3 secret appeared in a process command line"
+    return 1
+  }
+
+  local trace
+  trace="$(cat "$stub/curl.trace")"
+  [[ -n "$trace" && "$trace" != *"$AWS_SECRET_ACCESS_KEY"* ]] || {
+    log "BUG: the S3 secret was passed to curl on the command line (or curl was never called)"
+    return 1
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Transactional restore helpers
+# ------------------------------------------------------------------------------
+
+# Runs restore with a crash injected at <point> (the whole run is killed with
+# SIGKILL there). Fails if the run was not killed.
+#   restore_crashing_at <point> [env assignments...] -- <restore args...>
+restore_crashing_at() {
+  local point="$1" rc=0
+  shift
+  run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_FAIL_AT="$point" "$@" >/dev/null 2>&1 || rc=$?
+  (( rc == 137 )) || {
+    log "Expected restore to be killed at '$point' (exit 137), got exit $rc"
+    return 1
+  }
+}
+
+recover_crashing_at() {
+  local point="$1" rc=0
+  run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_FAIL_AT="$point" -- -X >/dev/null 2>&1 || rc=$?
+  (( rc == 137 )) || {
+    log "Expected recovery to be killed at '$point' (exit 137), got exit $rc"
+    return 1
+  }
+}
+
+# Lists reserved entries left in a volume (should be empty after recovery)
+reserved_entries() {
+  find "$1" -mindepth 1 -maxdepth 1 \( -name '.vb-restore*' -o -name '.restore-in-progress.*' \) -printf '%f\n'
+}
+
+assert_no_reserved_entries() {
+  local vol left
+  for vol in "$@"; do
+    left="$(reserved_entries "$TEST_VOLUMES_ROOT/$vol")"
+    [[ -z "$left" ]] || {
+      log "Reserved entries left in $vol: $left"
+      return 1
+    }
+  done
+}
+
+# Two volumes with backups at TXN_TS (the "new" data, kept in new-*) and
+# different current contents (the "old" data, kept in old-*). The metadata of
+# each volume root is kept in <snapshot>.root.
+setup_two_volume_transaction() {
+  TXN_TS="20250101_600000"
+  local vol
+  for vol in alpha beta; do
+    make_volume_content "$vol"
+    chmod 0750 "$TEST_VOLUMES_ROOT/$vol"
+    touch -d '2021-05-06 07:08:09' "$TEST_VOLUMES_ROOT/$vol"
+    copy_volume_snapshot "$vol" "$CASE_ROOT/new-$vol"
+    dir_root_metadata "$TEST_VOLUMES_ROOT/$vol" > "$CASE_ROOT/new-$vol.root"
+  done
+  run_backup -a -T "$TXN_TS" -c || return 1
+
+  for vol in alpha beta; do
+    replace_volume_with_marker "$vol" "old-$vol"
+    printf 'second old entry\n' > "$TEST_VOLUMES_ROOT/$vol/second.txt"
+    mkdir -p "$TEST_VOLUMES_ROOT/$vol/old-dir"
+    printf 'third\n' > "$TEST_VOLUMES_ROOT/$vol/old-dir/third.txt"
+    touch -d '2019-01-02 03:04:05' "$TEST_VOLUMES_ROOT/$vol"
+    copy_volume_snapshot "$vol" "$CASE_ROOT/old-$vol"
+    dir_root_metadata "$TEST_VOLUMES_ROOT/$vol" > "$CASE_ROOT/old-$vol.root"
+  done
+}
+
+# Puts the old data back into both volumes
+reset_two_volume_transaction() {
+  local vol
+  for vol in alpha beta; do
+    rm -rf "${TEST_VOLUMES_ROOT:?}/$vol"
+    mkdir -p "$TEST_VOLUMES_ROOT/$vol"
+    cp -a "$CASE_ROOT/old-$vol/." "$TEST_VOLUMES_ROOT/$vol/"
+    touch -d '2019-01-02 03:04:05' "$TEST_VOLUMES_ROOT/$vol"
+    dir_root_metadata "$TEST_VOLUMES_ROOT/$vol" > "$CASE_ROOT/old-$vol.root"
+  done
+}
+
+# Both volumes hold the <old|new> data, including the metadata of their
+# roots (the root mtime survives every crash only with user xattrs), and no
+# journal is left.
+assert_group_state() {
+  local expected="$1" vol
+  for vol in alpha beta; do
+    assert_dirs_equal "$CASE_ROOT/${expected}-${vol}" "$TEST_VOLUMES_ROOT/$vol" || {
+      log "Volume $vol does not hold the ${expected} data"
+      return 1
+    }
+    if xattr_tests_enabled; then
+      [[ "$(dir_root_metadata "$TEST_VOLUMES_ROOT/$vol")" == "$(cat "$CASE_ROOT/${expected}-${vol}.root")" ]] || {
+        log "Root of $vol: expected '$(cat "$CASE_ROOT/${expected}-${vol}.root")', got '$(dir_root_metadata "$TEST_VOLUMES_ROOT/$vol")'"
+        return 1
+      }
+    fi
+  done
+  assert_no_reserved_entries alpha beta || return 1
+}
+
+# ------------------------------------------------------------------------------
+# Transactional restore tests
+# ------------------------------------------------------------------------------
+
+test_restore_empty_volume_roundtrip() {
+  setup_case "restore_empty_volume_roundtrip"
+
+  mkdir -p "$TEST_VOLUMES_ROOT/empty"
+  local ts="20250101_610000"
+
+  run_backup -v empty -T "$ts" || return 1
+  prepare_target_volume "empty_restore"
+  run_restore -i "empty_${ts}.tar" -t empty_restore || return 1
+  [[ -z "$(ls -A "$TEST_VOLUMES_ROOT/empty_restore")" ]] || return 1
+
+  # Replacing a non-empty volume with an empty backup empties it
+  printf 'old\n' > "$TEST_VOLUMES_ROOT/empty_restore/old.txt"
+  run_restore -i "empty_${ts}.tar" -t empty_restore -C || return 1
+  [[ -z "$(ls -A "$TEST_VOLUMES_ROOT/empty_restore")" ]] || return 1
+}
+
+test_restore_preserves_volume_root_metadata() {
+  (( EUID == 0 )) || return "$SKIP_RC"
+  setup_case "restore_preserves_volume_root_metadata"
+
+  make_volume_content "pg"
+  chown 999:998 "$TEST_VOLUMES_ROOT/pg"
+  chmod 2750 "$TEST_VOLUMES_ROOT/pg"
+  touch -d '2021-03-04 05:06:07' "$TEST_VOLUMES_ROOT/pg"
+  local expected
+  expected="$(dir_root_metadata "$TEST_VOLUMES_ROOT/pg")"
+
+  local ts="20250101_620000"
+  run_backup -v pg -T "$ts" || return 1
+
+  prepare_target_volume "pg_new"
+  run_restore -i "pg_${ts}.tar" -t pg_new || return 1
+  [[ "$(dir_root_metadata "$TEST_VOLUMES_ROOT/pg_new")" == "$expected" ]] || {
+    log "Root metadata not restored: expected '$expected', got '$(dir_root_metadata "$TEST_VOLUMES_ROOT/pg_new")'"
+    return 1
+  }
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/pg" "$TEST_VOLUMES_ROOT/pg_new" || return 1
+
+  # Also when replacing existing contents
+  replace_volume_with_marker "pg_new" "old"
+  chmod 0755 "$TEST_VOLUMES_ROOT/pg_new"
+  run_restore -i "pg_${ts}.tar" -t pg_new -C || return 1
+  [[ "$(dir_root_metadata "$TEST_VOLUMES_ROOT/pg_new")" == "$expected" ]] || return 1
+}
+
+test_backup_tolerates_files_changing() {
+  setup_case "backup_tolerates_files_changing"
+  make_volume_content "alpha"
+
+  # tar exits 1 when files changed while being read
+  local stub="$CASE_ROOT/stub" real_tar
+  real_tar="$(command -v tar)"
+  mkdir -p "$stub"
+  cat > "$stub/tar" <<STUB
+#!/usr/bin/env bash
+'$real_tar' "\$@" || exit \$?
+[[ " \$* " == *" --create "* ]] && exit 1
+exit 0
+STUB
+  chmod +x "$stub/tar"
+
+  run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250101_630000 || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_20250101_630000.tar" || return 1
+
+  expect_rejected run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250101_630001 -S || return 1
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -name '*_20250101_630001*')" ]] || {
+    log "BUG: strict backup left files behind"
+    return 1
+  }
+}
+
+test_restore_all_wrong_passphrase_changes_nothing() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "restore_all_wrong_passphrase_changes_nothing"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  local ts="20250101_640000"
+  run_backup_with_env GPG_PASSPHRASE=right -- -v alpha -T "$ts" -c -s || return 1
+  run_backup_with_env GPG_PASSPHRASE=other -- -v beta -T "$ts" -c -s || return 1
+
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  expect_rejected run_restore_with_env GPG_PASSPHRASE=right -- -a -T "$ts" -s -C -j 2 || return 1
+
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+}
+
+test_restore_crash_matrix() {
+  setup_case "restore_crash_matrix"
+  setup_two_volume_transaction || return 1
+
+  # alpha is the coordinator (first by name); it finalizes last
+  local spec point expected
+  for spec in \
+    txn_create_rename:beta=old \
+    txn_staged:beta=old \
+    txn_aside_entry:alpha=old \
+    txn_swap_entry:beta=old \
+    txn_before_decision=old \
+    txn_after_decision=new \
+    txn_finalize:beta=new \
+    txn_finalize:alpha=new \
+    txn_retire_done:alpha=new \
+    txn_trash_signature:alpha=new \
+    txn_trash_rmdir:alpha=new \
+    txn_finalize_mtime:alpha=new; do
+    point="${spec%=*}"
+    expected="${spec##*=}"
+
+    restore_crashing_at "$point" -- -a -T "$TXN_TS" -C || return 1
+    if [[ "$point" != txn_finalize_mtime:* ]]; then
+      [[ -n "$(reserved_entries "$TEST_VOLUMES_ROOT/alpha")$(reserved_entries "$TEST_VOLUMES_ROOT/beta")" ]] || {
+        log "Crash at $point left no journal behind"
+        return 1
+      }
+    fi
+
+    # Recovery runs in a fresh process with a fresh TMPDIR (container restart)
+    run_restore -X || return 1
+    assert_group_state "$expected" || {
+      log "Wrong state after a crash at $point (expected $expected data)"
+      return 1
+    }
+
+    # Back to the old data for the next round
+    if [[ "$expected" == new ]]; then
+      reset_two_volume_transaction
+    fi
+  done
+}
+
+test_restore_repeated_crashes_during_rollback() {
+  setup_case "restore_repeated_crashes_during_rollback"
+  setup_two_volume_transaction || return 1
+
+  # alpha switched, beta half switched; then the rollback itself crashes in
+  # beta's rb2 and later in alpha's rb1
+  restore_crashing_at txn_swap_entry:beta -- -a -T "$TXN_TS" -C || return 1
+  recover_crashing_at txn_rb2_entry:beta || return 1
+  [[ "$(cat "$TEST_VOLUMES_ROOT/beta/.vb-restore/state")" == rb2 ]] || {
+    log "Expected beta to be in rb2 after the crash"
+    return 1
+  }
+  recover_crashing_at txn_rb1_entry:alpha || return 1
+  run_restore -X || return 1
+  assert_group_state old || return 1
+
+  # Mixed phases: alpha switched, beta just entered aside
+  restore_crashing_at txn_aside:beta -- -a -T "$TXN_TS" -C || return 1
+  recover_crashing_at txn_rb2_entry:alpha || return 1
+  run_restore -X || return 1
+  assert_group_state old || return 1
+}
+
+test_restore_recovery_needs_all_participants() {
+  setup_case "restore_recovery_needs_all_participants"
+  setup_two_volume_transaction || return 1
+
+  restore_crashing_at txn_swap_entry:beta -- -a -T "$TXN_TS" -C || return 1
+
+  # Only beta is mounted: recovery must refuse without touching it
+  local partial_root="$CASE_ROOT/partial-volumes"
+  mkdir -p "$partial_root"
+  mv "$TEST_VOLUMES_ROOT/beta" "$partial_root/beta"
+  local before
+  before="$(tree_manifest "$partial_root/beta")"
+
+  expect_rejected run_restore_with_env VOLUMES_ROOT="$partial_root" -- -X || return 1
+  [[ "$(tree_manifest "$partial_root/beta")" == "$before" ]] || {
+    log "BUG: recovery changed a volume although the coordinator was not mounted"
+    return 1
+  }
+
+  mv "$partial_root/beta" "$TEST_VOLUMES_ROOT/beta"
+  run_restore -X || return 1
+  assert_group_state old || return 1
+}
+
+test_restore_locks_against_concurrent_operations() {
+  setup_case "restore_locks_against_concurrent_operations"
+  make_volume_content "alpha"
+  local ts="20250101_650000"
+  run_backup -v alpha -T "$ts" || return 1
+
+  PAUSE_DIR="$CASE_ROOT/pause"
+  mkdir -p "$PAUSE_DIR"
+
+  # A restore holds the volume: backup, restore and recovery must refuse
+  run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_PAUSE_AT=txn_staged VB_TEST_PAUSE_DIR="$PAUSE_DIR" -- \
+    -i "alpha_${ts}.tar" -t alpha -C > "$CASE_ROOT/paused.log" 2>&1 &
+  PAUSED_PID=$!
+  wait_for_point txn_staged || return 1
+
+  expect_rejected run_backup -v alpha -T 20250101_650001 || return 1
+  expect_rejected run_restore -i "alpha_${ts}.tar" -t alpha -C || return 1
+  expect_rejected run_restore -X || return 1
+
+  resume_and_wait txn_staged 2>/dev/null || return 1
+
+  # A backup holds the volume (shared): a restore must refuse
+  start_paused_backup local_publish -- -v alpha -T 20250101_650002
+  wait_for_point local_publish || return 1
+  expect_rejected run_restore -i "alpha_${ts}.tar" -t alpha -C || return 1
+  resume_and_wait local_publish 2>/dev/null || return 1
+}
+
+test_recovery_waits_for_finalize() {
+  setup_case "recovery_waits_for_finalize"
+  make_volume_content "alpha"
+  local ts="20250101_660000"
+  run_backup -v alpha -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old"
+
+  local point
+  local -a points=(txn_retire_done txn_trash_signature txn_trash_rmdir)
+  # Without user xattrs nothing marks the volume once its journal is gone
+  if xattr_tests_enabled; then
+    points+=(txn_finalize_mtime)
+  fi
+  for point in "${points[@]}"; do
+    PAUSE_DIR="$CASE_ROOT/pause-$point"
+    mkdir -p "$PAUSE_DIR"
+    run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_PAUSE_AT="$point" VB_TEST_PAUSE_DIR="$PAUSE_DIR" -- \
+      -i "alpha_${ts}.tar" -t alpha -C > "$CASE_ROOT/paused.log" 2>&1 &
+    PAUSED_PID=$!
+    wait_for_point "$point" || return 1
+
+    local before after
+    before="$(cd "$TEST_VOLUMES_ROOT/alpha" && find . -printf '%P\t%y\t%m\t%T@\n' | LC_ALL=C sort; dir_root_metadata .; getfattr -d -m - --absolute-names . 2>/dev/null)"
+
+    expect_rejected run_restore -X || return 1
+    expect_rejected run_backup -v alpha -T 20250101_660001 || return 1
+
+    after="$(cd "$TEST_VOLUMES_ROOT/alpha" && find . -printf '%P\t%y\t%m\t%T@\n' | LC_ALL=C sort; dir_root_metadata .; getfattr -d -m - --absolute-names . 2>/dev/null)"
+    [[ "$before" == "$after" ]] || {
+      log "BUG: a concurrent recovery changed the volume while it was being finalized ($point)"
+      return 1
+    }
+
+    resume_and_wait "$point" 2>/dev/null || return 1
+    assert_no_reserved_entries alpha || return 1
+    replace_volume_with_marker "alpha" "old"
+  done
+}
+
+test_restore_wal_order() {
+  setup_case "restore_wal_order"
+  make_volume_content "alpha"
+  local ts="20250101_670000"
+  run_backup -v alpha -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old"
+  printf 'second\n' > "$TEST_VOLUMES_ROOT/alpha/second.txt"
+
+  # Record every sync and mv (with the content of journal state files)
+  local stub="$CASE_ROOT/stub" real_mv real_sync
+  real_mv="$(command -v mv)"
+  real_sync="$(command -v sync)"
+  mkdir -p "$stub"
+  cat > "$stub/mv" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do src="\$dst"; dst="\$arg"; done
+if [[ "\$src" == */.state.tmp ]]; then
+  printf 'STATE %s\n' "\$(cat "\$src")" >> '$stub/trace'
+elif [[ "\$src" == */.decision.tmp ]]; then
+  printf 'DECISION\n' >> '$stub/trace'
+elif [[ "\$src" != */.*.tmp ]]; then
+  printf 'MOVE %s -> %s\n' "\$src" "\$dst" >> '$stub/trace'
+fi
+exec '$real_mv' "\$@"
+STUB
+  cat > "$stub/sync" <<STUB
+#!/usr/bin/env bash
+printf 'SYNC %s\n' "\$*" >> '$stub/trace'
+exec '$real_sync' "\$@"
+STUB
+  chmod +x "$stub/mv" "$stub/sync"
+
+  run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+
+  awk '
+    /^STATE / { state = $2; states[state] = NR; synced_old = synced_new = 0; next }
+    /^SYNC -f/ { syncfs = NR; next }
+    /^SYNC / { if ($0 ~ /\/old/) synced_old = 1; if ($0 ~ /\/new/) synced_new = 1; next }
+    /^MOVE / {
+      if ($0 ~ /\/\.vb-restore\/old\// && state != "aside") { print "aside move outside the aside phase: " $0; bad = 1 }
+      if ($0 ~ /\/\.vb-restore\/new\// && $0 !~ /-> .*\.vb-restore/ && state != "swap") { print "swap move outside the swap phase: " $0; bad = 1 }
+      next
+    }
+    END {
+      if (!syncfs || syncfs > states["staged"]) { print "data not synced before staged"; bad = 1 }
+      if (!(states["aside"] < states["swap"] && states["swap"] < states["swapped"] && states["swapped"] < states["finalize"])) { print "phases out of order"; bad = 1 }
+      exit bad
+    }' "$stub/trace" || {
+    cat "$stub/trace" >&2
+    return 1
+  }
+
+  # The phase that follows aside/swap is only recorded after its directories were synced
+  awk '
+    /^STATE swap$/ && !old_synced { print "swap recorded before old/ was synced"; bad = 1 }
+    /^STATE swapped$/ && !new_synced { print "swapped recorded before new/ was synced"; bad = 1 }
+    /^STATE aside$/ { old_synced = 0 }
+    /^STATE swap$/ { new_synced = 0 }
+    /^SYNC / && /\/\.vb-restore\/old/ { old_synced = 1 }
+    /^SYNC / && /\/\.vb-restore\/new/ { new_synced = 1 }
+    END { exit bad }' "$stub/trace" || {
+    cat "$stub/trace" >&2
+    return 1
+  }
+}
+
+test_restore_refuses_nested_mounts() {
+  setup_case "restore_refuses_nested_mounts"
+  make_volume_content "alpha"
+  local ts="20250101_680000"
+  run_backup -v alpha -T "$ts" || return 1
+
+  mkdir -p "$TEST_VOLUMES_ROOT/alpha/mnt" "$CASE_ROOT/elsewhere"
+  printf 'must survive\n' > "$CASE_ROOT/elsewhere/keep.txt"
+  if ! mount --bind "$CASE_ROOT/elsewhere" "$TEST_VOLUMES_ROOT/alpha/mnt" 2>/dev/null; then
+    log "Skipping: bind mounts are not permitted here (needs CAP_SYS_ADMIN)"
+    return "$SKIP_RC"
+  fi
+
+  local rc=0
+  run_restore -i "alpha_${ts}.tar" -t alpha -C 2>/dev/null || rc=$?
+  umount "$TEST_VOLUMES_ROOT/alpha/mnt"
+
+  (( rc != 0 )) || {
+    log "BUG: restore replaced a volume that contains a mount point"
+    return 1
+  }
+  assert_text_file_contains "$CASE_ROOT/elsewhere/keep.txt" "must survive" || return 1
+  assert_no_reserved_entries alpha || return 1
+}
+
+test_restore_refuses_mount_points_from_mountinfo() {
+  setup_case "restore_refuses_mount_points_from_mountinfo"
+  make_volume_content "alpha"
+  local ts="20250101_681000"
+  run_backup -v alpha -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old"
+
+  # Mount points are read from mountinfo, where spaces are escaped as \040
+  local real_alpha fake="$CASE_ROOT/mountinfo"
+  real_alpha="$(cd "$TEST_VOLUMES_ROOT/alpha" && pwd -P)"
+  { cat /proc/self/mountinfo; printf '9999 1 0:99 / %s/data\\040dir rw - tmpfs tmpfs rw\n' "$real_alpha"; } > "$fake"
+
+  expect_rejected run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$fake" -- \
+    -i "alpha_${ts}.tar" -t alpha -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # A mount point of a volume that merely shares the name prefix is fine
+  { cat /proc/self/mountinfo; printf '9999 1 0:99 / %s-other/sub rw - tmpfs tmpfs rw\n' "$real_alpha"; } > "$fake"
+  run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$fake" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+}
+
+test_restore_refuses_legacy_staging_directory() {
+  setup_case "restore_refuses_legacy_staging_directory"
+  make_volume_content "alpha"
+  local ts="20250101_011112"
+  run_backup -v alpha -T "$ts" || return 1
+
+  clear_volume_dir "alpha"
+  # A staging directory of an older version may hold the only copy of data
+  mkdir -p "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER"
+  printf 'stale content\n' > "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER/stale.txt"
+
+  expect_rejected run_restore -i "alpha_${ts}.tar" -t alpha -C || return 1
+  expect_rejected run_restore -X || return 1
+  expect_rejected run_backup -v alpha -T 20250101_011113 || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/.restore-in-progress.LEFTOVER/stale.txt" "stale content" || return 1
+}
+
+test_reserved_names_from_users_are_never_removed() {
+  setup_case "reserved_names_from_users_are_never_removed"
+  make_volume_content "alpha"
+  local fake_gid="0123456789abcdef0123456789abcdef"
+
+  # An archive with a reserved name at its root is refused before any change
+  mkdir -p "$TEST_VOLUMES_ROOT/alpha/.vb-restore.done.${fake_gid}"
+  printf 'user data\n' > "$TEST_VOLUMES_ROOT/alpha/.vb-restore.done.${fake_gid}/data.txt"
+  expect_rejected run_backup -v alpha -T 20250101_690000 || return 1
+
+  local archive_dir="$CASE_ROOT/archive-src"
+  mkdir -p "$archive_dir/.vb-restore-x"
+  printf 'user data\n' > "$archive_dir/.vb-restore-x/data.txt"
+  tar -cf "$TEST_BACKUP_ROOT/crafted_20250101_690001.tar" -C "$archive_dir" .
+  sha256sum "$TEST_BACKUP_ROOT/crafted_20250101_690001.tar" > "$TEST_BACKUP_ROOT/crafted_20250101_690001.tar.sha256"
+  replace_volume_with_marker "crafted" "old-crafted"
+  expect_rejected run_restore -i crafted_20250101_690001.tar -t crafted -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/crafted/marker.txt" "old-crafted" || return 1
+  assert_no_reserved_entries crafted || return 1
+
+  # A user directory with a trash-like name (no signature) is never removed
+  expect_rejected run_restore -X || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/.vb-restore.done.${fake_gid}/data.txt" "user data" || return 1
+
+  # ... not even with a signature for another group id
+  printf 'vb-restore-journal v1\ngid=%s\n' "fedcba9876543210fedcba9876543210" \
+    > "$TEST_VOLUMES_ROOT/alpha/.vb-restore.done.${fake_gid}/VB-JOURNAL"
+  expect_rejected run_restore -X || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/.vb-restore.done.${fake_gid}/data.txt" "user data" || return 1
+}
+
+test_interrupted_trash_cleanup_is_finished() {
+  setup_case "interrupted_trash_cleanup_is_finished"
+  make_volume_content "alpha"
+  local ts="20250101_700000"
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "alpha" "$CASE_ROOT/new-alpha"
+  replace_volume_with_marker "alpha" "old"
+
+  restore_crashing_at txn_trash_rmdir:alpha -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+  local trash
+  trash="$(reserved_entries "$TEST_VOLUMES_ROOT/alpha")"
+  [[ "$trash" == .vb-restore.done.* && -z "$(ls -A "$TEST_VOLUMES_ROOT/alpha/$trash")" ]] || {
+    log "Expected an empty trash directory, found: '$trash'"
+    return 1
+  }
+
+  run_restore -X || return 1
+  assert_no_reserved_entries alpha || return 1
+  assert_dirs_equal "$CASE_ROOT/new-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  run_backup -v alpha -T 20250101_700001 || return 1
+}
+
+test_restore_requires_valid_checksum_file() {
+  setup_case "restore_requires_valid_checksum_file"
+  make_volume_content "alpha"
+  local ts="20250101_710000"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+  run_backup -v alpha -T "$ts" || return 1
+  prepare_target_volume "alpha_restore"
+
+  # The binary-mode form "<digest> *<name>" is accepted
+  sed -i 's/  / */' "${archive}.sha256"
+  grep -q '^[0-9a-f]\{64\} \*alpha_' "${archive}.sha256" || return 1
+  run_restore -i "$archive" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+
+  # Garbage is refused
+  printf 'not a checksum\n' > "${archive}.sha256"
+  expect_rejected run_restore -i "$archive" -t alpha_restore -C || return 1
+
+  # A missing checksum file is refused unless -U is given
+  rm -f "${archive}.sha256"
+  expect_rejected run_restore -i "$archive" -t alpha_restore -C || return 1
+  run_restore -i "$archive" -t alpha_restore -C -U || return 1
+}
+
+test_backup_refuses_lone_checksum_file() {
+  setup_case "backup_refuses_lone_checksum_file"
+  make_volume_content "alpha"
+  local ts="20250101_720000"
+
+  printf '%064d  alpha_%s.tar\n' 0 "$ts" > "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256"
+  expect_rejected run_backup -v alpha -T "$ts" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar" || return 1
+  [[ "$(cut -c1-8 "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256")" == 00000000 ]] || {
+    log "BUG: the existing checksum file was modified"
+    return 1
+  }
+}
+
+test_concurrent_local_backups_publish_one_pair() {
+  setup_case "concurrent_local_backups_publish_one_pair"
+  make_volume_content "alpha"
+  local ts="20250101_730000"
+
+  # A holds the BACKUP_ROOT lock while publishing; B with the same timestamp
+  # passes its early check, waits for the lock, then must give up.
+  start_paused_backup local_publish -- -v alpha -T "$ts"
+  wait_for_point local_publish || return 1
+
+  printf 'second version\n' > "$TEST_VOLUMES_ROOT/alpha/second.txt"
+  run_backup_with_env VB_LOCK_TIMEOUT=60 -- -v alpha -T "$ts" > "$CASE_ROOT/b.log" 2>&1 &
+  local b_pid=$!
+  sleep 1
+
+  resume_and_wait local_publish 2>/dev/null || return 1
+  local b_rc=0
+  wait "$b_pid" || b_rc=$?
+  (( b_rc != 0 )) || {
+    log "BUG: both backups reported success"
+    return 1
+  }
+
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+  [[ "$(sha256sum "$archive" | awk '{ print $1 }')" == "$(awk '{ print $1 }' "${archive}.sha256")" ]] || {
+    log "BUG: the published checksum does not belong to the published archive"
+    return 1
+  }
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -name '*.part')" ]] || return 1
+}
+
+test_restore_requires_flock() {
+  setup_case "restore_requires_flock"
+  make_volume_content "alpha"
+  local ts="20250101_740000"
+  run_backup -v alpha -T "$ts" || return 1
+
+  local stub="$CASE_ROOT/stub"
+  mkdir -p "$stub"
+  printf '#!/usr/bin/env bash\nexit 64\n' > "$stub/flock"
+  chmod +x "$stub/flock"
+
+  expect_rejected run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+  expect_rejected run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250101_740001 || return 1
+  assert_no_reserved_entries alpha || return 1
+}
+
+test_backup_stops_on_signal() {
+  setup_case "backup_stops_on_signal"
+  make_volume_content "alpha"
+
+  start_paused_backup archive_stream:alpha -- -v alpha -T 20250101_800000 -c
+  wait_for_point archive_stream:alpha || return 1
+  signal_paused_script TERM 143 || return 1
+
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1 ! -name .vb.lock)" ]] || {
+    log "BUG: an interrupted backup left files behind: $(ls -A "$TEST_BACKUP_ROOT")"
+    return 1
+  }
+}
+
+test_backup_all_stops_on_signal() {
+  setup_case "backup_all_stops_on_signal"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  start_paused_backup archive_stream:alpha,archive_stream:beta -- -a -j 2 -T 20250101_800100
+  wait_for_point archive_stream:alpha || return 1
+  wait_for_point archive_stream:beta || return 1
+  # Not INT: background jobs of a non-interactive shell ignore SIGINT, and a
+  # signal ignored at startup cannot be trapped
+  signal_paused_script TERM 143 || return 1
+
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1 ! -name .vb.lock)" ]] || {
+    log "BUG: an interrupted backup left files behind: $(ls -A "$TEST_BACKUP_ROOT")"
+    return 1
+  }
+}
+
+test_backup_all_does_not_wait_for_the_first_child() {
+  setup_case "backup_all_does_not_wait_for_the_first_child"
+  local vol
+  for vol in alpha beta gamma; do
+    make_volume_content "$vol"
+  done
+  local ts="20250101_800200"
+
+  # alpha is stuck; beta finishes, so gamma must start without waiting for alpha
+  start_paused_backup archive_stream:alpha -- -a -j 2 -T "$ts"
+  wait_for_point archive_stream:alpha || return 1
+
+  local i
+  for (( i = 0; i < 300; i++ )); do
+    [[ -e "$TEST_BACKUP_ROOT/gamma_${ts}.tar.sha256" ]] && break
+    sleep 0.1
+  done
+  [[ -e "$TEST_BACKUP_ROOT/gamma_${ts}.tar.sha256" ]] || {
+    log "BUG: the third backup did not start while the first one was still running"
+    resume_and_wait archive_stream:alpha 2>/dev/null || true
+    return 1
+  }
+
+  resume_and_wait archive_stream:alpha 2>/dev/null || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256" || return 1
+}
+
+test_s3_backup_stops_on_signal_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_backup_stops_on_signal_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_800300" prefix key
+  prefix="$(t_s3_prefix signal)"
+  key="${prefix}/alpha_${ts}.tar"
+
+  start_paused_backup archive_stream:alpha -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point archive_stream:alpha || return 1
+  [[ "$(t_s3_pending_uploads "$key")" == 1 ]] || {
+    log "Expected one multipart upload in progress"
+    return 1
+  }
+  signal_paused_script TERM 143 || return 1
+
+  [[ "$(t_s3_head "$key")" == 404 ]] || return 1
+  [[ "$(t_s3_pending_uploads "$key")" == 0 ]] || {
+    log "BUG: the interrupted multipart upload was not aborted"
+    return 1
+  }
+}
+
+test_restore_stops_on_signal() {
+  setup_case "restore_stops_on_signal"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  local ts="20250101_800400"
+  run_backup -a -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # Single restore, interrupted while streaming
+  start_paused_restore restore_stream:alpha -- -i "alpha_${ts}.tar" -t alpha -C
+  wait_for_point restore_stream:alpha || return 1
+  signal_paused_script TERM 143 || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # Restore of all volumes, interrupted while both are being staged
+  rm -rf "$PAUSE_DIR"
+  start_paused_restore restore_stream:alpha,restore_stream:beta -- -a -T "$ts" -C -j 2
+  wait_for_point restore_stream:alpha || return 1
+  wait_for_point restore_stream:beta || return 1
+  signal_paused_script TERM 143 || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+}
+
+test_backup_encrypts_to_every_recipient() {
+  setup_case "backup_encrypts_to_every_recipient"
+  generate_gpg_keypair_files first || return $?
+  generate_gpg_keypair_files second || return $?
+  make_volume_content "alpha"
+
+  # One file with two keys
+  cat "$TEST_GPG_ROOT/firstpublic.asc" "$TEST_GPG_ROOT/secondpublic.asc" > "$TEST_GPG_ROOT/both.asc"
+  run_backup -v alpha -T 20250101_800500 -e -k both.asc || return 1
+
+  # Two -k options, one of them an absolute path outside GPG_ROOT
+  mkdir -p "$CASE_ROOT/elsewhere"
+  mv "$TEST_GPG_ROOT/secondpublic.asc" "$CASE_ROOT/elsewhere/"
+  run_backup -v alpha -T 20250101_800501 -e -k firstpublic.asc -k "$CASE_ROOT/elsewhere/secondpublic.asc" || return 1
+
+  local ts key
+  for ts in 20250101_800500 20250101_800501; do
+    for key in first second; do
+      prepare_target_volume "restore_${key}_${ts}"
+      run_restore -i "alpha_${ts}.tar.gpg" -t "restore_${key}_${ts}" -k "${key}private.asc" || {
+        log "Backup $ts cannot be decrypted with the $key key"
+        return 1
+      }
+      assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/restore_${key}_${ts}" || return 1
+    done
+  done
+}
+
+test_backup_dry_run_validates_public_key() {
+  setup_case "backup_dry_run_validates_public_key"
+  generate_gpg_keypair_files || return $?
+  make_volume_content "alpha"
+
+  printf 'not a key\n' > "$TEST_GPG_ROOT/garbage.asc"
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k garbage.asc -n || return 1
+
+  # A key that can only sign
+  local home
+  home="$(mktemp -d "$TEST_ROOT/kg.XXXXXX")"
+  printf '%%no-protection\n%%transient-key\nKey-Type: eddsa\nKey-Curve: ed25519\nKey-Usage: sign\nName-Real: Sign Only\nExpire-Date: 0\n%%commit\n' \
+    > "$CASE_ROOT/sign-only.conf"
+  GNUPGHOME="$home" gpg --batch --gen-key "$CASE_ROOT/sign-only.conf" >/dev/null 2>&1 || return 1
+  GNUPGHOME="$home" gpg --armor --export > "$TEST_GPG_ROOT/sign-only.asc" || return 1
+  GNUPGHOME="$home" gpgconf --kill all >/dev/null 2>&1 || true
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k sign-only.asc -n || return 1
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k public.asc -k sign-only.asc || return 1
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k missing.asc -n || return 1
+  run_backup -v alpha -T 20250101_800600 -e -k public.asc -n || return 1
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1)" ]] || return 1
+}
+
+test_restore_rejects_unencrypted_gpg_archive() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "restore_rejects_unencrypted_gpg_archive"
+  make_volume_content "alpha"
+  local ts="20250101_800700"
+  run_backup -v alpha -T "$ts" || return 1
+
+  # A bare OpenPGP literal packet: gpg --decrypt outputs it without a key
+  local home="$CASE_ROOT/store-gnupg"
+  local fake="$TEST_BACKUP_ROOT/alpha_20250101_800701.tar.gpg"
+  mkdir -p "$home"
+  chmod 700 "$home"
+  GNUPGHOME="$home" gpg --batch --store --output "$fake" "$TEST_BACKUP_ROOT/alpha_${ts}.tar" 2>/dev/null || return 1
+  printf '%s  %s\n' "$(sha256sum "$fake" | awk '{ print $1 }')" "${fake##*/}" > "${fake}.sha256"
+
+  replace_volume_with_marker "alpha" "old"
+  expect_rejected run_restore_with_env GPG_PASSPHRASE=anything -- -i "${fake##*/}" -t alpha -s -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+}
+
+test_passphrase_with_newline_warns() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "passphrase_with_newline_warns"
+  make_volume_content "alpha"
+  local ts="20250101_800800"
+
+  run_backup_with_env GPG_PASSPHRASE=$'first\nsecond' -- -v alpha -T "$ts" -s 2> "$CASE_ROOT/backup.log" || return 1
+  grep -q 'contains a newline' "$CASE_ROOT/backup.log" || {
+    log "BUG: no warning about the newline in the passphrase"
+    return 1
+  }
+
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env GPG_PASSPHRASE=$'first\nsecond' -- -i "alpha_${ts}.tar.gpg" -t alpha_restore -s 2>/dev/null || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_backup_refuses_backup_root_inside_volume() {
+  setup_case "backup_refuses_backup_root_inside_volume"
+  make_volume_content "alpha"
+
+  expect_rejected run_backup_with_env BACKUP_ROOT="$TEST_VOLUMES_ROOT/alpha/backups" -- -v alpha -T 20250101_800900 || return 1
+  expect_rejected run_backup -v alpha -T 20250101_800900 -d "$TEST_VOLUMES_ROOT/alpha" || return 1
+  [[ -z "$(find "$TEST_VOLUMES_ROOT/alpha" -name '*.tar*')" && ! -e "$TEST_VOLUMES_ROOT/alpha/backups" ]] || {
+    log "BUG: a backup was written into the volume it archives"
+    return 1
+  }
+}
+
+test_restore_refuses_source_inside_target() {
+  setup_case "restore_refuses_source_inside_target"
+  make_volume_content "alpha"
+  local ts="20250101_801000"
+  run_backup -v alpha -T "$ts" || return 1
+
+  cp "$TEST_BACKUP_ROOT/alpha_${ts}.tar" "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256" "$TEST_VOLUMES_ROOT/alpha/"
+  expect_rejected run_restore -i "$TEST_VOLUMES_ROOT/alpha/alpha_${ts}.tar" -t alpha -C || return 1
+  assert_file_exists "$TEST_VOLUMES_ROOT/alpha/alpha_${ts}.tar" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # Same when the whole backup directory lives in a target volume
+  expect_rejected run_restore -a -d "$TEST_VOLUMES_ROOT/alpha" -C || return 1
+  assert_file_exists "$TEST_VOLUMES_ROOT/alpha/alpha_${ts}.tar" || return 1
+}
+
+test_backup_warns_about_nested_mounts() {
+  setup_case "backup_warns_about_nested_mounts"
+  make_volume_content "alpha"
+
+  local real_alpha fake="$CASE_ROOT/mountinfo"
+  real_alpha="$(cd "$TEST_VOLUMES_ROOT/alpha" && pwd -P)"
+  { cat /proc/self/mountinfo; printf '9999 1 0:99 / %s/subdir rw - tmpfs tmpfs rw\n' "$real_alpha"; } > "$fake"
+
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$fake" -- -v alpha -T 20250101_801100 2> "$CASE_ROOT/backup.log" || return 1
+  grep -q 'contains other mount points' "$CASE_ROOT/backup.log" || {
+    log "BUG: no warning about the mount point inside the volume"
+    return 1
+  }
+}
+
+test_restore_does_not_restore_selinux_labels() {
+  is_gnu_tar || return "$SKIP_RC"
+  setup_case "restore_does_not_restore_selinux_labels"
+  make_volume_content "alpha"
+  local ts="20250101_801200"
+  run_backup -v alpha -T "$ts" || return 1
+
+  local stub="$CASE_ROOT/stub" real_tar
+  real_tar="$(command -v tar)"
+  mkdir -p "$stub"
+  cat > "$stub/tar" <<STUB
+#!/usr/bin/env bash
+[[ " \$* " == *" --extract "* ]] && printf '%s\n' "\$*" >> '$stub/trace'
+exec '$real_tar' "\$@"
+STUB
+  chmod +x "$stub/tar"
+
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha_restore || return 1
+  [[ -s "$stub/trace" ]] || return 1
+  if grep -q -v -- '--xattrs-exclude=security.selinux' "$stub/trace"; then
+    log "BUG: an extraction restores SELinux labels:"
+    cat "$stub/trace" >&2
+    return 1
+  fi
+}
+
+test_s3_errors_include_the_curl_message() {
+  setup_case "s3_errors_include_the_curl_message"
+  make_volume_content "alpha"
+
+  local rc=0
+  run_backup_with_env AWS_ENDPOINT_URL=http://127.0.0.1:9 AWS_ACCESS_KEY_ID=key AWS_SECRET_ACCESS_KEY=secret AWS_REGION=us-east-1 -- \
+    -v alpha -T 20250101_801300 -b vb-test 2> "$CASE_ROOT/backup.log" || rc=$?
+  (( rc != 0 )) || return 1
+  grep -q 'curl: (7)' "$CASE_ROOT/backup.log" || {
+    log "BUG: the error does not say why curl failed:"
+    cat "$CASE_ROOT/backup.log" >&2
+    return 1
+  }
+}
+
+# Prints a backup timestamp <days> days ago (UTC)
+ts_days_ago() {
+  ts_seconds_ago $(( $1 * 86400 ))
+}
+
+ts_seconds_ago() {
+  date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y%m%d_%H%M%S
+}
+
+# Prints the keys below an S3 prefix of the test bucket
+#   t_s3_list_keys <prefix> [endpoint] [bucket]
+t_s3_list_keys() {
+  local endpoint="${2:-${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}}"
+  local bucket="${3:-$TEST_S3_BUCKET}"
+  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${bucket}?list-type=2&prefix=$1" \
+    | tr '<' '\n' | awk -F'>' '$1 == "Key" { print $2 }' | tr '\n' ' '
+}
+
+# Every checksum file in BACKUP_ROOT has its archive, and the digests match
+assert_backup_root_consistent() {
+  local sidecar archive
+  for sidecar in "$TEST_BACKUP_ROOT"/*.sha256; do
+    [[ -e "$sidecar" ]] || continue
+    archive="${sidecar%.sha256}"
+    [[ -f "$archive" ]] || {
+      log "BUG: checksum file without its archive: $sidecar"
+      return 1
+    }
+    [[ "$(sha256sum "$archive" | awk '{ print $1 }')" == "$(awk '{ print $1 }' "$sidecar")" ]] || {
+      log "BUG: checksum file does not match its archive: $sidecar"
+      return 1
+    }
+  done
+}
+
+# Lists the backup names left in BACKUP_ROOT for a volume (archives and checksum files)
+backup_names() {
+  find "$TEST_BACKUP_ROOT" -maxdepth 1 -name "$1_[0-9]*" -printf '%f\n' | LC_ALL=C sort | tr '\n' ' '
+}
+
+test_single_backup_restore_zstd() {
+  command -v zstd >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "single_backup_restore_zstd"
+  make_volume_content "alpha"
+
+  run_backup -v alpha -T 20250101_900000 -z || return 1
+  run_backup -v alpha -T 20250101_900001 -z -L 19 || return 1
+  run_backup_with_env GPG_PASSPHRASE=secret -- -v alpha -T 20250101_900002 -z -s || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_20250101_900000.tar.zst" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_20250101_900002.tar.zst.gpg" || return 1
+
+  local name
+  for name in alpha_20250101_900000.tar.zst alpha_20250101_900001.tar.zst; do
+    prepare_target_volume "restore_${name%%.*}"
+    run_restore -i "$name" -t "restore_${name%%.*}" || return 1
+    assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/restore_${name%%.*}" || return 1
+  done
+  prepare_target_volume "restore_encrypted"
+  run_restore_with_env GPG_PASSPHRASE=secret -- -i alpha_20250101_900002.tar.zst.gpg -t restore_encrypted -s || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/restore_encrypted" || return 1
+
+  # restore -a picks zstd archives too
+  replace_volume_with_marker "alpha" "old"
+  run_restore -a -T 20250101_900001 -C || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/restore_alpha_20250101_900001" "$TEST_VOLUMES_ROOT/alpha" || return 1
+}
+
+test_compression_options_are_validated() {
+  setup_case "compression_options_are_validated"
+  make_volume_content "alpha"
+
+  expect_rejected run_backup -v alpha -T 20250101_900100 -L 5 || return 1
+  expect_rejected run_backup -v alpha -T 20250101_900100 -c -L 10 || return 1
+  expect_rejected run_backup -v alpha -T 20250101_900100 -c -L 'x' || return 1
+  expect_rejected run_backup -v alpha -T 20250101_900100 -z -L 20 || return 1
+  expect_rejected run_backup -v alpha -T 20250101_900100 -c -z || return 1
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1)" ]] || return 1
+
+  run_backup -v alpha -T 20250101_900100 -c -L 1 || return 1
+  prepare_target_volume "alpha_restore"
+  run_restore -i alpha_20250101_900100.tar.gz -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_backup_excludes_patterns() {
+  setup_case "backup_excludes_patterns"
+  local root="$TEST_VOLUMES_ROOT/alpha"
+  make_volume_content "alpha"
+  mkdir -p "$root/cache" "$root/subdir/cache" "$root/logs"
+  printf 'x\n' > "$root/cache/blob"
+  printf 'x\n' > "$root/subdir/cache/kept"
+  printf 'x\n' > "$root/logs/app.log"
+  printf 'x\n' > "$root/subdir/debug.log"
+  printf 'x\n' > "$root/logs/keep.txt"
+  make_volume_content "beta"
+  printf 'x\n' > "$TEST_VOLUMES_ROOT/beta/beta.log"
+
+  run_backup -a -T 20250101_900200 -x '*.log' -x ./cache || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i alpha_20250101_900200.tar -t alpha_restore || return 1
+  local restored="$TEST_VOLUMES_ROOT/alpha_restore"
+  assert_file_not_exists "$restored/cache" || return 1
+  assert_file_not_exists "$restored/logs/app.log" || return 1
+  assert_file_not_exists "$restored/subdir/debug.log" || return 1
+  assert_file_exists "$restored/subdir/cache/kept" || return 1
+  assert_file_exists "$restored/logs/keep.txt" || return 1
+  assert_file_exists "$restored/hello.txt" || return 1
+
+  prepare_target_volume "beta_restore"
+  run_restore -i beta_20250101_900200.tar -t beta_restore || return 1
+  assert_file_not_exists "$TEST_VOLUMES_ROOT/beta_restore/beta.log" || return 1
+}
+
+test_secrets_from_files() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "secrets_from_files"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  # Docker secrets usually end with a newline, which is not part of the value
+  printf 'file-secret\n' > "$CASE_ROOT/passphrase"
+  run_backup_with_env GPG_PASSPHRASE_FILE="$CASE_ROOT/passphrase" -- -a -T 20250101_900300 -s || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env GPG_PASSPHRASE=file-secret -- -i alpha_20250101_900300.tar.gpg -t alpha_restore -s || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+
+  # Workers of restore -a see the value, not the file variable
+  replace_volume_with_marker "alpha" "old"
+  replace_volume_with_marker "beta" "old"
+  run_restore_with_env GPG_PASSPHRASE_FILE="$CASE_ROOT/passphrase" -- -a -T 20250101_900300 -s -C -j 2 || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha_restore" "$TEST_VOLUMES_ROOT/alpha" || return 1
+
+  expect_rejected run_backup_with_env GPG_PASSPHRASE=x GPG_PASSPHRASE_FILE="$CASE_ROOT/passphrase" -- \
+    -v alpha -T 20250101_900301 -s || return 1
+  expect_rejected run_backup_with_env GPG_PASSPHRASE_FILE="$CASE_ROOT/missing" -- -v alpha -T 20250101_900301 -s || return 1
+}
+
+test_restore_lists_backups() {
+  setup_case "restore_lists_backups"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  run_backup -a -T 20250101_900400 || return 1
+  run_backup -v alpha -T 20250101_900401 || return 1
+  run_backup -v alpha -T 20250101_900402 || return 1
+  run_backup -v alpha -T 20250101_900403 || return 1
+
+  rm "$TEST_BACKUP_ROOT/alpha_20250101_900401.tar.sha256"
+  cp "$TEST_BACKUP_ROOT/alpha_20250101_900400.tar.sha256" "$TEST_BACKUP_ROOT/alpha_20250101_900402.tar.sha256"
+  rm "$TEST_BACKUP_ROOT/alpha_20250101_900403.tar"
+
+  local out
+  out="$(run_restore -l 2>/dev/null)" || return 1
+  grep -q '^alpha  *20250101_900400  *complete .*alpha_20250101_900400\.tar$' <<< "$out" || {
+    log "Unexpected listing:"
+    printf '%s\n' "$out" >&2
+    return 1
+  }
+  grep -q '^alpha  *20250101_900401  *incomplete .*(no checksum file)$' <<< "$out" || return 1
+  grep -q '^alpha  *20250101_900402  *incomplete .*(checksum file names alpha_20250101_900400\.tar)$' <<< "$out" || return 1
+  grep -q '^alpha  *20250101_900403  *orphan ' <<< "$out" || return 1
+  grep -q '^beta  *20250101_900400  *complete ' <<< "$out" || return 1
+
+  out="$(run_restore -l -v beta 2>/dev/null)" || return 1
+  [[ "$(printf '%s\n' "$out" | grep -c '^alpha')" == 0 && "$(printf '%s\n' "$out" | grep -c '^beta')" == 1 ]] || return 1
+  out="$(run_restore -l -T 20250101_900401 2>/dev/null)" || return 1
+  [[ "$(printf '%s\n' "$out" | grep -c '_2025')" == 1 ]] || return 1
+
+  expect_rejected run_restore -l -i alpha_20250101_900400.tar || return 1
+}
+
+test_restore_all_skips_incomplete_backups() {
+  setup_case "restore_all_skips_incomplete_backups"
+  make_volume_content "alpha"
+  run_backup -v alpha -T 20250101_900500 || return 1
+  copy_volume_snapshot "alpha" "$CASE_ROOT/first"
+  printf 'second\n' > "$TEST_VOLUMES_ROOT/alpha/second.txt"
+  run_backup -v alpha -T 20250101_900501 || return 1
+  copy_volume_snapshot "alpha" "$CASE_ROOT/second"
+  rm "$TEST_BACKUP_ROOT/alpha_20250101_900501.tar.sha256"
+
+  replace_volume_with_marker "alpha" "old"
+  run_restore -a -C 2> "$CASE_ROOT/restore.log" || return 1
+  assert_dirs_equal "$CASE_ROOT/first" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  grep -q 'Skipping incomplete backup alpha_20250101_900501.tar' "$CASE_ROOT/restore.log" || return 1
+
+  # With -T, an incomplete backup is not replaced by another one
+  expect_rejected run_restore -a -T 20250101_900501 -C || return 1
+
+  run_restore -a -C -U 2>/dev/null || return 1
+  assert_dirs_equal "$CASE_ROOT/second" "$TEST_VOLUMES_ROOT/alpha" || return 1
+}
+
+test_verify_backups() {
+  setup_case "verify_backups"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  local ts="20250101_900600"
+  run_backup -a -T "$ts" -c || return 1
+  run_backup_with_env GPG_PASSPHRASE=secret -- -v alpha -T 20250101_900601 -s || return 1
+
+  # No volumes are needed to verify
+  local -a no_volumes=(VOLUMES_ROOT="$CASE_ROOT/missing")
+  run_restore_with_env "${no_volumes[@]}" -- -V -i "alpha_${ts}.tar.gz" || return 1
+  run_restore_with_env "${no_volumes[@]}" GPG_PASSPHRASE=secret -- -V -i alpha_20250101_900601.tar.gpg -s || return 1
+  expect_rejected run_restore_with_env "${no_volumes[@]}" GPG_PASSPHRASE=wrong -- -V -i alpha_20250101_900601.tar.gpg -s || return 1
+  run_restore_with_env "${no_volumes[@]}" -- -V -a -T "$ts" -j 2 || return 1
+
+  # A corrupted archive fails, and so does -a when one of its backups is bad
+  printf 'garbage' >> "$TEST_BACKUP_ROOT/beta_${ts}.tar.gz"
+  expect_rejected run_restore_with_env "${no_volumes[@]}" -- -V -i "beta_${ts}.tar.gz" || return 1
+  expect_rejected run_restore_with_env "${no_volumes[@]}" -- -V -a -T "$ts" || return 1
+
+  # Without a checksum file (-U), a truncated archive is still detected
+  local size
+  size="$(stat -c %s "$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz")"
+  head -c $(( size / 2 )) "$TEST_BACKUP_ROOT/alpha_${ts}.tar.gz" > "$TEST_BACKUP_ROOT/alpha_20250101_900602.tar.gz"
+  expect_rejected run_restore_with_env "${no_volumes[@]}" -- -V -i alpha_20250101_900602.tar.gz -U || return 1
+
+  expect_rejected run_restore -V -i "alpha_${ts}.tar.gz" -t alpha || return 1
+}
+
+test_rotation_keeps_newest_backups() {
+  setup_case "rotation_keeps_newest_backups"
+  make_volume_content "app"
+  make_volume_content "app_data"
+  local ts
+  for ts in 20250101_000001 20250101_000002 20250101_000003 20250101_000004; do
+    run_backup -v app -T "$ts" || return 1
+  done
+  run_backup -v app_data -T 20250101_000001 || return 1
+
+  # Dry run: nothing is deleted
+  run_backup -v app -T 20250101_000005 -R 2 -n 2> "$CASE_ROOT/dry.log" || return 1
+  grep -q 'Rotation would delete: app_20250101_000003.tar' "$CASE_ROOT/dry.log" || return 1
+  [[ "$(find "$TEST_BACKUP_ROOT" -name 'app_2025*.tar' | wc -l)" == 4 ]] || return 1
+
+  run_backup -v app -T 20250101_000005 -R 2 || return 1
+  [[ "$(backup_names app)" == "app_20250101_000004.tar app_20250101_000004.tar.sha256 app_20250101_000005.tar app_20250101_000005.tar.sha256 " ]] || {
+    log "Unexpected backups left: $(backup_names app)"
+    return 1
+  }
+  # Another volume whose name starts with the same prefix is not touched
+  assert_file_exists "$TEST_BACKUP_ROOT/app_data_20250101_000001.tar" || return 1
+  assert_backup_root_consistent || return 1
+}
+
+test_rotation_keeps_recent_backups() {
+  setup_case "rotation_keeps_recent_backups"
+  make_volume_content "app"
+  local old older recent
+  older="$(ts_days_ago 10)"
+  old="$(ts_days_ago 5)"
+  recent="$(ts_days_ago 1)"
+  run_backup -v app -T "$older" || return 1
+  run_backup -v app -T "$old" || return 1
+  run_backup -v app -T "$recent" || return 1
+
+  # Either rule keeps a backup: the 3 newest, or those younger than 3 days
+  run_backup -v app -T "$(ts_seconds_ago 7200)" -R 3 -D 3 || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${old}.tar" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${older}.tar" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${older}.tar.sha256" || return 1
+
+  run_backup -v app -T "$(ts_seconds_ago 3600)" -D 3 || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${old}.tar" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${recent}.tar" || return 1
+  assert_backup_root_consistent || return 1
+}
+
+test_rotation_handles_incomplete_backups() {
+  setup_case "rotation_handles_incomplete_backups"
+  make_volume_content "app"
+  local incomplete orphan complete two_days one_day ancient
+  complete="$(ts_days_ago 30)"
+  incomplete="$(ts_days_ago 20)"
+  orphan="$(ts_days_ago 10)"
+  two_days="$(ts_days_ago 2)"
+  one_day="$(ts_days_ago 1)"
+  ancient="$(ts_days_ago 40)"
+  run_backup -v app -T "$complete" || return 1
+  run_backup -v app -T "$incomplete" || return 1
+  rm "$TEST_BACKUP_ROOT/app_${incomplete}.tar.sha256"
+  run_backup -v app -T "$orphan" || return 1
+  rm "$TEST_BACKUP_ROOT/app_${orphan}.tar"
+
+  # -R never deletes incomplete backups or orphaned checksum files
+  run_backup -v app -T "$two_days" -R 1 2> "$CASE_ROOT/r.log" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${complete}.tar" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${incomplete}.tar" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${orphan}.tar.sha256" || return 1
+  grep -q "keeping incomplete backup app_${incomplete}.tar" "$CASE_ROOT/r.log" || return 1
+
+  # -D does, once they are old enough
+  run_backup -v app -T "$one_day" -D 5 || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${incomplete}.tar" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${orphan}.tar.sha256" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${two_days}.tar" || return 1
+
+  # The newest complete backup survives even when it is too old, and so does
+  # the backup that was just made, whatever its timestamp
+  run_backup -v app -T "$ancient" -D 1 || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${one_day}.tar" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_${ancient}.tar" || return 1
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_${two_days}.tar" || return 1
+  assert_backup_root_consistent || return 1
+}
+
+test_rotation_interrupted_between_files() {
+  setup_case "rotation_interrupted_between_files"
+  make_volume_content "app"
+  run_backup -v app -T 20250101_000001 || return 1
+  run_backup -v app -T 20250101_000002 || return 1
+
+  local rc=0
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_FAIL_AT=rotate_pair:app -- -v app -T 20250101_000003 -R 1 >/dev/null 2>&1 || rc=$?
+  (( rc == 137 )) || {
+    log "Expected the backup to be killed during rotation, got exit $rc"
+    return 1
+  }
+
+  # Newest first, and the checksum file before the archive: what is left is
+  # an incomplete archive
+  assert_file_not_exists "$TEST_BACKUP_ROOT/app_20250101_000002.tar.sha256" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_20250101_000002.tar" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/app_20250101_000001.tar.sha256" || return 1
+  local out
+  out="$(run_restore -l 2>/dev/null)" || return 1
+  grep -q '^app  *20250101_000002  *incomplete ' <<< "$out" || return 1
+  assert_backup_root_consistent || return 1
+}
+
+test_rotation_and_publishing_do_not_interleave() {
+  setup_case "rotation_and_publishing_do_not_interleave"
+  make_volume_content "app"
+  run_backup -v app -T 20250101_000001 || return 1
+
+  # A holds the BACKUP_ROOT lock while publishing; B finishes its archive,
+  # then publishes and rotates only after A released the lock
+  start_paused_backup local_publish:app -- -v app -T 20250101_000002
+  wait_for_point local_publish:app || return 1
+  run_backup -v app -T 20250101_000003 -R 1 > "$CASE_ROOT/b.log" 2>&1 &
+  local b_pid=$!
+  sleep 1
+  resume_and_wait local_publish:app 2>/dev/null || return 1
+  wait "$b_pid" || {
+    cat "$CASE_ROOT/b.log" >&2
+    return 1
+  }
+
+  [[ "$(backup_names app)" == "app_20250101_000003.tar app_20250101_000003.tar.sha256 " ]] || {
+    log "Unexpected backups left: $(backup_names app)"
+    return 1
+  }
+  assert_backup_root_consistent || return 1
+}
+
+test_s3_list_and_restore_all_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_list_and_restore_all_optional"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_900700" prefix
+  prefix="$(t_s3_prefix restore-all)"
+  run_backup -a -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  copy_volume_snapshot "alpha" "$CASE_ROOT/expected-alpha"
+  copy_volume_snapshot "beta" "$CASE_ROOT/expected-beta"
+
+  # An archive whose checksum file belongs to another upload is incomplete
+  run_backup -v alpha -T 20250101_900701 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  printf '%064d  alpha_20250101_900701.tar\n' 0 > "$CASE_ROOT/foreign.sha256"
+  [[ "$(t_s3_put "${prefix}/alpha_20250101_900701.tar.sha256" "$CASE_ROOT/foreign.sha256")" == 200 ]] || return 1
+
+  local out
+  out="$(run_restore -l -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null)" || return 1
+  grep -q "^alpha  *${ts}  *complete " <<< "$out" || {
+    printf '%s\n' "$out" >&2
+    return 1
+  }
+  grep -q "^beta  *${ts}  *complete " <<< "$out" || return 1
+  grep -q '^alpha  *20250101_900701  *incomplete .*another upload' <<< "$out" || return 1
+
+  replace_volume_with_marker "alpha" "old"
+  replace_volume_with_marker "beta" "old"
+  run_restore -a -b "$TEST_S3_BUCKET" -f "$prefix" -C -j 2 || return 1
+  assert_dirs_equal "$CASE_ROOT/expected-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_dirs_equal "$CASE_ROOT/expected-beta" "$TEST_VOLUMES_ROOT/beta" || return 1
+
+  run_restore -V -a -b "$TEST_S3_BUCKET" -f "$prefix" -T "$ts" || return 1
+}
+
+test_s3_rotation_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_rotation_optional"
+  make_volume_content "app"
+
+  local prefix ts
+  prefix="$(t_s3_prefix rotation)"
+  for ts in 20250101_000001 20250101_000002 20250101_000003; do
+    run_backup -v app -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  done
+
+  run_backup -v app -T 20250101_000004 -R 2 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  for ts in 20250101_000001 20250101_000002; do
+    [[ "$(t_s3_head "${prefix}/app_${ts}.tar")" == 404 && "$(t_s3_head "${prefix}/app_${ts}.tar.sha256")" == 404 ]] || {
+      log "BUG: app_${ts} was not rotated away"
+      return 1
+    }
+  done
+  [[ "$(t_s3_head "${prefix}/app_20250101_000003.tar.sha256")" == 200 ]] || return 1
+  [[ "$(t_s3_head "${prefix}/app_20250101_000004.tar.sha256")" == 200 ]] || return 1
+  # No probe objects are left behind
+  [[ -z "$(t_s3_list_keys "${prefix}/.vb-probe")" ]] || return 1
+}
+
+test_s3_rotation_keeps_replaced_objects_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_rotation_keeps_replaced_objects_optional"
+  make_volume_content "app"
+
+  local prefix
+  prefix="$(t_s3_prefix rotation-replaced)"
+  run_backup -v app -T 20250101_000001 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  # Paused after planning: the old backup gets replaced by different objects
+  start_paused_backup rotate_planned:app -- -v app -T 20250101_000002 -R 1 -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point rotate_planned:app || return 1
+  printf 'replacement archive\n' > "$CASE_ROOT/b.tar"
+  printf '%064d  app_20250101_000001.tar\n' 1 > "$CASE_ROOT/b.sha256"
+  [[ "$(t_s3_put "${prefix}/app_20250101_000001.tar" "$CASE_ROOT/b.tar")" == 200 ]] || return 1
+  [[ "$(t_s3_put "${prefix}/app_20250101_000001.tar.sha256" "$CASE_ROOT/b.sha256")" == 200 ]] || return 1
+  resume_and_wait rotate_planned:app 2>/dev/null || return 1
+
+  t_s3_get "${prefix}/app_20250101_000001.tar" "$CASE_ROOT/after.tar" || return 1
+  t_s3_get "${prefix}/app_20250101_000001.tar.sha256" "$CASE_ROOT/after.sha256" || return 1
+  if ! cmp -s "$CASE_ROOT/b.tar" "$CASE_ROOT/after.tar" || ! cmp -s "$CASE_ROOT/b.sha256" "$CASE_ROOT/after.sha256"; then
+    log "BUG: rotation deleted objects that were replaced after it checked them"
+    return 1
+  fi
+  grep -q 'changed after it was checked' "$CASE_ROOT/paused.log" || return 1
+}
+
+test_s3_rotation_needs_conditional_delete_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_rotation_needs_conditional_delete_optional"
+  make_volume_content "app"
+
+  local prefix stub="$CASE_ROOT/stub"
+  prefix="$(t_s3_prefix rotation-unconditional)"
+  run_backup -v app -T 20250101_000001 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  make_curl_stub "$stub" delete-ignores-if-match
+
+  expect_rejected run_backup_with_env PATH="$stub:$PATH" -- -v app -T 20250101_000002 -R 1 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  [[ "$(t_s3_head "${prefix}/app_20250101_000001.tar")" == 200 ]] || {
+    log "BUG: rotation deleted a backup although conditional deletes are not supported"
+    return 1
+  }
+
+  run_backup_with_env PATH="$stub:$PATH" S3_ALLOW_UNCONDITIONAL_DELETE=1 -- \
+    -v app -T 20250101_000003 -R 1 -b "$TEST_S3_BUCKET" -f "$prefix" 2> "$CASE_ROOT/optin.log" || return 1
+  grep -q 'ignores If-Match' "$CASE_ROOT/optin.log" || return 1
+  [[ "$(t_s3_head "${prefix}/app_20250101_000001.tar")" == 404 ]] || return 1
+}
+
+test_s3_rotation_on_versioned_bucket_optional() {
+  require_s3_or_skip || return $?
+  if [[ -z "${TEST_S3_VERSIONED_ENDPOINT:-}${TEST_S3_VERSIONED_BUCKET:-}" ]]; then
+    [[ "${REQUIRE_S3_TESTS:-0}" != 1 ]] || {
+      log "TEST_S3_VERSIONED_ENDPOINT or TEST_S3_VERSIONED_BUCKET is required (REQUIRE_S3_TESTS=1)"
+      return 1
+    }
+    return "$SKIP_RC"
+  fi
+  setup_case "s3_rotation_on_versioned_bucket_optional"
+  make_volume_content "app"
+
+  local endpoint="${TEST_S3_VERSIONED_ENDPOINT:-${AWS_ENDPOINT_URL:-}}"
+  local bucket="${TEST_S3_VERSIONED_BUCKET:-$TEST_S3_BUCKET}"
+  local prefix ts stub="$CASE_ROOT/stub" listing
+  local -a server=()
+  [[ -z "$endpoint" ]] || server=(AWS_ENDPOINT_URL="$endpoint")
+  prefix="$(t_s3_prefix rotation-versioned)"
+  make_curl_stub "$stub" trace
+  for ts in 20250101_000001 20250101_000002; do
+    run_backup_with_env "${server[@]}" -- -v app -T "$ts" -b "$bucket" -f "$prefix" || return 1
+  done
+  run_backup_with_env "${server[@]}" PATH="$stub:$PATH" -- \
+    -v app -T 20250101_000003 -R 1 -b "$bucket" -f "$prefix" || return 1
+
+  listing="$(t_s3_list_keys "${prefix}/" "$endpoint" "$bucket")"
+  [[ "$listing" == "${prefix}/app_20250101_000003.tar ${prefix}/app_20250101_000003.tar.sha256 " ]] || {
+    log "Unexpected listing after rotation: $listing"
+    return 1
+  }
+  ! grep -qi 'versionId' "$stub/curl.trace" || {
+    log "BUG: rotation addressed object versions"
+    return 1
+  }
+
+  # Clean up this prefix in the versioned bucket
+  local key
+  endpoint="${endpoint:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  for key in $listing; do
+    curl -K "$T_S3_CONFIG" -o /dev/null -X DELETE "${endpoint%/}/${bucket}/${key}" || true
+  done
+}
+
+test_gnu_tar_features_are_detected_reliably() {
+  is_gnu_tar || return "$SKIP_RC"
+  setup_case "gnu_tar_features_are_detected_reliably"
+  make_volume_content "alpha"
+
+  # A tar whose version banner arrives in two writes: a reader that stops at
+  # the first match makes the second write fail with SIGPIPE
+  local stub="$CASE_ROOT/stub" real_tar
+  real_tar="$(command -v tar)"
+  mkdir -p "$stub"
+  cat > "$stub/tar" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == --version ]]; then
+  printf 'tar (GNU tar) 1.35\n'
+  sleep 0.2
+  printf 'Copyright (C) 2023 Free Software Foundation, Inc.\n'
+  exit 0
+fi
+printf '%s\n' "\$*" >> '$stub/trace'
+exec '$real_tar' "\$@"
+STUB
+  chmod +x "$stub/tar"
+
+  run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250101_901000 || return 1
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env PATH="$stub:$PATH" -- -i alpha_20250101_901000.tar -t alpha_restore || return 1
+
+  if ! grep -q -- '--create.*--xattrs' "$stub/trace" || ! grep -q -- '--extract.*--xattrs' "$stub/trace"; then
+    log "BUG: GNU tar was not detected; archives lose ACLs and extended attributes:"
+    cat "$stub/trace" >&2
+    return 1
+  fi
+}
+
+test_failed_rollback_keeps_the_journal() {
+  setup_case "failed_rollback_keeps_the_journal"
+  setup_two_volume_transaction || return 1
+
+  # Moves out of journal/old fail while the control file exists
+  local stub="$CASE_ROOT/stub" real_mv
+  real_mv="$(command -v mv)"
+  write_wrapper "$stub" mv <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do src="\${dst:-}"; dst="\$arg"; done
+if [[ -e '$CASE_ROOT/mv.fail' && "\$src" == */.vb-restore/old/* ]]; then
+  : > '$CASE_ROOT/mv.fired'
+  printf 'mv: injected failure\n' >&2
+  exit 1
+fi
+exec '$real_mv' "\$@"
+STUB
+  : > "$CASE_ROOT/mv.fail"
+
+  # Interrupted before the commit: the rollback cannot move old data back
+  start_paused_restore txn_before_decision PATH="$stub:$PATH" -- -a -T "$TXN_TS" -C
+  wait_for_point txn_before_decision || return 1
+  local pid rc=0
+  pid="$(paused_script_pid)" || return 1
+  kill -TERM "$pid"
+  wait "$PAUSED_PID" || rc=$?
+  [[ -e "$CASE_ROOT/mv.fired" ]] || {
+    log "The injected mv failure never happened"
+    return 1
+  }
+  (( rc != 0 )) || return 1
+
+  # The original data of beta must still be in its journal
+  [[ -d "$TEST_VOLUMES_ROOT/beta/.vb-restore/old" ]] || {
+    log "BUG: the journal of beta is gone although its rollback failed"
+    return 1
+  }
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/.vb-restore/old/marker.txt" "old-beta" || return 1
+
+  rm -f "$CASE_ROOT/mv.fail"
+  run_restore -X || return 1
+  assert_group_state old || return 1
+}
+
+test_xattr_marker_fallback_and_failure() {
+  setup_case "xattr_marker_fallback_and_failure"
+  make_volume_content "alpha"
+  local ts="20250101_902000"
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "alpha" "$CASE_ROOT/new-alpha"
+
+  local stub="$CASE_ROOT/stub" real_setfattr
+  real_setfattr="$(command -v setfattr || true)"
+  write_wrapper "$stub" setfattr <<STUB
+#!/usr/bin/env bash
+target="\${!#}"
+fail() {
+  : > '$CASE_ROOT/setfattr.fired'
+  printf 'setfattr: %s: %s\n' "\$target" "\$1" >&2
+  exit 1
+}
+case "\$(cat '$CASE_ROOT/setfattr.mode' 2>/dev/null)" in
+  unsupported) fail "Operation not supported" ;;
+  eio-finalize)
+    if [[ " \$* " == *" -v "* && "\$(head -n 1 "\$target/.vb-restore/state" 2>/dev/null)" == finalize ]]; then
+      fail "Input/output error"
+    fi
+    ;;
+  eio-early)
+    if [[ " \$* " == *" -v "* && ! -e "\$target/.vb-restore" ]]; then
+      fail "Input/output error"
+    fi
+    ;;
+esac
+if [[ -n '$real_setfattr' ]]; then
+  exec '$real_setfattr' "\$@"
+fi
+exit 0
+STUB
+
+  # Not supported: the restore works without the marker
+  printf 'unsupported\n' > "$CASE_ROOT/setfattr.mode"
+  replace_volume_with_marker "alpha" "old"
+  run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C 2> "$CASE_ROOT/unsupported.log" || {
+    cat "$CASE_ROOT/unsupported.log" >&2
+    return 1
+  }
+  [[ -e "$CASE_ROOT/setfattr.fired" ]] || return 1
+  assert_dirs_equal "$CASE_ROOT/new-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+
+  # A failure while finalizing keeps the journal; recovery completes it
+  rm -f "$CASE_ROOT/setfattr.fired"
+  printf 'eio-finalize\n' > "$CASE_ROOT/setfattr.mode"
+  replace_volume_with_marker "alpha" "old"
+  expect_injected_failure "$CASE_ROOT/setfattr.fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+  [[ "$(head -n 1 "$TEST_VOLUMES_ROOT/alpha/.vb-restore/state" 2>/dev/null)" == finalize ]] || {
+    log "BUG: the journal did not stay in phase finalize after a failed marker"
+    return 1
+  }
+  run_restore -X || return 1
+  assert_dirs_equal "$CASE_ROOT/new-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # A failure before the journal exists leaves the volume untouched
+  rm -f "$CASE_ROOT/setfattr.fired"
+  printf 'eio-early\n' > "$CASE_ROOT/setfattr.mode"
+  replace_volume_with_marker "alpha" "old"
+  local before
+  before="$(volume_state alpha)"
+  expect_injected_failure "$CASE_ROOT/setfattr.fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+  [[ "$(volume_state alpha)" == "$before" ]] || {
+    log "BUG: a failure before the journal existed changed the volume"
+    return 1
+  }
+}
+
+test_signal_after_commit_decision_does_not_roll_back() {
+  setup_case "signal_after_commit_decision_does_not_roll_back"
+  setup_two_volume_transaction || return 1
+
+  # TERM right after the decision was made durable (alpha is the coordinator)
+  local stub="$CASE_ROOT/stub" real_sync journal
+  real_sync="$(command -v sync)"
+  journal="$(cd "$TEST_VOLUMES_ROOT/alpha" && pwd -P)/.vb-restore"
+  write_wrapper "$stub" sync <<STUB
+#!/usr/bin/env bash
+'$real_sync' "\$@"
+rc=\$?
+if [[ -e '$CASE_ROOT/sync.arm' && "\${!#}" == '$journal' && -e '$journal/decision' ]]; then
+  rm -f '$CASE_ROOT/sync.arm'
+  : > '$CASE_ROOT/sync.fired'
+  kill -TERM "\$PPID"
+fi
+exit \$rc
+STUB
+  : > "$CASE_ROOT/sync.arm"
+
+  local rc=0
+  run_restore_with_env PATH="$stub:$PATH" -- -a -T "$TXN_TS" -C > "$CASE_ROOT/restore.log" 2>&1 || rc=$?
+  [[ -e "$CASE_ROOT/sync.fired" ]] || {
+    log "The signal was never sent"
+    return 1
+  }
+  (( rc != 0 )) || return 1
+
+  # Committed: both volumes keep the new data, the decision stays
+  local vol
+  for vol in alpha beta; do
+    [[ "$(volume_manifest_without_journal "$TEST_VOLUMES_ROOT/$vol")" == "$(tree_manifest "$CASE_ROOT/new-$vol")" ]] || {
+      log "BUG: $vol was rolled back although the commit decision was durable"
+      cat "$CASE_ROOT/restore.log" >&2
+      return 1
+    }
+  done
+  [[ "$(head -n 1 "$journal/decision")" == commit ]] || return 1
+
+  run_restore -X || return 1
+  assert_group_state new || return 1
+}
+
+test_invalid_commit_decision_stops_recovery() {
+  setup_case "invalid_commit_decision_stops_recovery"
+  setup_two_volume_transaction || return 1
+  restore_crashing_at txn_after_decision -- -a -T "$TXN_TS" -C || return 1
+
+  local decision="$TEST_VOLUMES_ROOT/alpha/.vb-restore/decision" before variant
+  for variant in garbage directory; do
+    rm -rf "$decision"
+    if [[ "$variant" == garbage ]]; then
+      printf 'commmit\n' > "$decision"
+    else
+      mkdir "$decision"
+    fi
+    before="$(volume_state alpha beta)"
+    expect_rejected run_restore -X || return 1
+    [[ "$(volume_state alpha beta)" == "$before" ]] || {
+      log "BUG: recovery acted on an unreadable commit decision ($variant)"
+      return 1
+    }
+  done
+
+  rm -rf "$decision"
+  printf 'commit\n' > "$decision"
+  run_restore -X || return 1
+  assert_group_state new || return 1
+}
+
+# Backups of alpha and beta in S3, a curl stub in <mode> that lets the
+# complete pair of alpha through and fails afterwards: restore -a and -l must
+# refuse, and the volumes stay as they are. <setup>, if given, is called with
+# the stub directory to add more wrappers (which touch its "fired" too).
+#   check_incomplete_listing_is_refused <case> <mode> [<setup>]
+check_incomplete_listing_is_refused() {
+  local name="$1" mode="$2" setup="${3:-}" ts="20250101_903000" prefix stub
+  require_s3_or_skip || return $?
+  setup_case "$name"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  prefix="$(t_s3_prefix "$name")"
+  run_backup -a -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" "$mode"
+  [[ -z "$setup" ]] || "$setup" "$stub"
+  expect_injected_failure "$stub/fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -a -b "$TEST_S3_BUCKET" -f "$prefix" -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+
+  rm -f "$stub/fired" "$stub"/*.count
+  expect_injected_failure "$stub/fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -l -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+}
+
+test_s3_failed_listing_page_fails_optional() {
+  check_incomplete_listing_is_refused "s3_failed_listing_page_fails_optional" list-paged-fail
+}
+
+test_s3_truncated_listing_fails_optional() {
+  check_incomplete_listing_is_refused "s3_truncated_listing_fails_optional" list-truncated
+}
+
+# The parser of the second page (beta) fails; matched by its awk program
+listing_parser_fails_on_page_2() {
+  # shellcheck disable=SC2016
+  write_failing_wrapper "$1" awk '$1 == "Contents"' 2
+}
+
+test_s3_failed_listing_parser_fails_optional() {
+  check_incomplete_listing_is_refused "s3_failed_listing_parser_fails_optional" list-paged \
+    listing_parser_fails_on_page_2
+}
+
+# Reading the first page (alpha) to see whether more follow fails
+listing_read_fails() {
+  write_failing_wrapper "$1" grep '<IsTruncated>true</IsTruncated>' 1
+}
+
+test_s3_unreadable_listing_fails_optional() {
+  check_incomplete_listing_is_refused "s3_unreadable_listing_fails_optional" list-paged listing_read_fails
+}
+
+test_s3_malformed_listing_fails_optional() {
+  check_incomplete_listing_is_refused "s3_malformed_listing_fails_optional" list-malformed
+}
+
+test_s3_failed_token_check_fails_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_failed_token_check_fails_optional"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_904100" prefix stub="$CASE_ROOT/stub"
+  prefix="$(t_s3_prefix failed-token-check)"
+  run_backup -a -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # Reading the token of alpha's checksum file (the second token read) fails
+  write_failing_wrapper "$stub" awk 'name=x-amz-meta-vb-token' 2
+  expect_injected_failure "$stub/fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -a -b "$TEST_S3_BUCKET" -f "$prefix" -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+}
+
+test_unreadable_checksum_file_fails_the_catalog() {
+  setup_case "unreadable_checksum_file_fails_the_catalog"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_904000" stub="$CASE_ROOT/stub"
+  run_backup -a -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # Reading beta's checksum file fails: an I/O error, not a malformed file
+  write_failing_wrapper "$stub" awk "/beta_${ts}.tar.sha256" 1
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- -a -T "$ts" -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+
+  rm -f "$stub/fired" "$stub"/*.count
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- -l || return 1
+}
+
+test_failed_sort_stops_backup() {
+  setup_case "failed_sort_stops_backup"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  local stub="$CASE_ROOT/stub" ts
+
+  # The volumes of backup -a and the locks of backup -v come from sort -u
+  write_sort_wrapper "$stub" -u
+  for ts in 20250101_904300 20250101_904301; do
+    rm -f "$stub/fired"
+    if [[ "$ts" == *00 ]]; then
+      expect_injected_failure "$stub/fired" run_backup_with_env PATH="$stub:$PATH" -- -a -T "$ts" || return 1
+    else
+      expect_injected_failure "$stub/fired" run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T "$ts" || return 1
+    fi
+    if compgen -G "$TEST_BACKUP_ROOT/*_${ts}.tar*" > /dev/null; then
+      log "BUG: a backup was published although sorting its list failed: $ts"
+      return 1
+    fi
+  done
+
+  # The backups of a volume, newest first, come from sort -r for rotation
+  run_backup -v alpha -T 20250102_020000 || return 1
+  run_backup -v alpha -T 20250102_020001 || return 1
+  write_sort_wrapper "$stub" -r
+  rm -f "$stub/fired"
+  expect_injected_failure "$stub/fired" \
+    run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250102_020002 -R 1 || return 1
+  for ts in 20250102_020000 20250102_020001; do
+    assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar" || return 1
+    assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256" || return 1
+  done
+}
+
+test_failed_sort_stops_restore() {
+  setup_case "failed_sort_stops_restore"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  local ts="20250101_904400" stub="$CASE_ROOT/stub" glob
+  run_backup -a -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # restore -a sorts its candidates (-k2,2r), its participants (no options)
+  # and its locks (-u); restore -i its lock
+  for glob in '*-k2,2r' none -u -u:single; do
+    write_sort_wrapper "$stub" "${glob%:single}"
+    rm -f "$stub/fired"
+    if [[ "$glob" == *:single ]]; then
+      expect_injected_failure "$stub/fired" \
+        run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+    else
+      expect_injected_failure "$stub/fired" \
+        run_restore_with_env PATH="$stub:$PATH" -- -a -T "$ts" -C || return 1
+    fi
+    assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+    assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+    assert_no_reserved_entries alpha beta || return 1
+  done
+
+  # restore -l sorts its rows for display
+  write_sort_wrapper "$stub" '*-k2,2'
+  rm -f "$stub/fired"
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- -l || return 1
+}
+
+# Rotation deletes nothing when the listing gives no ETag for an object it
+# would delete, whatever S3_ALLOW_UNCONDITIONAL_DELETE says
+test_s3_rotation_requires_etags_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_rotation_requires_etags_optional"
+  make_volume_content "alpha"
+
+  local prefix stub="$CASE_ROOT/stub" variant ts n=0 keys key line
+  local -a env_args=()
+  prefix="$(t_s3_prefix rotation-requires-etags)"
+  run_backup -v alpha -T 20250102_010000 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  run_backup -v alpha -T 20250102_010001 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  for variant in list-no-etag list-no-sidecar-etag list-no-etag:opt-in; do
+    n=$((n + 1))
+    ts="20250102_01001${n}"
+    rm -rf "$stub"
+    make_curl_stub "$stub" "${variant%:opt-in}"
+    env_args=(PATH="$stub:$PATH")
+    [[ "$variant" != *:opt-in ]] || env_args+=(S3_ALLOW_UNCONDITIONAL_DELETE=1)
+
+    expect_injected_failure "$stub/fired" run_backup_with_env "${env_args[@]}" -- \
+      -v alpha -T "$ts" -R 1 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+    keys=" $(t_s3_list_keys "$prefix/") "
+    for key in alpha_20250102_010000.tar alpha_20250102_010001.tar; do
+      [[ "$keys" == *"/${key} "* && "$keys" == *"/${key}.sha256 "* ]] || {
+        log "BUG: rotation deleted part of ${key} ($variant)"
+        return 1
+      }
+    done
+    while IFS= read -r line; do
+      if [[ "$line" == *"-X DELETE"* && "$line" == *"/alpha_"* ]]; then
+        log "BUG: rotation sent a DELETE for a listed backup ($variant): $line"
+        return 1
+      fi
+    done < "$stub/curl.trace"
+  done
+}
+
+# Recovery removes a journal creation directory only while it holds exactly
+# what an interrupted txn_create leaves behind
+test_unrecognized_creation_directory_is_kept() {
+  setup_case "unrecognized_creation_directory_is_kept"
+  make_volume_content "alpha"
+
+  local gid="0123456789abcdef0123456789abcdef" dir signature variant before
+  dir="$TEST_VOLUMES_ROOT/alpha/.vb-restore.new.${gid}"
+  signature="$(printf 'vb-restore-journal v1\ngid=%s' "$gid")"
+
+  # Not what the tool writes: refused, and nothing changes
+  for variant in invalid-signature invalid-tmp extra-file data-in-new; do
+    rm -rf "$dir"
+    mkdir "$dir"
+    case "$variant" in
+      invalid-signature) printf 'not a journal\n' > "$dir/VB-JOURNAL" ;;
+      invalid-tmp) printf 'not a journal\n' > "$dir/.VB-JOURNAL.tmp" ;;
+      extra-file)
+        printf '%s\n' "$signature" > "$dir/VB-JOURNAL"
+        printf 'user notes\n' > "$dir/notes.txt"
+        ;;
+      data-in-new)
+        printf '%s\n' "$signature" > "$dir/VB-JOURNAL"
+        printf 'gid=%s\n' "$gid" > "$dir/group"
+        printf 'staging\n' > "$dir/state"
+        mkdir "$dir/new" "$dir/old"
+        printf 'user data\n' > "$dir/new/data.txt"
+        ;;
+    esac
+    before="$(volume_state alpha)"
+    expect_rejected run_restore -X || {
+      log "Recovery accepted an unrecognized creation directory ($variant)"
+      return 1
+    }
+    [[ "$(volume_state alpha)" == "$before" ]] || {
+      log "BUG: recovery changed an unrecognized creation directory ($variant)"
+      return 1
+    }
+  done
+
+  # What a crash inside txn_create leaves behind: removed, data unchanged
+  for variant in empty-tmp full-tmp group-tmp; do
+    rm -rf "$dir"
+    mkdir "$dir"
+    case "$variant" in
+      empty-tmp) : > "$dir/.VB-JOURNAL.tmp" ;;
+      full-tmp) printf '%s\n' "$signature" > "$dir/.VB-JOURNAL.tmp" ;;
+      group-tmp)
+        printf '%s\n' "$signature" > "$dir/VB-JOURNAL"
+        printf 'gid=%s\nvol' "$gid" > "$dir/.group.tmp"
+        ;;
+    esac
+    before="$(volume_manifest_without_journal "$TEST_VOLUMES_ROOT/alpha")"
+    run_restore -X || {
+      log "Recovery refused a creation directory left by a crash ($variant)"
+      return 1
+    }
+    assert_no_reserved_entries alpha || return 1
+    [[ "$(tree_manifest "$TEST_VOLUMES_ROOT/alpha")" == "$before" ]] || {
+      log "Recovery changed the data of alpha ($variant)"
+      return 1
+    }
+  done
+}
+
+test_restore_refuses_unreadable_mount_table() {
+  setup_case "restore_refuses_unreadable_mount_table"
+  make_volume_content "alpha"
+  local ts="20250101_904200" missing="$CASE_ROOT/no-mountinfo"
+  run_backup -v alpha -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old"
+
+  # Without the mount table, mount points inside the target cannot be ruled out
+  expect_rejected run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$missing" -- \
+    -i "alpha_${ts}.tar" -t alpha -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # A backup is the same either way; only its warning about mount points is lost
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$missing" -- -v alpha -T 20250101_904201 \
+    2> "$CASE_ROOT/backup.log" || return 1
+  grep -q "Cannot read the mount table" "$CASE_ROOT/backup.log" || {
+    log "Expected a warning about the unreadable mount table"
+    return 1
+  }
+}
+
+test_s3_truncated_checksum_fails_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_truncated_checksum_fails_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_903100" prefix stub="$CASE_ROOT/stub"
+  prefix="$(t_s3_prefix truncated-checksum)"
+  run_backup -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  replace_volume_with_marker "alpha" "old"
+  make_curl_stub "$stub" get-truncated
+
+  # The digest arrives in full, but the transfer broke off
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- \
+    -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar" -t alpha -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+}
+
+test_failed_directory_scan_keeps_the_journal() {
+  setup_case "failed_directory_scan_keeps_the_journal"
+  setup_two_volume_transaction || return 1
+  restore_crashing_at txn_swap_entry:beta -- -a -T "$TXN_TS" -C || return 1
+
+  # Listing journal/old fails while the control file exists
+  local stub="$CASE_ROOT/stub" real_find
+  real_find="$(command -v find)"
+  write_wrapper "$stub" find <<STUB
+#!/usr/bin/env bash
+if [[ -e '$CASE_ROOT/find.fail' && "\$1" == */.vb-restore/old ]]; then
+  : > '$CASE_ROOT/find.fired'
+  printf 'find: %s: Input/output error\n' "\$1" >&2
+  exit 1
+fi
+exec '$real_find' "\$@"
+STUB
+  : > "$CASE_ROOT/find.fail"
+
+  expect_injected_failure "$CASE_ROOT/find.fired" run_restore_with_env PATH="$stub:$PATH" -- -X || return 1
+  [[ -d "$TEST_VOLUMES_ROOT/beta/.vb-restore/old" ]] || {
+    log "BUG: the journal of beta is gone although its old data could not be listed"
+    return 1
+  }
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/.vb-restore/old/marker.txt" "old-beta" || return 1
+
+  rm -f "$CASE_ROOT/find.fail"
+  run_restore -X || return 1
+  assert_group_state old || return 1
+}
+
+test_recovery_rejects_dry_run() {
+  setup_case "recovery_rejects_dry_run"
+  setup_two_volume_transaction || return 1
+  restore_crashing_at txn_after_decision -- -a -T "$TXN_TS" -C || return 1
+
+  local before
+  before="$(volume_state alpha beta)"
+  expect_rejected run_restore -X -n || return 1
+  expect_rejected run_restore -X -C || return 1
+  expect_rejected run_restore -X -j 2 || return 1
+  [[ "$(volume_state alpha beta)" == "$before" ]] || {
+    log "BUG: a refused recovery changed the volumes"
+    return 1
+  }
+
+  run_restore -X || return 1
+  assert_group_state new || return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -1090,6 +4058,11 @@ test_s3_roundtrip_encrypted_optional() {
 run_test() {
   local name="$1"
   shift
+
+  # TEST_FILTER (a bash regex) selects tests by function name
+  if [[ -n "${TEST_FILTER:-}" && ! "$1" =~ $TEST_FILTER ]]; then
+    return 0
+  fi
 
   TESTS_TOTAL=$((TESTS_TOTAL + 1))
 
@@ -1130,50 +4103,152 @@ if ! command -v gzip >/dev/null 2>&1 && ! command -v pigz >/dev/null 2>&1; then
   die "Neither gzip nor pigz found; compressed tests cannot run"
 fi
 
+if [[ "${REQUIRE_XATTR_TESTS:-0}" == 1 ]]; then
+  for xattr_command in getfattr setfattr getfacl setfacl; do
+    require_command "$xattr_command"
+  done
+  xattr_tests_enabled || die "REQUIRE_XATTR_TESTS=1, but user extended attributes are not supported under $TEST_ROOT"
+fi
+
 log "Using backup script:  $BACKUP_BIN"
 log "Using restore script: $RESTORE_BIN"
 log "Test root: $TEST_ROOT"
+
+if [[ "${TEST_S3_CREATE_BUCKETS:-0}" == 1 ]] && s3_tests_enabled; then
+  t_s3_init
+  default_endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  t_s3_create_bucket "$default_endpoint" "$TEST_S3_BUCKET"
+  if [[ -n "${TEST_S3_VERSIONED_ENDPOINT:-}${TEST_S3_VERSIONED_BUCKET:-}" ]]; then
+    t_s3_create_bucket "${TEST_S3_VERSIONED_ENDPOINT:-$default_endpoint}" "${TEST_S3_VERSIONED_BUCKET:-$TEST_S3_BUCKET}" versioned
+  fi
+fi
+if s3_tests_enabled; then
+  log "S3 server: ${TEST_S3_PROVIDER:-unnamed} (${AWS_ENDPOINT_URL:-AWS})"
+fi
 
 # ------------------------------------------------------------------------------
 # Execute tests
 # ------------------------------------------------------------------------------
 
-run_test "single backup/restore plain"              test_single_backup_restore_plain
-run_test "single backup/restore compressed"         test_single_backup_restore_compressed
-run_test "single backup/restore symmetric"          test_single_backup_restore_symmetric
-run_test "single backup/restore asymmetric"         test_single_backup_restore_asymmetric
-run_test "all-mode filters + parallel"              test_all_mode_with_filters_and_parallel
-run_test "backup single dry-run"                    test_backup_single_dry_run_creates_nothing
-run_test "backup all dry-run"                       test_backup_all_dry_run_creates_nothing
-run_test "restore single dry-run"                   test_restore_single_dry_run_changes_nothing
-run_test "restore fails without -C on non-empty"    test_restore_fails_on_non_empty_without_clear_flag
-run_test "backup fails on duplicate timestamp"      test_backup_fails_on_duplicate_timestamp
-run_test "restore all: picks latest without -T"     test_restore_all_no_timestamp_picks_latest
-run_test "restore all dry-run"                      test_restore_all_dry_run_changes_nothing
-run_test "restore single: filename-only source"     test_restore_single_source_filename_only
-run_test "backup root override (-d)"                test_backup_root_override
-run_test "asymmetric GPG via env vars"              test_backup_restore_asymmetric_env_keys
-run_test "single backup/restore .tar.gpg"           test_single_backup_restore_tar_gpg
-run_test "volume names with dots and dashes"        test_volume_names_with_dots_and_dashes
-run_test "BACKUP_TIMESTAMP via env var"             test_backup_timestamp_env_var
-run_test "invalid flags and missing args"           test_invalid_flags_and_missing_args
-run_test "restore: leftover tmp does not block"     test_restore_leftover_tmp_does_not_block
-run_test "restore is atomic on failure"             test_restore_is_atomic_on_failure
-run_test "backup/restore sparse file"               test_backup_restore_sparse_file
-run_test "restore fails: VOLUMES_ROOT missing"      test_restore_fails_when_volumes_root_missing
-run_test "restore fails: target not mounted"        test_restore_fails_when_target_not_mounted
-run_test "local checksum detects tampering"         test_local_checksum_detects_tampering_after_move
-run_test "s3 roundtrip (optional)"                  test_s3_roundtrip_optional
-run_test "s3 checksum roundtrip (optional)"         test_s3_checksum_roundtrip_optional
-run_test "s3 backup fails closed on stat error"     test_s3_backup_fails_closed_on_stat_error
-run_test "s3 backup fails on overwrite (optional)"  test_s3_backup_fails_on_overwrite_optional
-run_test "s3 roundtrip encrypted (optional)"        test_s3_roundtrip_encrypted_optional
+run_test "single backup/restore plain"                 test_single_backup_restore_plain
+run_test "single backup/restore compressed"            test_single_backup_restore_compressed
+run_test "single backup/restore symmetric"             test_single_backup_restore_symmetric
+run_test "single backup/restore asymmetric"            test_single_backup_restore_asymmetric
+run_test "all-mode filters + parallel"                 test_all_mode_with_filters_and_parallel
+run_test "backup single dry-run"                       test_backup_single_dry_run_creates_nothing
+run_test "backup all dry-run"                          test_backup_all_dry_run_creates_nothing
+run_test "restore single dry-run"                      test_restore_single_dry_run_changes_nothing
+run_test "restore fails without -C on non-empty"       test_restore_fails_on_non_empty_without_clear_flag
+run_test "backup fails on duplicate timestamp"         test_backup_fails_on_duplicate_timestamp
+run_test "restore all: picks latest without -T"        test_restore_all_no_timestamp_picks_latest
+run_test "restore all dry-run"                         test_restore_all_dry_run_changes_nothing
+run_test "restore single: filename-only source"        test_restore_single_source_filename_only
+run_test "backup root override (-d)"                   test_backup_root_override
+run_test "asymmetric GPG via env vars"                 test_backup_restore_asymmetric_env_keys
+run_test "single backup/restore .tar.gpg"              test_single_backup_restore_tar_gpg
+run_test "volume names with dots and dashes"           test_volume_names_with_dots_and_dashes
+run_test "BACKUP_TIMESTAMP via env var"                test_backup_timestamp_env_var
+run_test "invalid flags and missing args"              test_invalid_flags_and_missing_args
+run_test "restore is atomic on failure"                test_restore_is_atomic_on_failure
+run_test "backup/restore sparse file"                  test_backup_restore_sparse_file
+run_test "restore fails: VOLUMES_ROOT missing"         test_restore_fails_when_volumes_root_missing
+run_test "restore fails: target not mounted"           test_restore_fails_when_target_not_mounted
+run_test "local checksum detects tampering"            test_local_checksum_detects_tampering_after_move
+run_test "rejects ./.. and escaping volume names"      test_rejects_dot_and_escaping_volume_names
+run_test "restore all: skips dot-named files"          test_restore_all_skips_dot_named_backup_files
+run_test "-j is validated before use"                  test_jobs_value_is_validated_before_use
+run_test "restore empty volume roundtrip"              test_restore_empty_volume_roundtrip
+run_test "restore preserves volume root metadata"      test_restore_preserves_volume_root_metadata
+run_test "backup tolerates files changing"             test_backup_tolerates_files_changing
+run_test "restore -a: one bad archive changes nothing" test_restore_all_wrong_passphrase_changes_nothing
+run_test "restore crash matrix"                        test_restore_crash_matrix
+run_test "restore repeated crashes during rollback"    test_restore_repeated_crashes_during_rollback
+run_test "recovery needs all participants"             test_restore_recovery_needs_all_participants
+run_test "restore locks against concurrent operations" test_restore_locks_against_concurrent_operations
+run_test "recovery waits for finalize"                 test_recovery_waits_for_finalize
+run_test "restore write-ahead order"                   test_restore_wal_order
+run_test "restore refuses nested mounts"               test_restore_refuses_nested_mounts
+run_test "restore refuses mount points (mountinfo)"    test_restore_refuses_mount_points_from_mountinfo
+run_test "restore refuses legacy staging directory"    test_restore_refuses_legacy_staging_directory
+run_test "reserved names from users never removed"     test_reserved_names_from_users_are_never_removed
+run_test "interrupted trash cleanup is finished"       test_interrupted_trash_cleanup_is_finished
+run_test "restore requires a valid checksum file"      test_restore_requires_valid_checksum_file
+run_test "backup refuses a lone checksum file"         test_backup_refuses_lone_checksum_file
+run_test "concurrent local backups publish one pair"   test_concurrent_local_backups_publish_one_pair
+run_test "restore and backup require flock"            test_restore_requires_flock
+run_test "backup stops on signal"                      test_backup_stops_on_signal
+run_test "backup -a stops on signal"                   test_backup_all_stops_on_signal
+run_test "backup -a does not wait for the first child" test_backup_all_does_not_wait_for_the_first_child
+run_test "restore stops on signal"                     test_restore_stops_on_signal
+run_test "backup encrypts to every recipient"          test_backup_encrypts_to_every_recipient
+run_test "backup dry-run validates the public key"     test_backup_dry_run_validates_public_key
+run_test "restore rejects unencrypted .gpg archive"    test_restore_rejects_unencrypted_gpg_archive
+run_test "passphrase with newline warns"               test_passphrase_with_newline_warns
+run_test "backup refuses BACKUP_ROOT inside volume"    test_backup_refuses_backup_root_inside_volume
+run_test "restore refuses source inside target"        test_restore_refuses_source_inside_target
+run_test "backup warns about nested mounts"            test_backup_warns_about_nested_mounts
+run_test "restore does not restore SELinux labels"     test_restore_does_not_restore_selinux_labels
+run_test "s3 errors include the curl message"          test_s3_errors_include_the_curl_message
+run_test "GNU tar features detected reliably"          test_gnu_tar_features_are_detected_reliably
+run_test "single backup/restore zstd"                  test_single_backup_restore_zstd
+run_test "compression options are validated"           test_compression_options_are_validated
+run_test "backup excludes patterns (-x)"               test_backup_excludes_patterns
+run_test "secrets from *_FILE variables"               test_secrets_from_files
+run_test "restore lists backups (-l)"                  test_restore_lists_backups
+run_test "restore -a skips incomplete backups"         test_restore_all_skips_incomplete_backups
+run_test "verify backups (-V)"                         test_verify_backups
+run_test "rotation keeps newest backups (-R)"          test_rotation_keeps_newest_backups
+run_test "rotation keeps recent backups (-D)"          test_rotation_keeps_recent_backups
+run_test "rotation handles incomplete backups"         test_rotation_handles_incomplete_backups
+run_test "rotation interrupted between files"          test_rotation_interrupted_between_files
+run_test "rotation and publishing do not interleave"   test_rotation_and_publishing_do_not_interleave
+run_test "failed rollback keeps the journal"           test_failed_rollback_keeps_the_journal
+run_test "xattr marker fallback and failure"           test_xattr_marker_fallback_and_failure
+run_test "signal after commit does not roll back"      test_signal_after_commit_decision_does_not_roll_back
+run_test "invalid commit decision stops recovery"      test_invalid_commit_decision_stops_recovery
+run_test "failed directory scan keeps the journal"     test_failed_directory_scan_keeps_the_journal
+run_test "recovery rejects dry run"                    test_recovery_rejects_dry_run
+run_test "s3 backup fails closed on HEAD error"        test_s3_backup_fails_closed_on_head_error
+run_test "s3 rejects unsafe keys"                      test_s3_rejects_unsafe_keys
+run_test "s3 roundtrip (optional)"                     test_s3_roundtrip_optional
+run_test "s3 checksum roundtrip (optional)"            test_s3_checksum_roundtrip_optional
+run_test "s3 backup fails on overwrite (optional)"     test_s3_backup_fails_on_overwrite_optional
+run_test "s3 roundtrip encrypted (optional)"           test_s3_roundtrip_encrypted_optional
+run_test "s3 multipart roundtrip (optional)"           test_s3_multipart_roundtrip_optional
+run_test "s3 failed stream publishes nothing"          test_s3_failed_stream_publishes_nothing_optional
+run_test "s3 concurrent object kept (optional)"        test_s3_concurrent_object_is_not_overwritten_optional
+run_test "s3 needs conditional writes (optional)"      test_s3_requires_conditional_writes_optional
+run_test "s3 lost Complete response (optional)"        test_s3_lost_complete_response_optional
+run_test "s3 sidecar conflict keeps archive"           test_s3_sidecar_conflict_keeps_archive_optional
+run_test "s3 credentials not on command line"          test_s3_credentials_stay_off_the_command_line_optional
+run_test "s3 backup stops on signal (optional)"        test_s3_backup_stops_on_signal_optional
+run_test "s3 list and restore -a (optional)"           test_s3_list_and_restore_all_optional
+run_test "s3 rotation (optional)"                      test_s3_rotation_optional
+run_test "s3 rotation keeps replaced objects"          test_s3_rotation_keeps_replaced_objects_optional
+run_test "s3 rotation needs conditional delete"        test_s3_rotation_needs_conditional_delete_optional
+run_test "s3 rotation on versioned bucket"             test_s3_rotation_on_versioned_bucket_optional
+run_test "s3 failed listing page fails"                test_s3_failed_listing_page_fails_optional
+run_test "s3 truncated listing fails"                  test_s3_truncated_listing_fails_optional
+run_test "s3 truncated checksum fails"                 test_s3_truncated_checksum_fails_optional
+run_test "s3 failed listing parser fails"              test_s3_failed_listing_parser_fails_optional
+run_test "s3 unreadable listing fails"                 test_s3_unreadable_listing_fails_optional
+run_test "s3 malformed listing fails"                  test_s3_malformed_listing_fails_optional
+run_test "s3 failed token check fails"                 test_s3_failed_token_check_fails_optional
+run_test "unreadable checksum file fails the catalog"  test_unreadable_checksum_file_fails_the_catalog
+run_test "restore refuses unreadable mount table"      test_restore_refuses_unreadable_mount_table
+run_test "failed sort stops backup"                    test_failed_sort_stops_backup
+run_test "failed sort stops restore"                   test_failed_sort_stops_restore
+run_test "s3 rotation requires ETags"                  test_s3_rotation_requires_etags_optional
+run_test "unrecognized creation directory is kept"     test_unrecognized_creation_directory_is_kept
 
 # ------------------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------------------
 
 printf '\n' >&2
+if [[ -n "${TEST_S3_PROVIDER:-}" ]]; then
+  printf 'S3 server   : %s\n' "$TEST_S3_PROVIDER" >&2
+fi
 printf 'Tests total : %d\n' "$TESTS_TOTAL" >&2
 printf 'Passed      : %d\n' "$TESTS_PASSED" >&2
 printf 'Skipped     : %d\n' "$TESTS_SKIPPED" >&2
