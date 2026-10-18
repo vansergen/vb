@@ -27,6 +27,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - [Troubleshooting](#troubleshooting)
 - [Running the Tests](#running-the-tests)
 - [FAQ](#faq)
+- [License](#license)
 
 ---
 
@@ -1340,3 +1341,7 @@ These scripts operate at the file-archive level. For a crash-consistent snapshot
 - Filesystem snapshots (LVM, ZFS, btrfs)
 - Storage-level snapshots (cloud disks)
 - App-aware backup tools for stateful services (`pg_dump`, etc.)
+
+## License
+
+MIT, see [LICENSE](LICENSE).
