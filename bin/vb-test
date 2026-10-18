@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test functions are only called through run_test:
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 set -Eeuo pipefail
 
 # ------------------------------------------------------------------------------
