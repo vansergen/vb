@@ -43,6 +43,24 @@ jobs:
       - name: Test
         run: docker compose -f compose.test.yaml run --rm --build test
 
+  # The S3 tests against other S3-compatible servers
+  test-s3-compat:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        target:
+          - seaweedfs
+          - rustfs
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test
+        run: docker compose -f compose.test.yaml run --rm --build -e TEST_S3_TARGET=${{ matrix.target }} test
+
   # The suite with the runner's bash, GNU userland and filesystem (no S3)
   test-runner:
     runs-on: ubuntu-latest
@@ -91,7 +109,7 @@ jobs:
           '
 
   release:
-    needs: [lint, test, test-runner, build]
+    needs: [lint, test, test-s3-compat, test-runner, build]
 
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 

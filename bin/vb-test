@@ -34,6 +34,14 @@ TESTS_SKIPPED=0
 #   TEST_S3_BUCKET      (required for S3 tests)
 #   TEST_S3_PREFIX      (optional)
 #   REQUIRE_S3_TESTS=1  (optional, turn S3 skips into failures)
+#   TEST_S3_VERSIONED_ENDPOINT  (optional, default AWS_ENDPOINT_URL) and
+#   TEST_S3_VERSIONED_BUCKET    (optional, default TEST_S3_BUCKET): where
+#                               the rotation test finds a bucket with
+#                               versioning; at least one must be set
+#   TEST_S3_CREATE_BUCKETS=1    (optional) wait for the server, create the
+#                               buckets and enable versioning on the
+#                               versioned one before the tests
+#   TEST_S3_PROVIDER            (optional) name of the S3 server, for the log
 #
 # TEST_FILTER=<regex> runs only the tests whose function name matches.
 #
@@ -473,6 +481,28 @@ t_s3_init() {
       printf 'header = "x-amz-security-token: %s"\n' "$AWS_SESSION_TOKEN"
     fi
   ) > "$T_S3_CONFIG"
+}
+
+# Creates a bucket (waiting up to 60 seconds for the server to come up) and
+# optionally enables versioning on it.
+#   t_s3_create_bucket <endpoint> <bucket> [versioned]
+t_s3_create_bucket() {
+  local endpoint="${1%/}" bucket="$2" versioned="${3:-}" code="" i
+  for (( i = 0; i < 60; i++ )); do
+    code="$(curl -K "$T_S3_CONFIG" -o "$TEST_ROOT/bucket.body" -w '%{http_code}' -X PUT "${endpoint}/${bucket}" 2>/dev/null)" || code=000
+    if [[ "$code" == 200 || "$code" == 409 ]]; then
+      break
+    fi
+    sleep 1
+  done
+  [[ "$code" == 200 || "$code" == 409 ]] || die "Could not create the bucket ${bucket} on ${endpoint} (HTTP ${code})"
+
+  if [[ -n "$versioned" ]]; then
+    code="$(curl -K "$T_S3_CONFIG" -o "$TEST_ROOT/bucket.body" -w '%{http_code}' -X PUT -H 'Content-Type: application/xml' \
+      --data-binary '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' \
+      "${endpoint}/${bucket}?versioning")" || code=000
+    [[ "$code" == 200 ]] || die "Could not enable versioning on the bucket ${bucket} on ${endpoint} (HTTP ${code})"
+  fi
 }
 
 # Unique per-test prefix below the per-run prefix
@@ -2852,9 +2882,11 @@ ts_seconds_ago() {
 }
 
 # Prints the keys below an S3 prefix of the test bucket
+#   t_s3_list_keys <prefix> [endpoint] [bucket]
 t_s3_list_keys() {
   local endpoint="${2:-${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}}"
-  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${TEST_S3_BUCKET}?list-type=2&prefix=$1" \
+  local bucket="${3:-$TEST_S3_BUCKET}"
+  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${bucket}?list-type=2&prefix=$1" \
     | tr '<' '\n' | awk -F'>' '$1 == "Key" { print $2 }' | tr '\n' ' '
 }
 
@@ -3308,9 +3340,9 @@ test_s3_rotation_needs_conditional_delete_optional() {
 
 test_s3_rotation_on_versioned_bucket_optional() {
   require_s3_or_skip || return $?
-  if [[ -z "${TEST_S3_VERSIONED_ENDPOINT:-}" ]]; then
+  if [[ -z "${TEST_S3_VERSIONED_ENDPOINT:-}${TEST_S3_VERSIONED_BUCKET:-}" ]]; then
     [[ "${REQUIRE_S3_TESTS:-0}" != 1 ]] || {
-      log "TEST_S3_VERSIONED_ENDPOINT is required (REQUIRE_S3_TESTS=1)"
+      log "TEST_S3_VERSIONED_ENDPOINT or TEST_S3_VERSIONED_BUCKET is required (REQUIRE_S3_TESTS=1)"
       return 1
     }
     return "$SKIP_RC"
@@ -3318,16 +3350,20 @@ test_s3_rotation_on_versioned_bucket_optional() {
   setup_case "s3_rotation_on_versioned_bucket_optional"
   make_volume_content "app"
 
+  local endpoint="${TEST_S3_VERSIONED_ENDPOINT:-${AWS_ENDPOINT_URL:-}}"
+  local bucket="${TEST_S3_VERSIONED_BUCKET:-$TEST_S3_BUCKET}"
   local prefix ts stub="$CASE_ROOT/stub" listing
+  local -a server=()
+  [[ -z "$endpoint" ]] || server=(AWS_ENDPOINT_URL="$endpoint")
   prefix="$(t_s3_prefix rotation-versioned)"
   make_curl_stub "$stub" trace
   for ts in 20250101_000001 20250101_000002; do
-    run_backup_with_env AWS_ENDPOINT_URL="$TEST_S3_VERSIONED_ENDPOINT" -- -v app -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+    run_backup_with_env "${server[@]}" -- -v app -T "$ts" -b "$bucket" -f "$prefix" || return 1
   done
-  run_backup_with_env AWS_ENDPOINT_URL="$TEST_S3_VERSIONED_ENDPOINT" PATH="$stub:$PATH" -- \
-    -v app -T 20250101_000003 -R 1 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  run_backup_with_env "${server[@]}" PATH="$stub:$PATH" -- \
+    -v app -T 20250101_000003 -R 1 -b "$bucket" -f "$prefix" || return 1
 
-  listing="$(t_s3_list_keys "${prefix}/" "$TEST_S3_VERSIONED_ENDPOINT")"
+  listing="$(t_s3_list_keys "${prefix}/" "$endpoint" "$bucket")"
   [[ "$listing" == "${prefix}/app_20250101_000003.tar ${prefix}/app_20250101_000003.tar.sha256 " ]] || {
     log "Unexpected listing after rotation: $listing"
     return 1
@@ -3337,10 +3373,11 @@ test_s3_rotation_on_versioned_bucket_optional() {
     return 1
   }
 
-  # Clean up this prefix on the versioned server
+  # Clean up this prefix in the versioned bucket
   local key
+  endpoint="${endpoint:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
   for key in $listing; do
-    curl -K "$T_S3_CONFIG" -o /dev/null -X DELETE "${TEST_S3_VERSIONED_ENDPOINT%/}/${TEST_S3_BUCKET}/${key}" || true
+    curl -K "$T_S3_CONFIG" -o /dev/null -X DELETE "${endpoint%/}/${bucket}/${key}" || true
   done
 }
 
@@ -3734,6 +3771,18 @@ log "Using backup script:  $BACKUP_BIN"
 log "Using restore script: $RESTORE_BIN"
 log "Test root: $TEST_ROOT"
 
+if [[ "${TEST_S3_CREATE_BUCKETS:-0}" == 1 ]] && s3_tests_enabled; then
+  t_s3_init
+  default_endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  t_s3_create_bucket "$default_endpoint" "$TEST_S3_BUCKET"
+  if [[ -n "${TEST_S3_VERSIONED_ENDPOINT:-}${TEST_S3_VERSIONED_BUCKET:-}" ]]; then
+    t_s3_create_bucket "${TEST_S3_VERSIONED_ENDPOINT:-$default_endpoint}" "${TEST_S3_VERSIONED_BUCKET:-$TEST_S3_BUCKET}" versioned
+  fi
+fi
+if s3_tests_enabled; then
+  log "S3 server: ${TEST_S3_PROVIDER:-unnamed} (${AWS_ENDPOINT_URL:-AWS})"
+fi
+
 # ------------------------------------------------------------------------------
 # Execute tests
 # ------------------------------------------------------------------------------
@@ -3844,6 +3893,9 @@ run_test "s3 truncated checksum fails"                 test_s3_truncated_checksu
 # ------------------------------------------------------------------------------
 
 printf '\n' >&2
+if [[ -n "${TEST_S3_PROVIDER:-}" ]]; then
+  printf 'S3 server   : %s\n' "$TEST_S3_PROVIDER" >&2
+fi
 printf 'Tests total : %d\n' "$TESTS_TOTAL" >&2
 printf 'Passed      : %d\n' "$TESTS_PASSED" >&2
 printf 'Skipped     : %d\n' "$TESTS_SKIPPED" >&2
