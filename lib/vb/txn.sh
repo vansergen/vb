@@ -482,8 +482,8 @@ txn_finalize() {
   tar --extract --no-recursion --numeric-owner --same-owner --preserve-permissions \
     "${tar_extract_flags[@]}" --file "${journal}/root.tar" --directory "$target" . \
     || die "Failed to restore the root metadata of ${target}"
-  mtime="$(head -n 1 "${journal}/root.mtime")" && [[ -n "$mtime" ]] \
-    || die "Failed to read ${journal}/root.mtime"
+  mtime="$(head -n 1 "${journal}/root.mtime")" || die "Failed to read ${journal}/root.mtime"
+  [[ -n "$mtime" ]] || die "${journal}/root.mtime is empty"
   txn_set_marker "$target" "$mtime"
   txn_sync "$target"
 
