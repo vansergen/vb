@@ -3652,6 +3652,25 @@ STUB
   assert_group_state old || return 1
 }
 
+test_recovery_rejects_dry_run() {
+  setup_case "recovery_rejects_dry_run"
+  setup_two_volume_transaction || return 1
+  restore_crashing_at txn_after_decision -- -a -T "$TXN_TS" -C || return 1
+
+  local before
+  before="$(volume_state alpha beta)"
+  expect_rejected run_restore -X -n || return 1
+  expect_rejected run_restore -X -C || return 1
+  expect_rejected run_restore -X -j 2 || return 1
+  [[ "$(volume_state alpha beta)" == "$before" ]] || {
+    log "BUG: a refused recovery changed the volumes"
+    return 1
+  }
+
+  run_restore -X || return 1
+  assert_group_state new || return 1
+}
+
 # ------------------------------------------------------------------------------
 # Test runner
 # ------------------------------------------------------------------------------
@@ -3796,6 +3815,7 @@ run_test "xattr marker fallback and failure"           test_xattr_marker_fallbac
 run_test "signal after commit does not roll back"      test_signal_after_commit_decision_does_not_roll_back
 run_test "invalid commit decision stops recovery"      test_invalid_commit_decision_stops_recovery
 run_test "failed directory scan keeps the journal"     test_failed_directory_scan_keeps_the_journal
+run_test "recovery rejects dry run"                    test_recovery_rejects_dry_run
 run_test "s3 backup fails closed on HEAD error"        test_s3_backup_fails_closed_on_head_error
 run_test "s3 rejects unsafe keys"                      test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                     test_s3_roundtrip_optional

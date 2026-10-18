@@ -128,7 +128,7 @@ Options:
     -V          Verify: check the checksum, decrypt, decompress and read the
                 archive without restoring anything (with -i or -a)
     -X          Recover: complete or roll back interrupted restores on all
-                mounted volumes, then exit
+                mounted volumes, then exit (cannot be combined with -n)
 
                 Without -a:
                   -i and -t are required
@@ -1125,6 +1125,10 @@ elif (( verify_mode )); then
 elif (( recover_only )); then
   if (( all_volumes || ${#volume_filters[@]} > 0 )) || [[ -n "$source_arg$target_volume$timestamp_filter" ]]; then
     die "Option -X cannot be combined with -a, -i, -t, -T or -v"
+  fi
+  # Recovery always acts: there is no dry run of it
+  if (( dry_run || clear_target || jobs != 1 )); then
+    die "Option -X cannot be combined with -n, -C or -j"
   fi
 elif (( all_volumes )); then
   [[ -z "$source_arg" ]] || die "Option -i cannot be used with -a"

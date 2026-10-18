@@ -356,7 +356,7 @@ Runs up to 3 backups concurrently.
 | `-j <N>`      | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                     |
 | `-C`          | Replace the existing contents of the target volume                      |
 | `-U`          | Allow restoring an archive without a `.sha256` checksum file            |
-| `-X`          | Only complete or roll back interrupted restores, then exit              |
+| `-X`          | Only complete or roll back interrupted restores, then exit (no `-n`)    |
 | `-s`          | Symmetric GPG decryption (passphrase)                                   |
 | `-k <file>`   | Private key file for asymmetric GPG decryption (default: `private.gpg`) |
 | `-n`          | Dry run: validate and print what would be done without restoring        |
