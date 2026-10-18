@@ -486,11 +486,13 @@ txn_finalize() {
 
 # Rolls back one participant and retires its journal, restoring the original
 # mtime of the volume root.
+#   txn_abort_participant <target> <coordinator-path>
 txn_abort_participant() {
-  local target="$1"
+  local target="$1" coordinator="$2"
   local journal="${target}/${TXN_NAME}"
   local mtime
 
+  txn__require_no_decision "$coordinator"
   txn_rollback "$target"
   # Only an empty journal/old proves that every original entry is back
   txn_dir_is_empty "${journal}/old" || die \
@@ -510,22 +512,45 @@ txn_abort_participant() {
 # Groups
 # ------------------------------------------------------------------------------
 
-txn_coordinator_decided() {
-  [[ "$(head -n 1 "$1/${TXN_NAME}/decision" 2>/dev/null)" == commit ]]
+# Prints the commit decision of a group, from its coordinator's journal:
+#   none     no decision was made: the group may be rolled back
+#   commit   the decision is durable: the group may only be completed
+#   invalid  the decision cannot be read or makes no sense: nothing may be
+#            done automatically
+# A leftover .decision.tmp (the rename never happened) counts as none.
+txn_decision_state() {
+  local file="$1/${TXN_NAME}/decision" line=""
+
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    printf 'none\n'
+  elif [[ -f "$file" && ! -L "$file" ]] && { IFS= read -r line < "$file"; } 2>/dev/null && [[ "$line" == commit ]]; then
+    printf 'commit\n'
+  else
+    printf 'invalid\n'
+  fi
+}
+
+txn__require_no_decision() {
+  local coordinator="$1" state
+  state="$(txn_decision_state "$coordinator")"
+  [[ "$state" == none ]] || die \
+    "Refusing to roll back: the coordinator ${coordinator} holds a ${state} commit decision (${coordinator}/${TXN_NAME}/decision)"
 }
 
 # Aborts a group: every ordinary participant first, the coordinator last.
+# Only allowed while the coordinator holds no decision.
 #   txn_abort_group <coordinator-path> <participant-path>...
 txn_abort_group() {
   local coordinator="$1" path
   shift
 
+  txn__require_no_decision "$coordinator"
   for path in "$@"; do
     [[ "$path" != "$coordinator" && -d "${path}/${TXN_NAME}" ]] || continue
-    txn_abort_participant "$path"
+    txn_abort_participant "$path" "$coordinator"
   done
   if [[ -d "${coordinator}/${TXN_NAME}" ]]; then
-    txn_abort_participant "$coordinator"
+    txn_abort_participant "$coordinator" "$coordinator"
   fi
 }
 
@@ -671,11 +696,17 @@ txn__recover_group() {
     die "Restore group ${gid} is inconsistent: participants still have journals but the coordinator '${coordinator}' does not; refusing to touch it"
   fi
 
-  if txn_coordinator_decided "$coordinator_path"; then
-    log WARN "Completing interrupted restore of: ${participants}"
-    txn_finalize_group "$coordinator_path" "${member_paths[@]}"
-  else
-    log WARN "Rolling back interrupted restore of: ${participants}"
-    txn_abort_group "$coordinator_path" "${member_paths[@]}"
-  fi
+  case "$(txn_decision_state "$coordinator_path")" in
+    commit)
+      log WARN "Completing interrupted restore of: ${participants}"
+      txn_finalize_group "$coordinator_path" "${member_paths[@]}"
+      ;;
+    none)
+      log WARN "Rolling back interrupted restore of: ${participants}"
+      txn_abort_group "$coordinator_path" "${member_paths[@]}"
+      ;;
+    *)
+      die "The commit decision of the interrupted restore of ${participants} is unreadable: ${coordinator_path}/${TXN_NAME}/decision. Refusing to touch the group. If it should read 'commit', the restore completes; without the file, it rolls back"
+      ;;
+  esac
 }

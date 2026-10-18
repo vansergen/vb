@@ -240,15 +240,27 @@ cleanup() {
     checksum_pid=""
   fi
 
-  if [[ -z "$RESTORE_PHASE" ]]; then
-    if (( txn_started && ! txn_committed && ! txn_done )); then
-      log WARN "Rolling back; the target volumes keep their original data"
-      if ! ( abort_transaction ); then
-        log ERROR "Rollback did not finish; run '$SCRIPT_NAME -X' to complete it"
-      fi
-    elif (( txn_committed && ! txn_done )); then
-      log WARN "Interrupted after the commit point; run '$SCRIPT_NAME -X' to finish the restore"
-    fi
+  # The decision on disk, not the in-memory flag, decides: a signal can
+  # arrive after the decision became durable but before the flag was set.
+  if [[ -z "$RESTORE_PHASE" ]] && (( txn_started && ! txn_done )); then
+    case "$(txn_decision_state "$txn_coordinator_path")" in
+      none)
+        if (( txn_committed )); then
+          log ERROR "The commit decision disappeared from ${txn_coordinator_path}/${TXN_NAME}; the journals were kept. Inspect them, then run '$SCRIPT_NAME -X'"
+        else
+          log WARN "Rolling back; the target volumes keep their original data"
+          if ! ( abort_transaction ); then
+            log ERROR "Rollback did not finish; the journals were kept. Run '$SCRIPT_NAME -X' to complete it"
+          fi
+        fi
+        ;;
+      commit)
+        log WARN "Interrupted after the commit point; run '$SCRIPT_NAME -X' to finish the restore"
+        ;;
+      *)
+        log ERROR "The commit decision in ${txn_coordinator_path}/${TXN_NAME} is unreadable; the journals were kept. Inspect it, then run '$SCRIPT_NAME -X'"
+        ;;
+    esac
   fi
 
   cleanup_work_dir

@@ -3449,6 +3449,77 @@ STUB
   }
 }
 
+test_signal_after_commit_decision_does_not_roll_back() {
+  setup_case "signal_after_commit_decision_does_not_roll_back"
+  setup_two_volume_transaction || return 1
+
+  # TERM right after the decision was made durable (alpha is the coordinator)
+  local stub="$CASE_ROOT/stub" real_sync journal
+  real_sync="$(command -v sync)"
+  journal="$(cd "$TEST_VOLUMES_ROOT/alpha" && pwd -P)/.vb-restore"
+  write_wrapper "$stub" sync <<STUB
+#!/usr/bin/env bash
+'$real_sync' "\$@"
+rc=\$?
+if [[ -e '$CASE_ROOT/sync.arm' && "\${!#}" == '$journal' && -e '$journal/decision' ]]; then
+  rm -f '$CASE_ROOT/sync.arm'
+  : > '$CASE_ROOT/sync.fired'
+  kill -TERM "\$PPID"
+fi
+exit \$rc
+STUB
+  : > "$CASE_ROOT/sync.arm"
+
+  local rc=0
+  run_restore_with_env PATH="$stub:$PATH" -- -a -T "$TXN_TS" -C > "$CASE_ROOT/restore.log" 2>&1 || rc=$?
+  [[ -e "$CASE_ROOT/sync.fired" ]] || {
+    log "The signal was never sent"
+    return 1
+  }
+  (( rc != 0 )) || return 1
+
+  # Committed: both volumes keep the new data, the decision stays
+  local vol
+  for vol in alpha beta; do
+    [[ "$(volume_manifest_without_journal "$TEST_VOLUMES_ROOT/$vol")" == "$(tree_manifest "$CASE_ROOT/new-$vol")" ]] || {
+      log "BUG: $vol was rolled back although the commit decision was durable"
+      cat "$CASE_ROOT/restore.log" >&2
+      return 1
+    }
+  done
+  [[ "$(head -n 1 "$journal/decision")" == commit ]] || return 1
+
+  run_restore -X || return 1
+  assert_group_state new || return 1
+}
+
+test_invalid_commit_decision_stops_recovery() {
+  setup_case "invalid_commit_decision_stops_recovery"
+  setup_two_volume_transaction || return 1
+  restore_crashing_at txn_after_decision -- -a -T "$TXN_TS" -C || return 1
+
+  local decision="$TEST_VOLUMES_ROOT/alpha/.vb-restore/decision" before variant
+  for variant in garbage directory; do
+    rm -rf "$decision"
+    if [[ "$variant" == garbage ]]; then
+      printf 'commmit\n' > "$decision"
+    else
+      mkdir "$decision"
+    fi
+    before="$(volume_state alpha beta)"
+    expect_rejected run_restore -X || return 1
+    [[ "$(volume_state alpha beta)" == "$before" ]] || {
+      log "BUG: recovery acted on an unreadable commit decision ($variant)"
+      return 1
+    }
+  done
+
+  rm -rf "$decision"
+  printf 'commit\n' > "$decision"
+  run_restore -X || return 1
+  assert_group_state new || return 1
+}
+
 # ------------------------------------------------------------------------------
 # Test runner
 # ------------------------------------------------------------------------------
@@ -3590,6 +3661,8 @@ run_test "rotation interrupted between files"          test_rotation_interrupted
 run_test "rotation and publishing do not interleave"   test_rotation_and_publishing_do_not_interleave
 run_test "failed rollback keeps the journal"           test_failed_rollback_keeps_the_journal
 run_test "xattr marker fallback and failure"           test_xattr_marker_fallback_and_failure
+run_test "signal after commit does not roll back"      test_signal_after_commit_decision_does_not_roll_back
+run_test "invalid commit decision stops recovery"      test_invalid_commit_decision_stops_recovery
 run_test "s3 backup fails closed on HEAD error"        test_s3_backup_fails_closed_on_head_error
 run_test "s3 rejects unsafe keys"                      test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                     test_s3_roundtrip_optional
