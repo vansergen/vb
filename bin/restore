@@ -735,6 +735,14 @@ scan_backup_catalog() {
   fi
 }
 
+# Prints the catalog indices by volume, newest first (for vb_collect).
+all_mode_candidates() {
+  local i
+  for i in "${!cat_names[@]}"; do
+    printf '%s\t%s\t%s\n' "${cat_volumes[i]}" "${cat_ts[i]}" "$i"
+  done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2r | cut -f3
+}
+
 # Picks the latest eligible backup of every volume (matching -v and -T).
 # Candidates are checked newest first; in S3 the pairing of archive and
 # checksum file is only checked for those candidates.
@@ -743,11 +751,7 @@ collect_backups_for_all_mode() {
   local -a order=()
 
   scan_backup_catalog 0
-  mapfile -t order < <(
-    for i in "${!cat_names[@]}"; do
-      printf '%s\t%s\t%s\n' "${cat_volumes[i]}" "${cat_ts[i]}" "$i"
-    done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2r | cut -f3
-  )
+  vb_collect order line all_mode_candidates
 
   for i in "${order[@]}"; do
     vol="${cat_volumes[i]}"
@@ -784,6 +788,7 @@ collect_backups_for_all_mode() {
 # take part when <require-mounted> is 1.
 build_participants_for_all_mode() {
   local require_mounted="${1:-1}" vol requested missing=0
+  local -a names=()
 
   if [[ -n "$timestamp_filter" ]]; then
     [[ "$timestamp_filter" =~ ^[0-9]{8}_[0-9]{6}$ ]] || die \
@@ -793,12 +798,13 @@ build_participants_for_all_mode() {
   collect_backups_for_all_mode
 
   if (( ${#volume_filters[@]} > 0 )); then
-    while IFS= read -r requested; do
+    vb_collect names line vb_sort_lines -- "${!volume_filters[@]}"
+    for requested in "${names[@]}"; do
       if [[ -z "${latest_file[$requested]:-}" ]]; then
         log ERROR "No backup found for requested volume: $requested"
         missing=1
       fi
-    done < <(printf '%s\n' "${!volume_filters[@]}" | sort)
+    done
     (( missing == 0 )) || die "One or more requested volumes have no matching backups"
   elif (( require_mounted )); then
     # Without -v, restore what is mounted (like backup -a) and skip the rest
@@ -818,11 +824,12 @@ build_participants_for_all_mode() {
     die "No complete backups found in ${location}"
   fi
 
-  while IFS= read -r vol; do
+  vb_collect names line vb_sort_lines -- "${!latest_file[@]}"
+  for vol in "${names[@]}"; do
     part_volumes+=("$vol")
     part_sources+=("${latest_file[$vol]}")
     unique_timestamps["${latest_ts[$vol]}"]=1
-  done < <(printf '%s\n' "${!latest_file[@]}" | sort)
+  done
 }
 
 # Read-only checks of one participant; fills part_paths.
@@ -913,8 +920,8 @@ dry_run_participant() {
 # ------------------------------------------------------------------------------
 
 run_list() {
-  local i vol ts status size name reason width=6
-  local -a rows=()
+  local i vol ts status size name reason row width=6
+  local -a rows=() sorted=()
 
   scan_backup_catalog 1
 
@@ -935,10 +942,12 @@ run_list() {
     return 0
   fi
 
+  vb_collect sorted line vb_sort_lines -t $'\t' -k1,1 -k2,2 -- "${rows[@]}"
   printf '%-*s  %-15s  %-10s  %10s  %s\n' "$width" VOLUME TIMESTAMP STATUS SIZE NAME
-  while IFS=$'\t' read -r vol ts status size name reason; do
+  for row in "${sorted[@]}"; do
+    IFS=$'\t' read -r vol ts status size name reason <<< "$row"
     printf '%-*s  %-15s  %-10s  %10s  %s%s\n' "$width" "$vol" "$ts" "$status" "$size" "$name" "${reason:+  (${reason})}"
-  done < <(printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k1,1 -k2,2)
+  done
 }
 
 verify_backup() {

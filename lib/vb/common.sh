@@ -161,6 +161,22 @@ vb_collect() {
   rm -f -- "$file"
 }
 
+# Prints the values one per line, sorted bytewise with the given sort
+# options (nothing for no values). A producer for vb_collect, so that a
+# failing sort is never taken for a shorter list.
+#   vb_sort_lines [<sort option>...] -- [<value>...]
+vb_sort_lines() {
+  local -a opts=()
+  while (( $# > 0 )) && [[ "$1" != -- ]]; do
+    opts+=("$1")
+    shift
+  done
+  [[ "${1:-}" == -- ]] || die "vb_sort_lines: missing --"
+  shift
+  (( $# > 0 )) || return 0
+  printf '%s\n' "$@" | LC_ALL=C sort "${opts[@]}"
+}
+
 # ------------------------------------------------------------------------------
 # Archive helpers
 # ------------------------------------------------------------------------------
@@ -300,6 +316,10 @@ stop_process_tree() {
   local root="$1" signal="${2:-TERM}" pid i
   local -a pids=()
 
+  # Not vb_collect: this runs during cleanup, where dying would leave the
+  # children running, and process_tree_pids runs no command whose failure
+  # matters (a /proc entry that cannot be read belongs to a process that is
+  # already gone)
   mapfile -t pids < <(process_tree_pids "$root")
   for pid in "${pids[@]}"; do
     kill "-${signal}" "$pid" 2>/dev/null || true

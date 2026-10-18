@@ -203,9 +203,11 @@ txn_describe_reserved() {
 #   txn_lock <x|s> <dir>...
 txn_lock() {
   local mode="$1" path fd rc
+  local -a paths=()
   shift
 
-  while IFS= read -r path; do
+  vb_collect paths line vb_sort_lines -u -- "$@"
+  for path in "${paths[@]}"; do
     [[ -n "$path" && -z "${txn_lock_fds[$path]:-}" ]] || continue
 
     exec {fd}<"$path"
@@ -221,7 +223,7 @@ txn_lock() {
     fi
 
     txn_lock_fds[$path]="$fd"
-  done < <(printf '%s\n' "$@" | sort -u)
+  done
 }
 
 # ------------------------------------------------------------------------------
