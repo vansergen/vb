@@ -3896,6 +3896,71 @@ test_s3_rotation_requires_etags_optional() {
   done
 }
 
+# Recovery removes a journal creation directory only while it holds exactly
+# what an interrupted txn_create leaves behind
+test_unrecognized_creation_directory_is_kept() {
+  setup_case "unrecognized_creation_directory_is_kept"
+  make_volume_content "alpha"
+
+  local gid="0123456789abcdef0123456789abcdef" dir signature variant before
+  dir="$TEST_VOLUMES_ROOT/alpha/.vb-restore.new.${gid}"
+  signature="$(printf 'vb-restore-journal v1\ngid=%s' "$gid")"
+
+  # Not what the tool writes: refused, and nothing changes
+  for variant in invalid-signature invalid-tmp extra-file data-in-new; do
+    rm -rf "$dir"
+    mkdir "$dir"
+    case "$variant" in
+      invalid-signature) printf 'not a journal\n' > "$dir/VB-JOURNAL" ;;
+      invalid-tmp) printf 'not a journal\n' > "$dir/.VB-JOURNAL.tmp" ;;
+      extra-file)
+        printf '%s\n' "$signature" > "$dir/VB-JOURNAL"
+        printf 'user notes\n' > "$dir/notes.txt"
+        ;;
+      data-in-new)
+        printf '%s\n' "$signature" > "$dir/VB-JOURNAL"
+        printf 'gid=%s\n' "$gid" > "$dir/group"
+        printf 'staging\n' > "$dir/state"
+        mkdir "$dir/new" "$dir/old"
+        printf 'user data\n' > "$dir/new/data.txt"
+        ;;
+    esac
+    before="$(volume_state alpha)"
+    expect_rejected run_restore -X || {
+      log "Recovery accepted an unrecognized creation directory ($variant)"
+      return 1
+    }
+    [[ "$(volume_state alpha)" == "$before" ]] || {
+      log "BUG: recovery changed an unrecognized creation directory ($variant)"
+      return 1
+    }
+  done
+
+  # What a crash inside txn_create leaves behind: removed, data unchanged
+  for variant in empty-tmp full-tmp group-tmp; do
+    rm -rf "$dir"
+    mkdir "$dir"
+    case "$variant" in
+      empty-tmp) : > "$dir/.VB-JOURNAL.tmp" ;;
+      full-tmp) printf '%s\n' "$signature" > "$dir/.VB-JOURNAL.tmp" ;;
+      group-tmp)
+        printf '%s\n' "$signature" > "$dir/VB-JOURNAL"
+        printf 'gid=%s\nvol' "$gid" > "$dir/.group.tmp"
+        ;;
+    esac
+    before="$(volume_manifest_without_journal "$TEST_VOLUMES_ROOT/alpha")"
+    run_restore -X || {
+      log "Recovery refused a creation directory left by a crash ($variant)"
+      return 1
+    }
+    assert_no_reserved_entries alpha || return 1
+    [[ "$(tree_manifest "$TEST_VOLUMES_ROOT/alpha")" == "$before" ]] || {
+      log "Recovery changed the data of alpha ($variant)"
+      return 1
+    }
+  done
+}
+
 test_restore_refuses_unreadable_mount_table() {
   setup_case "restore_refuses_unreadable_mount_table"
   make_volume_content "alpha"
@@ -4174,6 +4239,7 @@ run_test "restore refuses unreadable mount table"      test_restore_refuses_unre
 run_test "failed sort stops backup"                    test_failed_sort_stops_backup
 run_test "failed sort stops restore"                   test_failed_sort_stops_restore
 run_test "s3 rotation requires ETags"                  test_s3_rotation_requires_etags_optional
+run_test "unrecognized creation directory is kept"     test_unrecognized_creation_directory_is_kept
 
 # ------------------------------------------------------------------------------
 # Summary

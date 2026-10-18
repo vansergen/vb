@@ -121,15 +121,14 @@ txn_classify() {
         printf 'unknown\n'
       elif txn_dir_is_empty "$path"; then
         printf 'empty\n'
-      elif gid="$(txn_signature_gid "$path")" && [[ "$gid" == "$suffix" ]]; then
-        if [[ "$name" == "${TXN_NAME}.new."* ]]; then
-          printf 'creating %s\n' "$gid"
+      elif [[ "$name" == "${TXN_NAME}.new."* ]]; then
+        if txn__is_creation_dir "$path" "$suffix"; then
+          printf 'creating %s\n' "$suffix"
         else
-          printf 'trash %s\n' "$gid"
+          printf 'unknown\n'
         fi
-      elif [[ "$name" == "${TXN_NAME}.new."* ]] && txn__only_signature_files "$path"; then
-        # Interrupted while writing the signature: nothing else was written
-        printf 'creating %s\n' "$suffix"
+      elif gid="$(txn_signature_gid "$path")" && [[ "$gid" == "$suffix" ]]; then
+        printf 'trash %s\n' "$gid"
       else
         printf 'unknown\n'
       fi
@@ -143,13 +142,52 @@ txn_classify() {
   esac
 }
 
-txn__only_signature_files() {
-  local name
+# Returns 0 if <dir> holds exactly what txn_create had written into a
+# creation directory for <gid> when it was interrupted, and 1 otherwise
+# (then it is kept for inspection):
+#   - a valid signature for <gid>, then group, state (each first as its
+#     .tmp file) and the empty new/ and old/, in that order;
+#   - or, interrupted while writing the signature, only .VB-JOURNAL.tmp,
+#     empty or holding exactly the signature.
+txn__is_creation_dir() {
+  local dir="$1" gid="$2" name entry tmp content steps=""
   local -a names=()
-  vb_collect names nul find "$1" -mindepth 1 -maxdepth 1 -printf '%f\0'
-  for name in "${names[@]}"; do
-    [[ "$name" == VB-JOURNAL || "$name" == .VB-JOURNAL.tmp ]] || return 1
-  done
+  local -A seen=()
+  vb_collect names nul find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\0'
+
+  if [[ "$(txn_signature_gid "$dir")" == "$gid" ]]; then
+    for name in "${names[@]}"; do
+      entry="${dir}/${name}"
+      case "$name" in
+        VB-JOURNAL | group | .group.tmp | state | .state.tmp)
+          [[ -f "$entry" && ! -L "$entry" ]] || return 1
+          ;;
+        new | old)
+          [[ -d "$entry" && ! -L "$entry" ]] || return 1
+          txn_dir_is_empty "$entry" || return 1
+          ;;
+        *) return 1 ;;
+      esac
+      seen[$name]=1
+    done
+
+    for name in VB-JOURNAL .group.tmp group .state.tmp state new old; do
+      [[ -z "${seen[$name]:-}" ]] || steps+="${name} "
+    done
+    case "$steps" in
+      "VB-JOURNAL " | "VB-JOURNAL .group.tmp " | "VB-JOURNAL group " | "VB-JOURNAL group .state.tmp " | \
+        "VB-JOURNAL group state " | "VB-JOURNAL group state new " | "VB-JOURNAL group state new old ")
+        return 0
+        ;;
+    esac
+    return 1
+  fi
+
+  tmp="${dir}/.VB-JOURNAL.tmp"
+  [[ "${#names[@]}" == 1 && "${names[0]}" == .VB-JOURNAL.tmp && -f "$tmp" && ! -L "$tmp" ]] || return 1
+  # The check sits on cat itself: the sentinel must not hide a read error
+  content="$(cat -- "$tmp" || exit 1; printf x)" || die "Failed to read $tmp"
+  [[ "$content" == x || "$content" == "$(printf '%s\ngid=%s\nx' "$TXN_SIGNATURE" "$gid")" ]]
 }
 
 # Prints "<name>" for every reserved top-level entry of a volume.
