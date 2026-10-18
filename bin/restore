@@ -281,8 +281,11 @@ trap 'report_unexpected_error $? $LINENO "$BASH_COMMAND"' ERR
 # Sources
 # ------------------------------------------------------------------------------
 
+# A directory that cannot be read is fatal, never "empty".
 dir_has_entries() {
-  [[ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+  local first
+  first="$(find "$1" -mindepth 1 -maxdepth 1 -print -quit)" || die "Failed to read the directory $1"
+  [[ -n "$first" ]]
 }
 
 # Resolves a source argument and detects its format.
@@ -868,7 +871,7 @@ check_sources_outside_targets() {
 check_target_usable() {
   local volume="$1" path="$2" reserved
 
-  reserved="$(txn_describe_reserved "$path")"
+  reserved="$(txn_describe_reserved "$path")" || die "Failed to inspect ${path}"
   [[ -z "$reserved" ]] || die \
     "Target volume '${volume}' holds reserved entries ($(printf '%s; ' "$reserved")); run '$SCRIPT_NAME -X' or move them away"
 
@@ -883,7 +886,7 @@ dry_run_participant() {
   setup_source "${part_sources[index]}"
   log INFO "  ${part_volumes[index]}  <-  ${src_path}"
 
-  reserved="$(txn_describe_reserved "${part_paths[index]}")"
+  reserved="$(txn_describe_reserved "${part_paths[index]}")" || die "Failed to inspect ${part_paths[index]}"
   if [[ -n "$reserved" ]]; then
     log WARN "  ${part_volumes[index]} holds reserved entries; the restore will recover them first: $(printf '%s; ' "$reserved")"
   elif dir_has_entries "${part_paths[index]}" && (( clear_target == 0 )); then

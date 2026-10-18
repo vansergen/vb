@@ -206,7 +206,9 @@ s3__bucket_url() {
 
 # Usage: s3__call <body-file> <headers-file> <curl args...>
 # Sets S3_STATUS (HTTP status, 000 on transport failure) and S3_CURL_RC; the
-# error message of curl is kept for s3__describe.
+# error message of curl is kept for s3__describe. An HTTP status with a
+# non-zero curl exit (for example a body that broke off, exit 18) is not a
+# complete answer: callers must check S3_CURL_RC as well.
 s3__call() {
   local body="$1" headers="$2"
   shift 2
@@ -265,6 +267,7 @@ s3_head() {
   s3_head_headers="${work_dir}/head.headers"
 
   s3__call /dev/null "$s3_head_headers" --retry 3 --head "$(s3_url_for "$bucket" "$key")"
+  (( S3_CURL_RC == 0 )) || die "Failed to check s3://${bucket}/${key}: $(s3__describe /dev/null)"
 
   case "$S3_STATUS" in
     200) return 0 ;;
@@ -292,6 +295,7 @@ s3_get() {
 s3_get_file() {
   local bucket="$1" key="$2" out="$3"
   s3__call "$out" "${work_dir}/get.headers" --retry 3 "$(s3_url_for "$bucket" "$key")"
+  (( S3_CURL_RC == 0 )) || die "Failed to download s3://${bucket}/${key}: $(s3__describe "$out")"
 
   case "$S3_STATUS" in
     200) return 0 ;;
@@ -321,6 +325,8 @@ s3_put_file() {
 
   for attempt in 1 2 3; do
     s3__call "$body" "$headers" --upload-file "$file" -H "x-amz-meta-vb-token: ${token}" "${cond[@]}" "$url"
+    # An answer that broke off is a lost answer: retry and check the token
+    (( S3_CURL_RC == 0 )) || S3_STATUS=000
 
     case "$S3_STATUS" in
       200) return 0 ;;
@@ -357,14 +363,22 @@ s3_delete_if_match() {
   local -a cond=()
   [[ -z "$etag" ]] || cond=(-H "If-Match: ${etag}")
 
-  s3__call "$body" "${work_dir}/delete.headers" --retry 3 -X DELETE "${cond[@]}" "$(s3_url_for "$bucket" "$key")"
+  local attempt
+  for attempt in 1 2 3; do
+    s3__call "$body" "${work_dir}/delete.headers" --retry 3 -X DELETE "${cond[@]}" "$(s3_url_for "$bucket" "$key")"
+    # An answer that broke off is a lost answer: ask again (a repeated
+    # DELETE of a deleted object answers 404)
+    (( S3_CURL_RC == 0 )) || S3_STATUS=000
 
-  case "$S3_STATUS" in
-    200 | 204 | 404) return 0 ;;
-    412) return 3 ;;
-    501) return 4 ;;
-    *) die "Failed to delete s3://${bucket}/${key}: $(s3__describe "$body")" ;;
-  esac
+    case "$S3_STATUS" in
+      200 | 204 | 404) return 0 ;;
+      412) return 3 ;;
+      501) return 4 ;;
+      000 | 5??) sleep "$attempt" ;;
+      *) die "Failed to delete s3://${bucket}/${key}: $(s3__describe "$body")" ;;
+    esac
+  done
+  die "Failed to delete s3://${bucket}/${key} after retries: $(s3__describe "$body")"
 }
 
 # Decodes XML character references, both named (&quot;) and numeric (&#34;,
@@ -444,7 +458,10 @@ s3_list() {
     fi
 
     s3__call "$body" "$headers" --retry 3 "${base}?${query}"
-    [[ "$S3_STATUS" == 200 ]] || die "Failed to list s3://${bucket}/${prefix}: $(s3__describe "$body")"
+    [[ "$S3_STATUS" == 200 && "$S3_CURL_RC" == 0 ]] || die \
+      "Failed to list s3://${bucket}/${prefix}: $(s3__describe "$body")"
+    grep -q '</ListBucketResult>' "$body" || die \
+      "Incomplete listing of s3://${bucket}/${prefix}: the response ended early"
 
     tr '<' '\n' < "$body" | awk -F'>' '
       $1 == "Contents" { key = ""; size = ""; etag = ""; inside = 1 }
@@ -478,7 +495,7 @@ s3_mp_begin() {
   : > "$s3_mp_parts_file"
 
   s3__call "$body" "$headers" -X POST -H "x-amz-meta-vb-token: ${s3_mp_token}" "${s3_mp_url}?uploads"
-  [[ "$S3_STATUS" == 200 ]] || die \
+  [[ "$S3_STATUS" == 200 && "$S3_CURL_RC" == 0 ]] || die \
     "Failed to start multipart upload to s3://${s3_mp_bucket}/${s3_mp_key}: $(s3__describe "$body")"
 
   s3_mp_upload_id="$(sed -n 's:.*<UploadId>\([^<]*\)</UploadId>.*:\1:p' "$body" | head -n 1)"
@@ -565,6 +582,8 @@ s3_mp_complete() {
   for attempt in 1 2 3; do
     s3__call "$body" "$headers" -X POST -H 'Content-Type: application/xml' "${cond[@]}" \
       --data-binary "@${xml}" "${s3_mp_url}?uploadId=${s3_mp_upload_id_enc}"
+    # An answer that broke off is a lost answer: retry and check the token
+    (( S3_CURL_RC == 0 )) || S3_STATUS=000
     code="$(s3__error_code "$body")"
 
     if [[ "$S3_STATUS" == 200 && -z "$code" ]] && grep -q '<CompleteMultipartUploadResult' "$body"; then

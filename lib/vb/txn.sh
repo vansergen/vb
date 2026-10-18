@@ -142,9 +142,11 @@ txn_classify() {
 
 txn__only_signature_files() {
   local name
-  while IFS= read -r -d '' name; do
+  local -a names=()
+  vb_collect names nul find "$1" -mindepth 1 -maxdepth 1 -printf '%f\0'
+  for name in "${names[@]}"; do
     [[ "$name" == VB-JOURNAL || "$name" == .VB-JOURNAL.tmp ]] || return 1
-  done < <(find "$1" -mindepth 1 -maxdepth 1 -printf '%f\0')
+  done
 }
 
 # Prints "<name>" for every reserved top-level entry of a volume.
@@ -171,13 +173,17 @@ txn_read_marker() {
 
 # Describes why a volume cannot be used as a restore target or backup source
 # (prints nothing when it holds no reserved entries and no marker).
+# Callers must check its status: it may run in a command substitution, where
+# errexit does not apply.
 txn_describe_reserved() {
   local target="$1" name class
-  while IFS= read -r name; do
+  local -a names=()
+  vb_collect names line txn_reserved_entries "$target"
+  for name in "${names[@]}"; do
     [[ -n "$name" ]] || continue
-    class="$(txn_classify "$target" "$name")"
+    class="$(txn_classify "$target" "$name")" || die "Failed to inspect ${target}/${name}"
     printf '%s: %s\n' "$name" "${class%% *}"
-  done < <(txn_reserved_entries "$target")
+  done
 
   if txn_read_marker "$target"; then
     printf '%s: pending root mtime marker\n' "$TXN_MARKER_XATTR"
@@ -305,10 +311,12 @@ txn_stage_complete() {
   local journal="${target}/${TXN_NAME}"
   local name
 
-  while IFS= read -r name; do
+  local -a reserved=()
+  vb_collect reserved line txn_reserved_entries "${journal}/new"
+  for name in "${reserved[@]}"; do
     [[ -n "$name" ]] || continue
     die "The archive contains the reserved name '${name}' at its root; refusing to restore it"
-  done < <(txn_reserved_entries "${journal}/new")
+  done
 
   date -r "${journal}/new" +%s.%N > "${journal}/root.mtime" || die "Failed to record the root mtime of ${target}"
   tar --create --no-recursion --numeric-owner "${tar_extra_flags[@]}" \
@@ -329,7 +337,7 @@ txn_aside() {
 
   txn_write "$journal" state aside
   vb_test_point "txn_aside" "${target##*/}"
-  mapfile -d '' -t names < <(txn_entries "$target")
+  vb_collect names nul txn_entries "$target"
   for name in "${names[@]}"; do
     txn_mv "${target}/${name}" "${journal}/old/${name}"
     vb_test_point "txn_aside_entry" "${target##*/}"
@@ -345,7 +353,7 @@ txn_swap() {
 
   txn_write "$journal" state swap
   vb_test_point "txn_swap" "${target##*/}"
-  mapfile -d '' -t names < <(find "${journal}/new" -mindepth 1 -maxdepth 1 -printf '%f\0')
+  vb_collect names nul find "${journal}/new" -mindepth 1 -maxdepth 1 -printf '%f\0'
   for name in "${names[@]}"; do
     txn_mv "${journal}/new/${name}" "${target}/${name}"
     vb_test_point "txn_swap_entry" "${target##*/}"
@@ -360,7 +368,7 @@ txn__rb1() {
   local name
   local -a names=()
 
-  mapfile -d '' -t names < <(txn_entries "$target")
+  vb_collect names nul txn_entries "$target"
   for name in "${names[@]}"; do
     txn_mv "${target}/${name}" "${journal}/new/${name}"
     vb_test_point "txn_rb1_entry" "${target##*/}"
@@ -374,7 +382,7 @@ txn__rb2() {
   local name
   local -a names=()
 
-  mapfile -d '' -t names < <(find "${journal}/old" -mindepth 1 -maxdepth 1 -printf '%f\0')
+  vb_collect names nul find "${journal}/old" -mindepth 1 -maxdepth 1 -printf '%f\0'
   for name in "${names[@]}"; do
     txn_mv "${journal}/old/${name}" "${target}/${name}"
     vb_test_point "txn_rb2_entry" "${target##*/}"
@@ -580,20 +588,25 @@ txn_finalize_group() {
 # back to a consistent state. Nothing is changed before the locks of every
 # involved volume are held, and decisions are based on a second scan taken
 # under those locks.
+txn__mounted_volume_names() {
+  find "$volumes_root_real" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
 txn_recover() {
-  local -a names=("$@")
+  local -a names=("$@") entries=()
   local -A involved=()
-  local name path entry class gid participants member
+  local name path entry class gid participants member reserved
 
   if (( ${#names[@]} == 0 )); then
-    mapfile -t names < <(find "$volumes_root_real" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+    vb_collect names line txn__mounted_volume_names
   fi
 
   # 1. Detect, read-only
   for name in "${names[@]}"; do
     is_valid_volume_name "$name" || continue
     path="$(resolve_volume_dir "$name")" || continue
-    if [[ -n "$(txn_describe_reserved "$path")" ]]; then
+    reserved="$(txn_describe_reserved "$path")" || die "Failed to inspect ${path}"
+    if [[ -n "$reserved" ]]; then
       involved[$name]=1
     fi
     if [[ -d "${path}/${TXN_NAME}" ]]; then
@@ -620,10 +633,11 @@ txn_recover() {
   local -A groups=()
   local -A unknown=()
   for name in "${!involved[@]}"; do
-    path="$(resolve_volume_dir "$name")"
-    while IFS= read -r entry; do
+    path="$(resolve_volume_dir "$name")" || die "Volume '${name}' disappeared"
+    vb_collect entries line txn_reserved_entries "$path"
+    for entry in "${entries[@]}"; do
       [[ -n "$entry" ]] || continue
-      class="$(txn_classify "$path" "$entry")"
+      class="$(txn_classify "$path" "$entry")" || die "Failed to inspect ${path}/${entry}"
       case "${class%% *}" in
         journal)
           gid="${class#* }"
@@ -637,7 +651,7 @@ txn_recover() {
           unknown["${path}/${entry}"]="not created by this tool"
           ;;
       esac
-    done < <(txn_reserved_entries "$path")
+    done
   done
 
   if (( ${#unknown[@]} > 0 )); then
@@ -653,15 +667,16 @@ txn_recover() {
 
   # Leftover trash, creation directories and markers
   for name in "${!involved[@]}"; do
-    path="$(resolve_volume_dir "$name")"
-    while IFS= read -r entry; do
+    path="$(resolve_volume_dir "$name")" || die "Volume '${name}' disappeared"
+    vb_collect entries line txn_reserved_entries "$path"
+    for entry in "${entries[@]}"; do
       [[ -n "$entry" ]] || continue
-      class="$(txn_classify "$path" "$entry")"
+      class="$(txn_classify "$path" "$entry")" || die "Failed to inspect ${path}/${entry}"
       case "${class%% *}" in
         trash | creating) txn_cleanup_trash "${path}/${entry}" ;;
         empty) rmdir -- "${path}/${entry}" || die "Failed to delete ${path}/${entry}" ;;
       esac
-    done < <(txn_reserved_entries "$path")
+    done
     txn_sync "$path"
 
     if txn_read_marker "$path" && [[ -n "$txn_marker_value" ]]; then

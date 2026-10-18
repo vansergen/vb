@@ -509,7 +509,9 @@ collect_selected_volumes_for_all_mode() {
     return
   fi
 
-  while IFS= read -r -d '' dir; do
+  local -a dirs=()
+  vb_collect dirs nul find "$VOLUMES_ROOT" -mindepth 1 -maxdepth 1 -type d -print0
+  for dir in "${dirs[@]}"; do
     local vol
     vol="$(basename "$dir")"
 
@@ -519,7 +521,7 @@ collect_selected_volumes_for_all_mode() {
     fi
 
     SELECTED_VOLUMES+=("$vol")
-  done < <(find "$VOLUMES_ROOT" -mindepth 1 -maxdepth 1 -type d -print0)
+  done
 
   (( ${#SELECTED_VOLUMES[@]} > 0 )) || die "No mounted volumes found in ${VOLUMES_ROOT}"
   mapfile -t SELECTED_VOLUMES < <(printf '%s\n' "${SELECTED_VOLUMES[@]}" | sort -u)
@@ -683,7 +685,7 @@ upload_backup_to_s3() {
 # refuse); archiving them would produce an inconsistent or unrestorable backup.
 check_source_has_no_reserved_entries() {
   local reserved
-  reserved="$(txn_describe_reserved "$directory")"
+  reserved="$(txn_describe_reserved "$directory")" || die "Failed to inspect ${directory}"
   [[ -z "$reserved" ]] || die \
     "Volume '$volume' holds reserved entries ($(printf '%s; ' "$reserved")). If a restore was interrupted, run 'restore -X'; otherwise rename them"
 }

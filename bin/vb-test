@@ -533,6 +533,13 @@ t_s3_delete_prefix() {
 #   delete-ignores-if-match
 #                          drop the If-Match header of every DELETE (a provider
 #                          that ignores conditional deletes)
+#   list-paged-fail        list two keys per page and answer 503 to every page
+#                          after the first
+#   list-truncated         cut a listing after its second entry, as a broken
+#                          transfer (HTTP 200, curl exit 18)
+#   get-truncated          cut a downloaded checksum file after the digest, as a
+#                          broken transfer (HTTP 200, curl exit 18)
+# The failure modes touch <dir>/fired when they inject something.
 make_curl_stub() {
   local dir="$1" mode="$2" real_curl
   real_curl="$(command -v curl)"
@@ -545,8 +552,9 @@ mode='$mode'
 state='$dir'
 printf '%s\n' "\$*" >> "\$state/curl.trace"
 
-out="" url="" conditional=0 is_post=0 is_delete=0 has_w=0 prev=""
+out="" url="" conditional=0 is_post=0 is_delete=0 is_head=0 has_w=0 prev=""
 for arg in "\$@"; do
+  [[ "\$arg" == --head ]] && is_head=1
   case "\$prev" in
     -o) out="\$arg" ;;
     -w) has_w=1 ;;
@@ -563,6 +571,45 @@ is_complete=0
 [[ \$is_post == 1 && "\$url" == *"?uploadId="* ]] && is_complete=1
 
 case "\$mode" in
+  list-paged-fail)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      if [[ "\$url" == *"continuation-token="* ]]; then
+        : > "\$state/fired"
+        printf '<Error><Code>ServiceUnavailable</Code></Error>' > "\$out"
+        printf '503'
+        exit 0
+      fi
+      args=()
+      for arg in "\$@"; do
+        [[ "\$arg" == "\$url" ]] && arg="\${url}&max-keys=2"
+        args+=("\$arg")
+      done
+      exec "\$real_curl" "\${args[@]}"
+    fi
+    ;;
+  list-truncated)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      body="\$(cat "\$out")"
+      rest="\${body#*</Contents>}"
+      rest="\${rest#*</Contents>}"
+      if [[ "\$rest" != "\$body" ]]; then
+        : > "\$state/fired"
+        head -c \$(( \${#body} - \${#rest} + 16 )) <<< "\$body" > "\$out"
+      fi
+      printf '%s' "\$code"
+      exit 18
+    fi
+    ;;
+  get-truncated)
+    if (( ! is_head )) && [[ "\$url" == *.sha256 && -n "\$out" ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      : > "\$state/fired"
+      head -c 69 "\$out" > "\$out.cut" && mv "\$out.cut" "\$out"
+      printf '%s' "\$code"
+      exit 18
+    fi
+    ;;
   delete-ignores-if-match)
     if (( is_delete )); then
       args=() header=0
@@ -3520,6 +3567,91 @@ test_invalid_commit_decision_stops_recovery() {
   assert_group_state new || return 1
 }
 
+# Backups of alpha and beta in S3, a curl stub in <mode> that lets the
+# complete pair of alpha through and fails afterwards: restore -a and -l must
+# refuse, and the volumes stay as they are.
+#   check_incomplete_listing_is_refused <case> <mode>
+check_incomplete_listing_is_refused() {
+  local name="$1" mode="$2" ts="20250101_903000" prefix stub
+  require_s3_or_skip || return $?
+  setup_case "$name"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  prefix="$(t_s3_prefix "$name")"
+  run_backup -a -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" "$mode"
+  expect_injected_failure "$stub/fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -a -b "$TEST_S3_BUCKET" -f "$prefix" -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+
+  rm -f "$stub/fired"
+  expect_injected_failure "$stub/fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -l -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+}
+
+test_s3_failed_listing_page_fails_optional() {
+  check_incomplete_listing_is_refused "s3_failed_listing_page_fails_optional" list-paged-fail
+}
+
+test_s3_truncated_listing_fails_optional() {
+  check_incomplete_listing_is_refused "s3_truncated_listing_fails_optional" list-truncated
+}
+
+test_s3_truncated_checksum_fails_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_truncated_checksum_fails_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_903100" prefix stub="$CASE_ROOT/stub"
+  prefix="$(t_s3_prefix truncated-checksum)"
+  run_backup -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  replace_volume_with_marker "alpha" "old"
+  make_curl_stub "$stub" get-truncated
+
+  # The digest arrives in full, but the transfer broke off
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- \
+    -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar" -t alpha -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+}
+
+test_failed_directory_scan_keeps_the_journal() {
+  setup_case "failed_directory_scan_keeps_the_journal"
+  setup_two_volume_transaction || return 1
+  restore_crashing_at txn_swap_entry:beta -- -a -T "$TXN_TS" -C || return 1
+
+  # Listing journal/old fails while the control file exists
+  local stub="$CASE_ROOT/stub" real_find
+  real_find="$(command -v find)"
+  write_wrapper "$stub" find <<STUB
+#!/usr/bin/env bash
+if [[ -e '$CASE_ROOT/find.fail' && "\$1" == */.vb-restore/old ]]; then
+  : > '$CASE_ROOT/find.fired'
+  printf 'find: %s: Input/output error\n' "\$1" >&2
+  exit 1
+fi
+exec '$real_find' "\$@"
+STUB
+  : > "$CASE_ROOT/find.fail"
+
+  expect_injected_failure "$CASE_ROOT/find.fired" run_restore_with_env PATH="$stub:$PATH" -- -X || return 1
+  [[ -d "$TEST_VOLUMES_ROOT/beta/.vb-restore/old" ]] || {
+    log "BUG: the journal of beta is gone although its old data could not be listed"
+    return 1
+  }
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/.vb-restore/old/marker.txt" "old-beta" || return 1
+
+  rm -f "$CASE_ROOT/find.fail"
+  run_restore -X || return 1
+  assert_group_state old || return 1
+}
+
 # ------------------------------------------------------------------------------
 # Test runner
 # ------------------------------------------------------------------------------
@@ -3663,6 +3795,7 @@ run_test "failed rollback keeps the journal"           test_failed_rollback_keep
 run_test "xattr marker fallback and failure"           test_xattr_marker_fallback_and_failure
 run_test "signal after commit does not roll back"      test_signal_after_commit_decision_does_not_roll_back
 run_test "invalid commit decision stops recovery"      test_invalid_commit_decision_stops_recovery
+run_test "failed directory scan keeps the journal"     test_failed_directory_scan_keeps_the_journal
 run_test "s3 backup fails closed on HEAD error"        test_s3_backup_fails_closed_on_head_error
 run_test "s3 rejects unsafe keys"                      test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                     test_s3_roundtrip_optional
@@ -3682,6 +3815,9 @@ run_test "s3 rotation (optional)"                      test_s3_rotation_optional
 run_test "s3 rotation keeps replaced objects"          test_s3_rotation_keeps_replaced_objects_optional
 run_test "s3 rotation needs conditional delete"        test_s3_rotation_needs_conditional_delete_optional
 run_test "s3 rotation on versioned bucket"             test_s3_rotation_on_versioned_bucket_optional
+run_test "s3 failed listing page fails"                test_s3_failed_listing_page_fails_optional
+run_test "s3 truncated listing fails"                  test_s3_truncated_listing_fails_optional
+run_test "s3 truncated checksum fails"                 test_s3_truncated_checksum_fails_optional
 
 # ------------------------------------------------------------------------------
 # Summary

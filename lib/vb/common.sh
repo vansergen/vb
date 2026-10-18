@@ -127,6 +127,37 @@ resolve_volume_dir() {
 }
 
 # ------------------------------------------------------------------------------
+# Lists from commands
+# ------------------------------------------------------------------------------
+
+# Stores the output of a command in an array. The command runs in the current
+# shell (not in a process substitution), so `die` inside it ends the script,
+# and any other failure is fatal too: a partial list is never used.
+#   vb_collect <array> <nul|line> <command> [args...]
+vb_collect() {
+  local -n vb__collect_into="$1"
+  local mode="$2" file rc=0
+  shift 2
+
+  if [[ -z "$work_dir" && "${BASHPID:-$$}" == "$$" ]]; then
+    ensure_work_dir
+  fi
+  file="$(mktemp "${work_dir:-${TMPDIR:-/tmp}}/list.XXXXXX")" || die "Failed to create a temporary file"
+  "$@" > "$file" || rc=$?
+  if (( rc != 0 )); then
+    rm -f -- "$file"
+    die "Failed to list ($*): exit ${rc}"
+  fi
+
+  if [[ "$mode" == nul ]]; then
+    mapfile -d '' -t vb__collect_into < "$file"
+  else
+    mapfile -t vb__collect_into < "$file"
+  fi
+  rm -f -- "$file"
+}
+
+# ------------------------------------------------------------------------------
 # Archive helpers
 # ------------------------------------------------------------------------------
 

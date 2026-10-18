@@ -114,47 +114,59 @@ catalog__local_pair_problem() {
   fi
 }
 
+catalog__local_archives() {
+  find "$1" -maxdepth 1 -type f \( -name '*.tar' -o -name '*.tar.gz' -o -name '*.tar.zst' \
+    -o -name '*.tar.gpg' -o -name '*.tar.gz.gpg' -o -name '*.tar.zst.gpg' \) -print0
+}
+
 catalog_scan_local() {
-  local dir="${1%/}" path name problem status
+  local dir="${1%/}" path name problem status size
+  local -a paths=()
   catalog_reset
   [[ -d "$dir" ]] || die "Backup directory not found: $dir"
 
-  while IFS= read -r -d '' path; do
+  vb_collect paths nul catalog__local_archives "$dir"
+  for path in "${paths[@]}"; do
     name="${path##*/}"
     catalog__valid_name "$name" || continue
     problem="$(catalog__local_pair_problem "${path}.sha256" "$name")"
     status=complete
     [[ -z "$problem" ]] || status=incomplete
-    catalog__add "$name" "$cat_parsed_volume" "$cat_parsed_ts" "$(stat -c %s -- "$path")" "$status" "$problem" \
+    size="$(stat -c %s -- "$path")" || die "Failed to read the size of ${path}"
+    catalog__add "$name" "$cat_parsed_volume" "$cat_parsed_ts" "$size" "$status" "$problem" \
       "$([[ -f "${path}.sha256" ]] && echo 1 || echo 0)" "$path" "" "" "" 0
-  done < <(find "$dir" -maxdepth 1 -type f \( -name '*.tar' -o -name '*.tar.gz' -o -name '*.tar.zst' \
-    -o -name '*.tar.gpg' -o -name '*.tar.gz.gpg' -o -name '*.tar.zst.gpg' \) -print0)
+  done
 
-  while IFS= read -r -d '' path; do
+  vb_collect paths nul find "$dir" -maxdepth 1 -type f -name '*.sha256' -print0
+  for path in "${paths[@]}"; do
     name="${path##*/}"
     name="${name%.sha256}"
     [[ ! -e "${dir}/${name}" ]] || continue
     catalog__valid_name "$name" || continue
     catalog__add "$name" "$cat_parsed_volume" "$cat_parsed_ts" "" orphan "checksum file without its archive" 1 \
       "${dir}/${name}" "" "" "" 0
-  done < <(find "$dir" -maxdepth 1 -type f -name '*.sha256' -print0)
+  done
 }
 
 # Lists an S3 prefix (direct children only).
 #   catalog_scan_s3 <bucket> <prefix> <check-tokens: 0|1>
 catalog_scan_s3() {
   local bucket="$1" prefix="$2" check_tokens="$3"
-  local key size etag name status reason
+  local key size etag name status reason line
+  local -a lines=()
   local -A sizes=() etags=() keys=()
   catalog_reset
 
-  while IFS=$'\t' read -r key size etag; do
+  # The whole listing must succeed before anything is decided from it
+  vb_collect lines line s3_list "$bucket" "$prefix"
+  for line in "${lines[@]}"; do
+    IFS=$'\t' read -r key size etag <<< "$line"
     [[ -n "$key" ]] || continue
     name="${key##*/}"
     sizes[$name]="$size"
     etags[$name]="$etag"
     keys[$name]="$key"
-  done < <(s3_list "$bucket" "$prefix")
+  done
 
   for name in "${!keys[@]}"; do
     if [[ "$name" == *.sha256 ]]; then
