@@ -39,6 +39,10 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+          # Not detected from the repository, whose metadata may lag behind
+          # the LICENSE file of the commit being built
+          labels: |
+            org.opencontainers.image.licenses=MIT
       # https://github.com/marketplace/actions/docker-setup-qemu
       - uses: docker/setup-qemu-action@v4
       # https://github.com/marketplace/actions/docker-setup-buildx

@@ -26,7 +26,7 @@
     "prettier": "prettier -c .",
     "prettier:write": "prettier -c -w ."
   },
-  "license": "AGPL-3.0-only",
+  "license": "MIT",
   "devDependencies": {
     "@binden/commitlint-config": "^3.0.0",
     "@binden/semantic-release-config": "^3.0.4",

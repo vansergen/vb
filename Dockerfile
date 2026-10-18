@@ -17,6 +17,7 @@ RUN apk add --no-cache \
 
 COPY lib/vb/ /usr/local/lib/vb/
 COPY bin/backup bin/restore /usr/local/bin/
+COPY LICENSE /usr/share/licenses/vb/LICENSE
 
 # tini forwards signals to the whole process group (-g), so `docker stop`
 # also reaches the tar/gpg/curl processes of a running backup or restore.

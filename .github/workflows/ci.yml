@@ -108,6 +108,11 @@ jobs:
             restore -h > /dev/null
           '
 
+      - name: Check the license in the runtime image
+        run: |
+          docker run --rm --entrypoint cat vb:ci /usr/share/licenses/vb/LICENSE > "$RUNNER_TEMP/image-LICENSE"
+          cmp "$RUNNER_TEMP/image-LICENSE" LICENSE
+
   release:
     needs: [lint, test, test-s3-compat, test-runner, build]
 
