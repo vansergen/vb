@@ -37,7 +37,7 @@ encrypt=0
 symmetric=0
 upload_to_s3=0
 
-pgp_key="public.gpg"
+declare -a pgp_keys=()
 s3_bucket=""
 s3_folder=""
 s3_prefix=""
@@ -51,7 +51,8 @@ gpg_passphrase="${GPG_PASSPHRASE:-}"
 
 tmp_backup_path=""
 tmp_sidecar_path=""
-recipient_fpr=""
+declare -a public_key_sources=()
+declare -a recipient_fprs=()
 backup_path=""
 s3_url=""
 directory=""
@@ -62,9 +63,10 @@ compressor_name="none"
 
 declare -A pid_to_volume=()
 declare -a running_pids=()
+pipeline_pid=""
+checksum_pid=""
 
 failed=0
-wait_supports_p=0
 
 # ------------------------------------------------------------------------------
 # Usage
@@ -104,7 +106,9 @@ Options:
     -s          Encrypt backup with passphrase (symmetric GPG)
     -b <bucket> Upload backup to S3 bucket
     -f <path>   S3 folder/prefix inside bucket
-    -k <file>   Public key filename inside ${GPG_ROOT} (default: public.gpg)
+    -k <file>   Public key file for -e: absolute path or file inside ${GPG_ROOT}
+                (default: public.gpg). Repeatable: the backup is encrypted to
+                every key of every file
 
 Environment variables:
   BACKUP_ROOT           Local backup directory (default: /backups)
@@ -163,6 +167,26 @@ EOF
 # ------------------------------------------------------------------------------
 
 cleanup() {
+  local pid
+
+  # Children of an "all" backup stop their own pipelines and uploads on TERM
+  for pid in "${running_pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${running_pids[@]}"; do
+    stop_process_tree "$pid" TERM
+  done
+  running_pids=()
+
+  if [[ -n "$pipeline_pid" ]]; then
+    stop_process_tree "$pipeline_pid" TERM
+    pipeline_pid=""
+  fi
+  if [[ -n "$checksum_pid" ]]; then
+    stop_process_tree "$checksum_pid" TERM
+    checksum_pid=""
+  fi
+
   if [[ -n "$tmp_backup_path" && -f "$tmp_backup_path" ]]; then
     rm -f "$tmp_backup_path"
   fi
@@ -174,18 +198,16 @@ cleanup() {
   cleanup_work_dir
 }
 
-terminate_children() {
-  local pid
-  for pid in "${!pid_to_volume[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
+on_signal() {
+  trap '' INT TERM
+  log WARN "Received SIG$1, stopping"
+  exit "$2"
 }
 
 trap cleanup EXIT
-trap 'log WARN "Interrupted"; terminate_children; wait || true; exit 130' INT
-trap 'log WARN "Terminated"; terminate_children; wait || true; exit 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'report_unexpected_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -226,29 +248,64 @@ construct_s3_url() {
   s3_url="s3://${s3_bucket}/${s3_key}"
 }
 
-prepare_asymmetric_gpg() {
-  local key_source
+# Public keys for -e: the keys in GPG_PUBLIC_KEY plus every -k file; without
+# either, ${GPG_ROOT}/public.gpg.
+collect_public_key_sources() {
+  local key
+  public_key_sources=()
 
-  prepare_gpg_home
+  for key in "${pgp_keys[@]}"; do
+    [[ "$key" == /* ]] || key="${GPG_ROOT%/}/${key}"
+    [[ -f "$key" ]] || die "Public key file not found: $key"
+    public_key_sources+=("$key")
+  done
 
   if [[ -n "$gpg_raw_key" ]]; then
-    key_source="${work_dir}/public.key"
-    printf '%s' "$gpg_raw_key" > "$key_source"
-    chmod 600 "$key_source"
-  else
-    key_source="${GPG_ROOT%/}/${pgp_key}"
+    public_key_sources+=(env:GPG_PUBLIC_KEY)
+  elif (( ${#pgp_keys[@]} == 0 )); then
+    key="${GPG_ROOT%/}/public.gpg"
+    [[ -f "$key" ]] || die "Either GPG_PUBLIC_KEY or ${key} must be provided (or pass -k)"
+    public_key_sources+=("$key")
   fi
+}
 
-  [[ -f "$key_source" ]] || die "Public key file not found: $key_source"
+# Imports the public keys and selects every primary key as a recipient. Keys
+# that are expired, revoked or cannot encrypt are refused instead of being
+# skipped, so that no intended recipient silently loses access.
+prepare_asymmetric_gpg() {
+  local source file listing fpr validity caps
+  recipient_fprs=()
 
-  recipient_fpr="$(
-    gpg --batch --with-colons --import-options show-only --import "$key_source" 2>/dev/null \
-      | awk -F: '/^fpr:/ { print $10; exit }'
-  )"
+  prepare_gpg_home
+  collect_public_key_sources
 
-  [[ -n "$recipient_fpr" ]] || die "Unable to extract recipient fingerprint from public key"
+  for source in "${public_key_sources[@]}"; do
+    file="$source"
+    if [[ "$source" == env:GPG_PUBLIC_KEY ]]; then
+      file="${work_dir}/public.key"
+      printf '%s' "$gpg_raw_key" > "$file"
+      chmod 600 "$file"
+    fi
 
-  gpg --batch --import "$key_source" >/dev/null 2>&1 || die "Failed to import public key"
+    listing="$(gpg --batch --with-colons --import-options show-only --import "$file" 2>/dev/null \
+      | awk -F: '
+        $1 == "pub" { want = 1; validity = $2; caps = $12; next }
+        $1 == "fpr" && want { print $10 ":" validity ":" caps; want = 0 }
+        $1 == "sub" { want = 0 }
+      ')" || true
+    [[ -n "$listing" ]] || die "No public key found in ${source}"
+
+    while IFS=: read -r fpr validity caps; do
+      [[ "$validity" != e ]] || die "Public key ${fpr} from ${source} has expired"
+      [[ "$validity" != r ]] || die "Public key ${fpr} from ${source} is revoked"
+      [[ "$caps" == *E* ]] || die "Public key ${fpr} from ${source} has no usable encryption key"
+      recipient_fprs+=("$fpr")
+    done <<< "$listing"
+
+    gpg --batch --import "$file" >/dev/null 2>&1 || die "Failed to import public key from ${source}"
+  done
+
+  log INFO "Recipients: ${recipient_fprs[*]}"
 }
 
 prepare_compressor() {
@@ -282,6 +339,7 @@ prepare_gpg_runtime() {
 # common on live volumes; that is a warning unless -S was given.
 archive_stream() {
   local rc=0
+  vb_test_point "archive_stream" "$volume"
   tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" . || rc=$?
 
   if (( rc == 1 && ! strict_tar )); then
@@ -314,13 +372,18 @@ encrypt_stream() {
       --compress-algo none \
       3<<<"$gpg_passphrase"
   elif (( encrypt )); then
+    local fpr
+    local -a recipients=()
+    for fpr in "${recipient_fprs[@]}"; do
+      recipients+=(--recipient "$fpr")
+    done
     gpg \
       --batch \
       --yes \
       --no-tty \
       --trust-model always \
       --encrypt \
-      --recipient "$recipient_fpr" \
+      "${recipients[@]}" \
       --compress-algo none
   else
     cat
@@ -335,11 +398,13 @@ validate_common_options() {
 
   if (( symmetric )); then
     [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
+    check_passphrase_newline "$gpg_passphrase"
   fi
 
   if (( encrypt )); then
-    [[ -n "$gpg_raw_key" || -f "${GPG_ROOT%/}/${pgp_key}" ]] || die \
-      "Either GPG_PUBLIC_KEY env var or ${GPG_ROOT%/}/${pgp_key} must be provided"
+    collect_public_key_sources
+  elif (( ${#pgp_keys[@]} > 0 )); then
+    log WARN "Option -k is only used with -e; ignoring it"
   fi
 
   if (( upload_to_s3 )); then
@@ -367,8 +432,24 @@ validate_single_mode() {
   directory="$(resolve_volume_dir "$volume")" || die \
     "Refusing volume '$volume': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
   check_source_has_no_reserved_entries
+  check_backup_root_outside_volume
+
+  local mounts
+  mounts="$(mounts_below "$directory")"
+  [[ -z "$mounts" ]] || log WARN \
+    "Volume '$volume' contains other mount points ($(printf '%s ' "$mounts")); their contents are included in the backup, but a restore refuses targets with mount points"
 
   validate_common_options
+}
+
+# The archive is written to BACKUP_ROOT while the volume is read, so a
+# BACKUP_ROOT inside the volume would end up in its own backup.
+check_backup_root_outside_volume() {
+  (( ! upload_to_s3 )) || return 0
+  local real_root
+  real_root="$(realpath -m -- "$backup_root")"
+  [[ "$real_root" != "$directory" && "$real_root" != "$directory"/* ]] || die \
+    "The backup directory ${backup_root} is inside volume '$volume'; the backup would contain itself. Use another directory (-d)"
 }
 
 collect_selected_volumes_for_all_mode() {
@@ -425,23 +506,10 @@ build_child_args() {
     fi
   fi
 
-  if (( encrypt )) && [[ -n "$pgp_key" ]]; then
-    CHILD_ARGS+=(-k "$pgp_key")
-  fi
-}
-
-remove_running_pid() {
-  local pid_to_remove="$1"
-  local pid
-  local new_running=()
-
-  for pid in "${running_pids[@]}"; do
-    if [[ "$pid" != "$pid_to_remove" ]]; then
-      new_running+=("$pid")
-    fi
+  local key
+  for key in "${pgp_keys[@]}"; do
+    CHILD_ARGS+=(-k "$key")
   done
-
-  running_pids=("${new_running[@]}")
 }
 
 launch_child_backup() {
@@ -458,41 +526,33 @@ launch_child_backup() {
   log INFO "Launched backup: $vol (pid=$pid)"
 }
 
-reap_one_child() {
-  local pid=""
-  local vol=""
-  local status=0
+# Waits until at least one running child has finished and records its result.
+reap_children() {
+  local i pid vol
+  local -a running=()
 
-  if (( wait_supports_p )); then
-    if wait -n -p pid; then
-      status=0
+  vb_wait_any "${running_pids[@]}"
+  for i in "${!vb_done_pids[@]}"; do
+    pid="${vb_done_pids[i]}"
+    vol="${pid_to_volume[$pid]:-unknown}"
+    unset 'pid_to_volume[$pid]'
+    if (( vb_done_status[i] == 0 )); then
+      log INFO "Backup completed: $vol"
     else
-      status=$?
+      log ERROR "Backup failed: $vol"
+      failed=1
     fi
-  else
-    pid="${running_pids[0]}"
-    if wait "$pid"; then
-      status=0
-    else
-      status=$?
-    fi
-  fi
+  done
 
-  vol="${pid_to_volume[$pid]:-unknown}"
-  remove_running_pid "$pid"
-  unset 'pid_to_volume[$pid]'
-
-  if (( status == 0 )); then
-    log INFO "Backup completed: $vol"
-  else
-    log ERROR "Backup failed: $vol"
-    failed=1
-  fi
+  for pid in "${running_pids[@]}"; do
+    [[ " ${vb_done_pids[*]} " == *" ${pid} "* ]] || running+=("$pid")
+  done
+  running_pids=("${running[@]}")
 }
 
 wait_for_all_children() {
   while (( ${#running_pids[@]} > 0 )); do
-    reap_one_child
+    reap_children
   done
 }
 
@@ -512,7 +572,7 @@ check_s3_destination_is_free() {
 # when every stage of the pipeline succeeded; otherwise the upload is aborted.
 # The checksum sidecar is published last and marks the backup as complete.
 upload_backup_to_s3() {
-  local token sha_fifo sha_out sha_pid digest stream_ok=1 rc=0
+  local token sha_fifo sha_out digest stream_ok=1 rc=0
 
   ensure_work_dir
   token="$(random_hex 16)"
@@ -520,15 +580,18 @@ upload_backup_to_s3() {
   sha_out="${work_dir}/sha.out"
   mkfifo "$sha_fifo"
 
-  sha256sum < "$sha_fifo" > "$sha_out" &
-  sha_pid=$!
-
   s3_mp_begin "$s3_bucket" "$s3_key" "$token"
 
-  if ! archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" | s3_mp_upload_parts; then
-    stream_ok=0
-  fi
-  wait "$sha_pid" || stream_ok=0
+  sha256sum < "$sha_fifo" > "$sha_out" &
+  checksum_pid=$!
+
+  # In the background, so that signals are handled while it runs
+  (archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" | s3_mp_upload_parts) &
+  pipeline_pid=$!
+  wait "$pipeline_pid" || stream_ok=0
+  pipeline_pid=""
+  wait "$checksum_pid" || stream_ok=0
+  checksum_pid=""
 
   if (( ! stream_ok )); then
     s3_mp_abort
@@ -578,7 +641,7 @@ check_local_destination_is_free() {
 # the renames cannot interleave with another backup. The sidecar is renamed
 # last and marks the backup as complete.
 publish_local_backup() {
-  local sha_fifo sha_out sha_pid digest lock_fd stream_ok=1
+  local sha_fifo sha_out digest lock_fd stream_ok=1
 
   mkdir -p "$backup_root"
   check_local_destination_is_free
@@ -590,12 +653,15 @@ publish_local_backup() {
   mkfifo "$sha_fifo"
 
   sha256sum < "$sha_fifo" > "$sha_out" &
-  sha_pid=$!
+  checksum_pid=$!
 
-  if ! archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" > "$tmp_backup_path"; then
-    stream_ok=0
-  fi
-  wait "$sha_pid" || stream_ok=0
+  # In the background, so that signals are handled while it runs
+  (archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" > "$tmp_backup_path") &
+  pipeline_pid=$!
+  wait "$pipeline_pid" || stream_ok=0
+  pipeline_pid=""
+  wait "$checksum_pid" || stream_ok=0
+  checksum_pid=""
   (( stream_ok )) || die "Backup stream failed; nothing was published"
 
   digest="$(awk '{ print $1 }' "$sha_out")"
@@ -610,7 +676,7 @@ publish_local_backup() {
   flock -x -w "${VB_LOCK_TIMEOUT:-300}" "$lock_fd" || die "Timed out waiting for the lock on ${backup_root}"
 
   check_local_destination_is_free
-  vb_test_point "local_publish"
+  vb_test_point "local_publish" "$volume"
   mv -T -- "$tmp_backup_path" "$backup_path"
   tmp_backup_path=""
   mv -T -- "$tmp_sidecar_path" "${backup_path}.sha256"
@@ -664,6 +730,9 @@ run_single_backup() {
     if (( upload_to_s3 )); then
       check_s3_destination_is_free
     fi
+    if (( encrypt )); then
+      prepare_asymmetric_gpg
+    fi
     log INFO "Dry-run: no changes made"
     return 0
   fi
@@ -696,10 +765,6 @@ run_all_backups() {
   validate_common_options
   collect_selected_volumes_for_all_mode
   build_child_args
-
-  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
-    wait_supports_p=1
-  fi
 
   log INFO "Found ${#SELECTED_VOLUMES[@]} volume(s) to back up"
   log INFO "Backup timestamp: $backup_timestamp"
@@ -736,7 +801,7 @@ run_all_backups() {
 
   while IFS= read -r vol; do
     while (( ${#running_pids[@]} >= jobs )); do
-      reap_one_child
+      reap_children
     done
 
     launch_child_backup "$vol"
@@ -766,7 +831,7 @@ while getopts ':ad:T:j:ceshb:f:k:v:nS' flag; do
       s3_bucket="$OPTARG"
       ;;
     f) s3_folder="$OPTARG" ;;
-    k) pgp_key="$OPTARG" ;;
+    k) pgp_keys+=("$OPTARG") ;;
     v)
       validate_volume_name "$OPTARG"
       requested_volumes+=("$OPTARG")

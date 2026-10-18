@@ -35,7 +35,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Back up all volumes from `/volumes`
 - Save archives locally or upload to S3
 - Compress with `pigz` / `gzip`
-- Encrypt with GPG (symmetric passphrase or asymmetric public key)
+- Encrypt with GPG (symmetric passphrase, or asymmetric to one or more public keys)
 - Run backups for multiple volumes in parallel
 - Assign a shared timestamp to a group of backups
 - Write a SHA256 checksum alongside every archive (local and S3)
@@ -208,7 +208,7 @@ The key file must be present at `./gpg/public.asc` (or another path specified wi
 | `-s`          | Symmetric GPG encryption (passphrase)                                     |
 | `-b <bucket>` | Upload to S3 bucket                                                       |
 | `-f <path>`   | Folder / prefix inside the S3 bucket                                      |
-| `-k <file>`   | Public key file inside `/gpg` (default: `public.gpg`)                     |
+| `-k <file>`   | Public key file: absolute path or file inside `/gpg` (repeatable)         |
 | `-n`          | Dry run: validate and print what would be done without creating any files |
 | `-S`          | Strict: fail when files change while they are archived (default: warning) |
 | `-h`          | Show help                                                                 |
@@ -432,7 +432,7 @@ docker run --rm \
 | Variable           | Description                                               |
 | ------------------ | --------------------------------------------------------- |
 | `BACKUP_TIMESTAMP` | Override the backup timestamp (format: `YYYYMMDD_HHMMSS`) |
-| `GPG_PUBLIC_KEY`   | Public key content for asymmetric encryption              |
+| `GPG_PUBLIC_KEY`   | Public key(s) for asymmetric encryption                   |
 | `GPG_PASSPHRASE`   | Passphrase for symmetric encryption                       |
 
 ### For restore
@@ -528,6 +528,14 @@ docker run --rm \
 ```
 
 `./gpg/public.asc` must contain the GPG public key.
+
+The backup is encrypted to **every** public key it is given, so any of the matching private keys can restore it — for example, an operator key and an offline recovery key:
+
+```bash
+docker run --rm ... ghcr.io/vansergen/vb backup -v postgres_data -c -e -k operator.asc -k recovery.asc
+```
+
+Keys come from every `-k` file (absolute paths or files inside `/gpg`), every key inside one file, and `GPG_PUBLIC_KEY`. Without `-k` and `GPG_PUBLIC_KEY`, `/gpg/public.gpg` is used. A key that is expired, revoked, or cannot encrypt is refused rather than skipped, and a dry run (`-n`) checks the keys too.
 
 **Restore** — private key is required:
 
@@ -990,6 +998,18 @@ A file with that name already exists in `BACKUP_ROOT`. Use a different timestamp
 
 A `.sha256` file with the name of the new backup exists, but its archive does not (for example, left behind by version 1 or created by hand). The backup refuses to publish next to it, so that a checksum is never attributed to the wrong archive. Inspect and remove it, or use another timestamp.
 
+### `The backup directory … is inside volume …`
+
+`BACKUP_ROOT` (or `-d`) points into the volume that is being backed up, so the archive would contain itself. Mount the backup directory somewhere outside that volume.
+
+### `Backup file … is stored inside the target volume`
+
+A restore replaces the entire target volume, so an archive stored inside it would be deleted together with the old data. Move the archive (and its `.sha256` file) out of the volume first.
+
+### `contains other mount points` (backup warning)
+
+`tar` also archives the contents of mounts nested inside the volume. That backup works, but a restore refuses a target volume that contains mount points, so unmount them before restoring.
+
 ### `Target volume is not empty`
 
 The target volume already contains data. Add `-C` to clear it before restoring.
@@ -1005,6 +1025,14 @@ The provider answered `501` to `If-None-Match: *`. Nothing was published. If you
 ### `Publication incomplete`
 
 The archive was uploaded, but another object already occupied its `.sha256` name. The archive is kept, but counts as incomplete: restore refuses it unless its checksum matches. Inspect both objects before reusing the timestamp.
+
+### `GPG did not confirm the decryption`
+
+GPG produced output, but did not report a successful decryption. The `.gpg` file is not actually encrypted (for example, a bare OpenPGP literal packet that anyone can create) or was tampered with, so it is refused.
+
+### `has no usable encryption key` / `has expired` / `is revoked`
+
+One of the public keys given for `-e` cannot be used to encrypt. Remove it or replace it with a current key: the backup refuses rather than silently leaving out a recipient.
 
 ### `GPG_PASSPHRASE environment variable is not set`
 

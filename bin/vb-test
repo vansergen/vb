@@ -375,24 +375,27 @@ replace_volume_with_marker() {
 # GPG helpers
 # ------------------------------------------------------------------------------
 
+# Writes <prefix>public.asc and <prefix>private.asc to TEST_GPG_ROOT
 generate_gpg_keypair_files() {
   command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
 
-  local keyhome="$CASE_ROOT/keygen-gnupg"
-  mkdir -p "$keyhome"
+  local prefix="${1:-}"
+  # Short path: the agent socket path must fit in 108 bytes
+  local keyhome
+  keyhome="$(mktemp -d "$TEST_ROOT/kg.XXXXXX")"
   chmod 700 "$keyhome"
   printf 'allow-loopback-pinentry\n' > "$keyhome/gpg-agent.conf"
 
   GNUPGHOME="$keyhome" gpgconf --launch gpg-agent >/dev/null 2>&1 || true
 
-  cat > "$CASE_ROOT/gpg-batch.conf" <<'EOF'
+  cat > "$CASE_ROOT/gpg-batch.conf" <<EOF
 %no-protection
 %transient-key
 Key-Type: RSA
 Key-Length: 2048
 Subkey-Type: RSA
 Subkey-Length: 2048
-Name-Real: Backup Test
+Name-Real: Backup Test ${prefix}
 Name-Email: backup-test@example.invalid
 Expire-Date: 0
 %commit
@@ -404,8 +407,8 @@ EOF
     return 1
   }
 
-  GNUPGHOME="$keyhome" gpg --armor --export > "$TEST_GPG_ROOT/public.asc" || return 1
-  GNUPGHOME="$keyhome" gpg --armor --export-secret-keys > "$TEST_GPG_ROOT/private.asc" || return 1
+  GNUPGHOME="$keyhome" gpg --armor --export > "$TEST_GPG_ROOT/${prefix}public.asc" || return 1
+  GNUPGHOME="$keyhome" gpg --armor --export-secret-keys > "$TEST_GPG_ROOT/${prefix}private.asc" || return 1
 
   GNUPGHOME="$keyhome" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
 }
@@ -641,6 +644,85 @@ resume_and_wait() {
   wait "$PAUSED_PID" || rc=$?
   cat "$CASE_ROOT/paused.log" >&2 || true
   return "$rc"
+}
+
+# Runs restore in the background, pausing at a test point:
+#   start_paused_restore <point> [env assignments...] -- <restore args...>
+start_paused_restore() {
+  local point="$1"
+  shift
+  PAUSE_DIR="$CASE_ROOT/pause"
+  mkdir -p "$PAUSE_DIR"
+
+  run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_PAUSE_AT="$point" VB_TEST_PAUSE_DIR="$PAUSE_DIR" "$@" \
+    > "$CASE_ROOT/paused.log" 2>&1 &
+  PAUSED_PID=$!
+}
+
+# Prints the PID of the backup or restore script started in the background
+paused_script_pid() {
+  local pid cmdline
+  while IFS= read -r pid; do
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || continue
+    if [[ "$cmdline" == *" $BACKUP_BIN "* || "$cmdline" == *" $RESTORE_BIN "* ]]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done < <(process_tree_pids "$PAUSED_PID")
+  log "Could not find the script process below $PAUSED_PID"
+  return 1
+}
+
+# Sends a signal to the paused script (only to it, not to its children) and
+# checks that it exits with <expected rc> and leaves no process behind.
+#   signal_paused_script <signal> <expected rc>
+signal_paused_script() {
+  local signal="$1" expected="$2" pid rc=0 i survivors=""
+  pid="$(paused_script_pid)" || return 1
+  kill "-$signal" "$pid"
+
+  for (( i = 0; i < 600; i++ )); do
+    kill -0 "$PAUSED_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$PAUSED_PID" 2>/dev/null; then
+    log "BUG: the script did not exit within 60 seconds after SIG$signal"
+    # shellcheck disable=SC2046 # one PID per word
+    kill -KILL $(process_tree_pids "$PAUSED_PID") 2>/dev/null || true
+    wait "$PAUSED_PID" 2>/dev/null || true
+    return 1
+  fi
+  wait "$PAUSED_PID" || rc=$?
+  (( rc == expected )) || {
+    log "Expected exit $expected after SIG$signal, got $rc"
+    cat "$CASE_ROOT/paused.log" >&2 || true
+    return 1
+  }
+
+  # Every process of the run inherited VB_TEST_PAUSE_DIR
+  for (( i = 0; i < 50; i++ )); do
+    survivors="$(processes_with_env "VB_TEST_PAUSE_DIR=$PAUSE_DIR")"
+    [[ -n "$survivors" ]] || return 0
+    sleep 0.1
+  done
+  log "Processes survived SIG$signal:"
+  for pid in $survivors; do
+    log "  $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  done
+  return 1
+}
+
+# Lists processes whose environment contains <text>
+processes_with_env() {
+  local text="$1" environ pid
+  for environ in /proc/[0-9]*/environ; do
+    pid="${environ#/proc/}"
+    pid="${pid%/environ}"
+    [[ "$pid" != "$$" && "$pid" != "$BASHPID" ]] || continue
+    if grep -qaF -- "$text" "$environ" 2>/dev/null; then
+      printf '%s\n' "$pid"
+    fi
+  done
 }
 
 # ------------------------------------------------------------------------------
@@ -2354,6 +2436,290 @@ test_restore_requires_flock() {
   assert_no_reserved_entries alpha || return 1
 }
 
+test_backup_stops_on_signal() {
+  setup_case "backup_stops_on_signal"
+  make_volume_content "alpha"
+
+  start_paused_backup archive_stream:alpha -- -v alpha -T 20250101_800000 -c
+  wait_for_point archive_stream:alpha || return 1
+  signal_paused_script TERM 143 || return 1
+
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1 ! -name .vb.lock)" ]] || {
+    log "BUG: an interrupted backup left files behind: $(ls -A "$TEST_BACKUP_ROOT")"
+    return 1
+  }
+}
+
+test_backup_all_stops_on_signal() {
+  setup_case "backup_all_stops_on_signal"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  start_paused_backup archive_stream:alpha,archive_stream:beta -- -a -j 2 -T 20250101_800100
+  wait_for_point archive_stream:alpha || return 1
+  wait_for_point archive_stream:beta || return 1
+  # Not INT: background jobs of a non-interactive shell ignore SIGINT, and a
+  # signal ignored at startup cannot be trapped
+  signal_paused_script TERM 143 || return 1
+
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1 ! -name .vb.lock)" ]] || {
+    log "BUG: an interrupted backup left files behind: $(ls -A "$TEST_BACKUP_ROOT")"
+    return 1
+  }
+}
+
+test_backup_all_does_not_wait_for_the_first_child() {
+  setup_case "backup_all_does_not_wait_for_the_first_child"
+  local vol
+  for vol in alpha beta gamma; do
+    make_volume_content "$vol"
+  done
+  local ts="20250101_800200"
+
+  # alpha is stuck; beta finishes, so gamma must start without waiting for alpha
+  start_paused_backup archive_stream:alpha -- -a -j 2 -T "$ts"
+  wait_for_point archive_stream:alpha || return 1
+
+  local i
+  for (( i = 0; i < 300; i++ )); do
+    [[ -e "$TEST_BACKUP_ROOT/gamma_${ts}.tar.sha256" ]] && break
+    sleep 0.1
+  done
+  [[ -e "$TEST_BACKUP_ROOT/gamma_${ts}.tar.sha256" ]] || {
+    log "BUG: the third backup did not start while the first one was still running"
+    resume_and_wait archive_stream:alpha 2>/dev/null || true
+    return 1
+  }
+
+  resume_and_wait archive_stream:alpha 2>/dev/null || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256" || return 1
+}
+
+test_s3_backup_stops_on_signal_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_backup_stops_on_signal_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_800300" prefix key
+  prefix="$(t_s3_prefix signal)"
+  key="${prefix}/alpha_${ts}.tar"
+
+  start_paused_backup archive_stream:alpha -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point archive_stream:alpha || return 1
+  [[ "$(t_s3_pending_uploads "$key")" == 1 ]] || {
+    log "Expected one multipart upload in progress"
+    return 1
+  }
+  signal_paused_script TERM 143 || return 1
+
+  [[ "$(t_s3_head "$key")" == 404 ]] || return 1
+  [[ "$(t_s3_pending_uploads "$key")" == 0 ]] || {
+    log "BUG: the interrupted multipart upload was not aborted"
+    return 1
+  }
+}
+
+test_restore_stops_on_signal() {
+  setup_case "restore_stops_on_signal"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+  local ts="20250101_800400"
+  run_backup -a -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # Single restore, interrupted while streaming
+  start_paused_restore restore_stream:alpha -- -i "alpha_${ts}.tar" -t alpha -C
+  wait_for_point restore_stream:alpha || return 1
+  signal_paused_script TERM 143 || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # Restore of all volumes, interrupted while both are being staged
+  rm -rf "$PAUSE_DIR"
+  start_paused_restore restore_stream:alpha,restore_stream:beta -- -a -T "$ts" -C -j 2
+  wait_for_point restore_stream:alpha || return 1
+  wait_for_point restore_stream:beta || return 1
+  signal_paused_script TERM 143 || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+}
+
+test_backup_encrypts_to_every_recipient() {
+  setup_case "backup_encrypts_to_every_recipient"
+  generate_gpg_keypair_files first || return $?
+  generate_gpg_keypair_files second || return $?
+  make_volume_content "alpha"
+
+  # One file with two keys
+  cat "$TEST_GPG_ROOT/firstpublic.asc" "$TEST_GPG_ROOT/secondpublic.asc" > "$TEST_GPG_ROOT/both.asc"
+  run_backup -v alpha -T 20250101_800500 -e -k both.asc || return 1
+
+  # Two -k options, one of them an absolute path outside GPG_ROOT
+  mkdir -p "$CASE_ROOT/elsewhere"
+  mv "$TEST_GPG_ROOT/secondpublic.asc" "$CASE_ROOT/elsewhere/"
+  run_backup -v alpha -T 20250101_800501 -e -k firstpublic.asc -k "$CASE_ROOT/elsewhere/secondpublic.asc" || return 1
+
+  local ts key
+  for ts in 20250101_800500 20250101_800501; do
+    for key in first second; do
+      prepare_target_volume "restore_${key}_${ts}"
+      run_restore -i "alpha_${ts}.tar.gpg" -t "restore_${key}_${ts}" -k "${key}private.asc" || {
+        log "Backup $ts cannot be decrypted with the $key key"
+        return 1
+      }
+      assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/restore_${key}_${ts}" || return 1
+    done
+  done
+}
+
+test_backup_dry_run_validates_public_key() {
+  setup_case "backup_dry_run_validates_public_key"
+  generate_gpg_keypair_files || return $?
+  make_volume_content "alpha"
+
+  printf 'not a key\n' > "$TEST_GPG_ROOT/garbage.asc"
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k garbage.asc -n || return 1
+
+  # A key that can only sign
+  local home
+  home="$(mktemp -d "$TEST_ROOT/kg.XXXXXX")"
+  printf '%%no-protection\n%%transient-key\nKey-Type: eddsa\nKey-Curve: ed25519\nKey-Usage: sign\nName-Real: Sign Only\nExpire-Date: 0\n%%commit\n' \
+    > "$CASE_ROOT/sign-only.conf"
+  GNUPGHOME="$home" gpg --batch --gen-key "$CASE_ROOT/sign-only.conf" >/dev/null 2>&1 || return 1
+  GNUPGHOME="$home" gpg --armor --export > "$TEST_GPG_ROOT/sign-only.asc" || return 1
+  GNUPGHOME="$home" gpgconf --kill all >/dev/null 2>&1 || true
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k sign-only.asc -n || return 1
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k public.asc -k sign-only.asc || return 1
+  expect_rejected run_backup -v alpha -T 20250101_800600 -e -k missing.asc -n || return 1
+  run_backup -v alpha -T 20250101_800600 -e -k public.asc -n || return 1
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -mindepth 1)" ]] || return 1
+}
+
+test_restore_rejects_unencrypted_gpg_archive() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "restore_rejects_unencrypted_gpg_archive"
+  make_volume_content "alpha"
+  local ts="20250101_800700"
+  run_backup -v alpha -T "$ts" || return 1
+
+  # A bare OpenPGP literal packet: gpg --decrypt outputs it without a key
+  local home="$CASE_ROOT/store-gnupg"
+  local fake="$TEST_BACKUP_ROOT/alpha_20250101_800701.tar.gpg"
+  mkdir -p "$home"
+  chmod 700 "$home"
+  GNUPGHOME="$home" gpg --batch --store --output "$fake" "$TEST_BACKUP_ROOT/alpha_${ts}.tar" 2>/dev/null || return 1
+  printf '%s  %s\n' "$(sha256sum "$fake" | awk '{ print $1 }')" "${fake##*/}" > "${fake}.sha256"
+
+  replace_volume_with_marker "alpha" "old"
+  expect_rejected run_restore_with_env GPG_PASSPHRASE=anything -- -i "${fake##*/}" -t alpha -s -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+}
+
+test_passphrase_with_newline_warns() {
+  command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
+  setup_case "passphrase_with_newline_warns"
+  make_volume_content "alpha"
+  local ts="20250101_800800"
+
+  run_backup_with_env GPG_PASSPHRASE=$'first\nsecond' -- -v alpha -T "$ts" -s 2> "$CASE_ROOT/backup.log" || return 1
+  grep -q 'contains a newline' "$CASE_ROOT/backup.log" || {
+    log "BUG: no warning about the newline in the passphrase"
+    return 1
+  }
+
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env GPG_PASSPHRASE=$'first\nsecond' -- -i "alpha_${ts}.tar.gpg" -t alpha_restore -s 2>/dev/null || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_backup_refuses_backup_root_inside_volume() {
+  setup_case "backup_refuses_backup_root_inside_volume"
+  make_volume_content "alpha"
+
+  expect_rejected run_backup_with_env BACKUP_ROOT="$TEST_VOLUMES_ROOT/alpha/backups" -- -v alpha -T 20250101_800900 || return 1
+  expect_rejected run_backup -v alpha -T 20250101_800900 -d "$TEST_VOLUMES_ROOT/alpha" || return 1
+  [[ -z "$(find "$TEST_VOLUMES_ROOT/alpha" -name '*.tar*')" && ! -e "$TEST_VOLUMES_ROOT/alpha/backups" ]] || {
+    log "BUG: a backup was written into the volume it archives"
+    return 1
+  }
+}
+
+test_restore_refuses_source_inside_target() {
+  setup_case "restore_refuses_source_inside_target"
+  make_volume_content "alpha"
+  local ts="20250101_801000"
+  run_backup -v alpha -T "$ts" || return 1
+
+  cp "$TEST_BACKUP_ROOT/alpha_${ts}.tar" "$TEST_BACKUP_ROOT/alpha_${ts}.tar.sha256" "$TEST_VOLUMES_ROOT/alpha/"
+  expect_rejected run_restore -i "$TEST_VOLUMES_ROOT/alpha/alpha_${ts}.tar" -t alpha -C || return 1
+  assert_file_exists "$TEST_VOLUMES_ROOT/alpha/alpha_${ts}.tar" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # Same when the whole backup directory lives in a target volume
+  expect_rejected run_restore -a -d "$TEST_VOLUMES_ROOT/alpha" -C || return 1
+  assert_file_exists "$TEST_VOLUMES_ROOT/alpha/alpha_${ts}.tar" || return 1
+}
+
+test_backup_warns_about_nested_mounts() {
+  setup_case "backup_warns_about_nested_mounts"
+  make_volume_content "alpha"
+
+  local real_alpha fake="$CASE_ROOT/mountinfo"
+  real_alpha="$(cd "$TEST_VOLUMES_ROOT/alpha" && pwd -P)"
+  { cat /proc/self/mountinfo; printf '9999 1 0:99 / %s/subdir rw - tmpfs tmpfs rw\n' "$real_alpha"; } > "$fake"
+
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$fake" -- -v alpha -T 20250101_801100 2> "$CASE_ROOT/backup.log" || return 1
+  grep -q 'contains other mount points' "$CASE_ROOT/backup.log" || {
+    log "BUG: no warning about the mount point inside the volume"
+    return 1
+  }
+}
+
+test_restore_does_not_restore_selinux_labels() {
+  tar --version 2>/dev/null | grep -q 'GNU tar' || return "$SKIP_RC"
+  setup_case "restore_does_not_restore_selinux_labels"
+  make_volume_content "alpha"
+  local ts="20250101_801200"
+  run_backup -v alpha -T "$ts" || return 1
+
+  local stub="$CASE_ROOT/stub" real_tar
+  real_tar="$(command -v tar)"
+  mkdir -p "$stub"
+  cat > "$stub/tar" <<STUB
+#!/usr/bin/env bash
+[[ " \$* " == *" --extract "* ]] && printf '%s\n' "\$*" >> '$stub/trace'
+exec '$real_tar' "\$@"
+STUB
+  chmod +x "$stub/tar"
+
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha_restore || return 1
+  [[ -s "$stub/trace" ]] || return 1
+  if grep -v -- '--xattrs-exclude=security.selinux' "$stub/trace" | grep -q .; then
+    log "BUG: an extraction restores SELinux labels:"
+    cat "$stub/trace" >&2
+    return 1
+  fi
+}
+
+test_s3_errors_include_the_curl_message() {
+  setup_case "s3_errors_include_the_curl_message"
+  make_volume_content "alpha"
+
+  local rc=0
+  run_backup_with_env AWS_ENDPOINT_URL=http://127.0.0.1:9 AWS_ACCESS_KEY_ID=key AWS_SECRET_ACCESS_KEY=secret AWS_REGION=us-east-1 -- \
+    -v alpha -T 20250101_801300 -b vb-test 2> "$CASE_ROOT/backup.log" || rc=$?
+  (( rc != 0 )) || return 1
+  grep -q 'curl: (7)' "$CASE_ROOT/backup.log" || {
+    log "BUG: the error does not say why curl failed:"
+    cat "$CASE_ROOT/backup.log" >&2
+    return 1
+  }
+}
+
 # ------------------------------------------------------------------------------
 # Test runner
 # ------------------------------------------------------------------------------
@@ -2467,6 +2833,19 @@ run_test "restore requires a valid checksum file"       test_restore_requires_va
 run_test "backup refuses a lone checksum file"          test_backup_refuses_lone_checksum_file
 run_test "concurrent local backups publish one pair"    test_concurrent_local_backups_publish_one_pair
 run_test "restore and backup require flock"             test_restore_requires_flock
+run_test "backup stops on signal"                       test_backup_stops_on_signal
+run_test "backup -a stops on signal"                    test_backup_all_stops_on_signal
+run_test "backup -a does not wait for the first child"  test_backup_all_does_not_wait_for_the_first_child
+run_test "restore stops on signal"                      test_restore_stops_on_signal
+run_test "backup encrypts to every recipient"           test_backup_encrypts_to_every_recipient
+run_test "backup dry-run validates the public key"      test_backup_dry_run_validates_public_key
+run_test "restore rejects unencrypted .gpg archive"     test_restore_rejects_unencrypted_gpg_archive
+run_test "passphrase with newline warns"                test_passphrase_with_newline_warns
+run_test "backup refuses BACKUP_ROOT inside volume"     test_backup_refuses_backup_root_inside_volume
+run_test "restore refuses source inside target"         test_restore_refuses_source_inside_target
+run_test "backup warns about nested mounts"             test_backup_warns_about_nested_mounts
+run_test "restore does not restore SELinux labels"      test_restore_does_not_restore_selinux_labels
+run_test "s3 errors include the curl message"           test_s3_errors_include_the_curl_message
 run_test "s3 backup fails closed on HEAD error"         test_s3_backup_fails_closed_on_head_error
 run_test "s3 rejects unsafe keys"                       test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                      test_s3_roundtrip_optional
@@ -2480,6 +2859,7 @@ run_test "s3 needs conditional writes (optional)"       test_s3_requires_conditi
 run_test "s3 lost Complete response (optional)"         test_s3_lost_complete_response_optional
 run_test "s3 sidecar conflict keeps archive"            test_s3_sidecar_conflict_keeps_archive_optional
 run_test "s3 credentials not on command line"           test_s3_credentials_stay_off_the_command_line_optional
+run_test "s3 backup stops on signal (optional)"         test_s3_backup_stops_on_signal_optional
 
 # ------------------------------------------------------------------------------
 # Summary

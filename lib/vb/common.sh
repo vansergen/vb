@@ -131,10 +131,17 @@ resolve_volume_dir() {
 # ------------------------------------------------------------------------------
 
 tar_extra_flags=()
+tar_extract_flags=()
 
+# tar_extra_flags are used when creating archives, tar_extract_flags when
+# extracting them. SELinux labels belong to the host, so they are never
+# restored (the target's own labeling applies).
 prepare_tar_flags() {
+  tar_extra_flags=()
+  tar_extract_flags=()
   if tar --version 2>/dev/null | grep -q 'GNU tar'; then
     tar_extra_flags=(--acls --xattrs '--xattrs-include=*' --sparse)
+    tar_extract_flags=("${tar_extra_flags[@]}" '--xattrs-exclude=security.selinux')
   fi
 }
 
@@ -150,6 +157,14 @@ read_sidecar_digest() {
 # ------------------------------------------------------------------------------
 # GPG
 # ------------------------------------------------------------------------------
+
+# GPG reads a passphrase from a file descriptor up to the first newline.
+# Warns once per process.
+check_passphrase_newline() {
+  [[ "$1" == *$'\n'* && -z "${vb_passphrase_warned:-}" ]] || return 0
+  vb_passphrase_warned=1
+  log WARN "GPG_PASSPHRASE contains a newline; GPG uses only the text before the first newline as the passphrase"
+}
 
 prepare_gpg_home() {
   ensure_work_dir
@@ -186,6 +201,34 @@ process_tree_pids() {
     for pid in ${children[$current]:-}; do
       queue+=("$pid")
     done
+  done
+}
+
+# Waits until at least one of the given child processes has exited, without
+# polling: `wait -n` wakes up on any exit (and on trapped signals), then the
+# exit status of every finished child is collected. Fills vb_done_pids and
+# vb_done_status (parallel arrays).
+vb_wait_any() {
+  local pid status
+  vb_done_pids=()
+  vb_done_status=()
+
+  while :; do
+    for pid in "$@"; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        status=0
+        wait "$pid" || status=$?
+        vb_done_pids+=("$pid")
+        vb_done_status+=("$status")
+      fi
+    done
+    (( ${#vb_done_pids[@]} == 0 )) || return 0
+    status=0
+    wait -n 2>/dev/null || status=$?
+    # 127: no job left to wait for (should not happen); avoid spinning
+    if (( status == 127 )); then
+      sleep 0.2
+    fi
   done
 }
 

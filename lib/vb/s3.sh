@@ -205,14 +205,21 @@ s3__bucket_url() {
 # ------------------------------------------------------------------------------
 
 # Usage: s3__call <body-file> <headers-file> <curl args...>
-# Sets S3_STATUS (HTTP status, 000 on transport failure) and S3_CURL_RC.
+# Sets S3_STATUS (HTTP status, 000 on transport failure) and S3_CURL_RC; the
+# error message of curl is kept for s3__describe.
 s3__call() {
   local body="$1" headers="$2"
   shift 2
 
   S3_CURL_RC=0
-  S3_STATUS="$(curl -K "$s3_curl_config" -o "$body" -D "$headers" -w '%{http_code}' "$@")" || S3_CURL_RC=$?
+  S3_STATUS="$(curl -K "$s3_curl_config" -o "$body" -D "$headers" -w '%{http_code}' "$@" 2> "${work_dir}/curl.err")" \
+    || S3_CURL_RC=$?
   [[ -n "$S3_STATUS" ]] || S3_STATUS=000
+}
+
+# Prints the first line of the last curl error message, if any.
+s3__curl_error() {
+  head -n 1 -- "${work_dir}/${1:-curl.err}" 2>/dev/null || true
 }
 
 s3__error_code() {
@@ -225,7 +232,9 @@ s3__describe() {
   code="$(s3__error_code "$1")"
   printf 'HTTP %s%s' "$S3_STATUS" "${code:+ ($code)}"
   if (( S3_CURL_RC != 0 )); then
-    printf ', curl exit %s' "$S3_CURL_RC"
+    local error
+    error="$(s3__curl_error)"
+    printf ', curl exit %s%s' "$S3_CURL_RC" "${error:+: $error}"
   fi
 }
 
@@ -471,9 +480,11 @@ s3_mp_upload_parts() {
     vb_test_point "s3_part_${number}"
 
     if ! etag="$(curl -K "$s3_curl_config" --fail --retry 3 --upload-file "$part" -o /dev/null \
-      -w '%header{etag}' "${s3_mp_url}?partNumber=${number}&uploadId=${s3_mp_upload_id_enc}")" \
-      || [[ -z "$etag" ]]; then
-      log ERROR "Failed to upload part ${number} of s3://${s3_mp_bucket}/${s3_mp_key}"
+      -w '%header{etag}' "${s3_mp_url}?partNumber=${number}&uploadId=${s3_mp_upload_id_enc}" \
+      2> "${work_dir}/curl.part.err")" || [[ -z "$etag" ]]; then
+      local error
+      error="$(s3__curl_error curl.part.err)"
+      log ERROR "Failed to upload part ${number} of s3://${s3_mp_bucket}/${s3_mp_key}${error:+: $error}"
       return 1
     fi
 
@@ -490,9 +501,11 @@ s3_mp_upload_parts() {
 s3_mp_abort() {
   [[ -n "$s3_mp_upload_id" ]] || return 0
 
-  if ! curl -K "$s3_curl_config" --retry 2 -o /dev/null -X DELETE \
-    "${s3_mp_url}?uploadId=${s3_mp_upload_id_enc}" >/dev/null 2>&1; then
-    log WARN "Failed to abort the multipart upload to s3://${s3_mp_bucket}/${s3_mp_key}; an AbortIncompleteMultipartUpload lifecycle rule will clean it up"
+  if ! curl -K "$s3_curl_config" --fail --retry 2 -o /dev/null -X DELETE \
+    "${s3_mp_url}?uploadId=${s3_mp_upload_id_enc}" > /dev/null 2> "${work_dir}/curl.abort.err"; then
+    local error
+    error="$(s3__curl_error curl.abort.err)"
+    log WARN "Failed to abort the multipart upload to s3://${s3_mp_bucket}/${s3_mp_key}${error:+ ($error)}; an AbortIncompleteMultipartUpload lifecycle rule will clean it up"
   fi
   s3_mp_upload_id=""
 }

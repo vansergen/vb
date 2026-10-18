@@ -405,7 +405,7 @@ txn_finalize() {
   sync -- "$journal"
 
   tar --extract --no-recursion --numeric-owner --same-owner --preserve-permissions \
-    "${tar_extra_flags[@]}" --file "${journal}/root.tar" --directory "$target" .
+    "${tar_extract_flags[@]}" --file "${journal}/root.tar" --directory "$target" .
   mtime="$(head -n 1 "${journal}/root.mtime")"
   txn_set_marker "$target" "$mtime"
   sync -- "$target"

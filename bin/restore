@@ -51,6 +51,7 @@ declare -A unique_timestamps=()
 declare -a part_volumes=()
 declare -a part_sources=()
 declare -a part_paths=()
+declare -a part_local_sources=()
 
 # Transaction state (orchestrator)
 txn_gid=""
@@ -61,6 +62,7 @@ txn_done=0
 declare -a stage_pids=()
 declare -A stage_pid_volume=()
 pipeline_pid=""
+checksum_pid=""
 
 # State of the source being processed
 download_from_s3=0
@@ -203,6 +205,11 @@ cleanup() {
     stop_process_tree "$pipeline_pid" TERM
     pipeline_pid=""
   fi
+  # Blocked opening its FIFO if the pipeline never started writing
+  if [[ -n "$checksum_pid" ]]; then
+    stop_process_tree "$checksum_pid" TERM
+    checksum_pid=""
+  fi
 
   if [[ -z "$RESTORE_PHASE" ]]; then
     if (( txn_started && ! txn_committed && ! txn_done )); then
@@ -284,6 +291,10 @@ setup_source() {
 check_decryption_prerequisites() {
   (( decrypt )) || return 0
   require_command gpg
+
+  if [[ -z "$RESTORE_PHASE" ]]; then
+    check_passphrase_newline "$gpg_passphrase"
+  fi
 
   if (( symmetric )); then
     [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
@@ -380,12 +391,15 @@ decrypt_stream() {
     return
   fi
 
+  # The status file proves that the data was actually decrypted: gpg also
+  # "decrypts" unencrypted OpenPGP data (a bare literal packet) with exit 0.
   if [[ -n "$gpg_passphrase" ]]; then
     gpg \
       --batch \
       --yes \
       --no-tty \
       --pinentry-mode loopback \
+      --status-file "${work_dir}/gpg.status" \
       --passphrase-fd 3 \
       --decrypt \
       --output - \
@@ -396,6 +410,7 @@ decrypt_stream() {
       --yes \
       --no-tty \
       --pinentry-mode loopback \
+      --status-file "${work_dir}/gpg.status" \
       --decrypt \
       --output -
   fi
@@ -417,7 +432,7 @@ extract_stream() {
     --numeric-owner \
     --same-owner \
     --preserve-permissions \
-    "${tar_extra_flags[@]}"
+    "${tar_extract_flags[@]}"
 }
 
 # ------------------------------------------------------------------------------
@@ -430,7 +445,7 @@ extract_stream() {
 stage_participant() {
   local volume="$1" source="$2" target="$3" gid="$4"
   local journal="${target}/${TXN_NAME}"
-  local sha_fifo sha_out sha_pid actual rc=0 sha_rc=0
+  local sha_fifo sha_out actual rc=0 sha_rc=0
 
   [[ "$(txn_signature_gid "$journal" 2>/dev/null)" == "$gid" && "$(txn_state "$journal")" == staging ]] || die \
     "Journal of ${target} does not belong to this restore"
@@ -455,24 +470,32 @@ stage_participant() {
   ensure_work_dir
   sha_fifo="${work_dir}/sha.fifo"
   sha_out="${work_dir}/sha.out"
-  rm -f -- "$sha_fifo"
+  rm -f -- "$sha_fifo" "${work_dir}/gpg.status"
   mkfifo "$sha_fifo"
 
   # Readers first, then the writers; the checksum reader is a direct child so
   # it can be waited for.
   sha256sum < "$sha_fifo" > "$sha_out" &
-  sha_pid=$!
+  checksum_pid=$!
 
   # The pipeline runs in the background so signals are handled promptly.
-  (source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | extract_stream "${journal}/new") &
+  (
+    vb_test_point "restore_stream" "$volume"
+    source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | extract_stream "${journal}/new"
+  ) &
   pipeline_pid=$!
 
   wait "$pipeline_pid" || rc=$?
   pipeline_pid=""
-  wait "$sha_pid" || sha_rc=$?
+  wait "$checksum_pid" || sha_rc=$?
+  checksum_pid=""
 
   (( rc == 0 )) || die "Failed to read, decrypt, decompress or extract ${src_path}"
   (( sha_rc == 0 )) || die "Failed to compute the checksum of ${src_path}"
+  if (( decrypt )); then
+    grep -q '^\[GNUPG:\] DECRYPTION_OKAY' "${work_dir}/gpg.status" 2>/dev/null || die \
+      "GPG did not confirm the decryption of ${src_path}; the archive is not encrypted or not intact"
+  fi
 
   if [[ -n "$expected_digest" ]]; then
     actual="$(awk '{ print $1 }' "$sha_out")"
@@ -483,14 +506,6 @@ stage_participant() {
 
   txn_stage_complete "$target"
   log INFO "Staged ${volume}"
-}
-
-child_finished() {
-  local content state
-  content="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
-  content="${content##*) }"
-  state="${content%% *}"
-  [[ "$state" == Z || "$state" == X ]]
 }
 
 launch_stage_worker() {
@@ -519,27 +534,22 @@ launch_stage_worker() {
 # Waits until at least one stage worker has finished. Returns 1 if any of
 # the finished workers failed.
 reap_stage_workers() {
-  local pid status reaped=0 failed=0
+  local i pid failed=0
   local -a running=()
 
-  while (( ! reaped )); do
-    running=()
-    for pid in "${stage_pids[@]}"; do
-      if child_finished "$pid"; then
-        status=0
-        wait "$pid" || status=$?
-        reaped=1
-        if (( status != 0 )); then
-          log ERROR "Failed to stage ${stage_pid_volume[$pid]}"
-          failed=1
-        fi
-      else
-        running+=("$pid")
-      fi
-    done
-    stage_pids=("${running[@]}")
-    (( reaped )) || sleep 0.2
+  vb_wait_any "${stage_pids[@]}"
+  for i in "${!vb_done_pids[@]}"; do
+    pid="${vb_done_pids[i]}"
+    if (( vb_done_status[i] != 0 )); then
+      log ERROR "Failed to stage ${stage_pid_volume[$pid]}"
+      failed=1
+    fi
   done
+
+  for pid in "${stage_pids[@]}"; do
+    [[ " ${vb_done_pids[*]} " == *" ${pid} "* ]] || running+=("$pid")
+  done
+  stage_pids=("${running[@]}")
 
   return "$failed"
 }
@@ -759,10 +769,25 @@ preflight_participant() {
     die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
   fi
   check_decryption_prerequisites
+  if (( ! download_from_s3 )); then
+    part_local_sources[index]="$(realpath -e -- "$src_path")"
+  fi
 
   if (( ! download_from_s3 && ! allow_unverified )) && [[ ! -f "${src_path}.sha256" ]]; then
     die "Checksum file not found: ${src_path}.sha256. The backup may be incomplete; use -U to restore it without verification"
   fi
+}
+
+# A restore replaces the whole target, so an archive stored inside one of the
+# targets would be moved aside and deleted with the old data.
+check_sources_outside_targets() {
+  local source path
+  for source in "${part_local_sources[@]}"; do
+    for path in "${part_paths[@]}"; do
+      [[ "$source" != "$path"/* ]] || die \
+        "Backup file ${source} is stored inside the target volume ${path}; move it out of the volume first"
+    done
+  done
 }
 
 # Checks that a target can be used once the locks are held.
@@ -837,6 +862,7 @@ run_restore() {
   for index in "${!part_volumes[@]}"; do
     preflight_participant "$index"
   done
+  check_sources_outside_targets
 
   log INFO "Restoring ${#part_volumes[@]} volume(s)"
   if (( all_volumes )); then
