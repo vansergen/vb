@@ -757,6 +757,49 @@ processes_with_env() {
   done
 }
 
+# Prints a canonical description of volumes, journals included: metadata of
+# every entry and the digest of every file
+volume_state() {
+  local vol
+  for vol in "$@"; do
+    printf '== %s\n' "$vol"
+    tree_manifest "$TEST_VOLUMES_ROOT/$vol"
+    (cd "$TEST_VOLUMES_ROOT/$vol" && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
+  done
+}
+
+# Manifest of a volume without its journal
+volume_manifest_without_journal() {
+  tree_manifest "$1" | grep -v -e '^\.vb-restore' || true
+}
+
+# Writes an executable wrapper <dir>/<command> from stdin
+write_wrapper() {
+  local dir="$1" command="$2"
+  mkdir -p "$dir"
+  cat > "$dir/$command"
+  chmod +x "$dir/$command"
+}
+
+# Runs a command that must fail because of an injected fault. Checks first
+# that the fault was injected (<marker> exists), then that the command failed.
+#   expect_injected_failure <marker> <command...>
+expect_injected_failure() {
+  local marker="$1" rc=0
+  shift
+  "$@" > "$CASE_ROOT/injected.log" 2>&1 || rc=$?
+  [[ -e "$marker" ]] || {
+    log "The injected fault never happened: $*"
+    cat "$CASE_ROOT/injected.log" >&2
+    return 1
+  }
+  (( rc != 0 )) || {
+    log "BUG: succeeded despite the injected fault: $*"
+    cat "$CASE_ROOT/injected.log" >&2
+    return 1
+  }
+}
+
 # ------------------------------------------------------------------------------
 # Test functions
 # ------------------------------------------------------------------------------
@@ -3288,6 +3331,124 @@ STUB
   fi
 }
 
+test_failed_rollback_keeps_the_journal() {
+  setup_case "failed_rollback_keeps_the_journal"
+  setup_two_volume_transaction || return 1
+
+  # Moves out of journal/old fail while the control file exists
+  local stub="$CASE_ROOT/stub" real_mv
+  real_mv="$(command -v mv)"
+  write_wrapper "$stub" mv <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do src="\${dst:-}"; dst="\$arg"; done
+if [[ -e '$CASE_ROOT/mv.fail' && "\$src" == */.vb-restore/old/* ]]; then
+  : > '$CASE_ROOT/mv.fired'
+  printf 'mv: injected failure\n' >&2
+  exit 1
+fi
+exec '$real_mv' "\$@"
+STUB
+  : > "$CASE_ROOT/mv.fail"
+
+  # Interrupted before the commit: the rollback cannot move old data back
+  start_paused_restore txn_before_decision PATH="$stub:$PATH" -- -a -T "$TXN_TS" -C
+  wait_for_point txn_before_decision || return 1
+  local pid rc=0
+  pid="$(paused_script_pid)" || return 1
+  kill -TERM "$pid"
+  wait "$PAUSED_PID" || rc=$?
+  [[ -e "$CASE_ROOT/mv.fired" ]] || {
+    log "The injected mv failure never happened"
+    return 1
+  }
+  (( rc != 0 )) || return 1
+
+  # The original data of beta must still be in its journal
+  [[ -d "$TEST_VOLUMES_ROOT/beta/.vb-restore/old" ]] || {
+    log "BUG: the journal of beta is gone although its rollback failed"
+    return 1
+  }
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/.vb-restore/old/marker.txt" "old-beta" || return 1
+
+  rm -f "$CASE_ROOT/mv.fail"
+  run_restore -X || return 1
+  assert_group_state old || return 1
+}
+
+test_xattr_marker_fallback_and_failure() {
+  setup_case "xattr_marker_fallback_and_failure"
+  make_volume_content "alpha"
+  local ts="20250101_902000"
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "alpha" "$CASE_ROOT/new-alpha"
+
+  local stub="$CASE_ROOT/stub" real_setfattr
+  real_setfattr="$(command -v setfattr || true)"
+  write_wrapper "$stub" setfattr <<STUB
+#!/usr/bin/env bash
+target="\${!#}"
+fail() {
+  : > '$CASE_ROOT/setfattr.fired'
+  printf 'setfattr: %s: %s\n' "\$target" "\$1" >&2
+  exit 1
+}
+case "\$(cat '$CASE_ROOT/setfattr.mode' 2>/dev/null)" in
+  unsupported) fail "Operation not supported" ;;
+  eio-finalize)
+    if [[ " \$* " == *" -v "* && "\$(head -n 1 "\$target/.vb-restore/state" 2>/dev/null)" == finalize ]]; then
+      fail "Input/output error"
+    fi
+    ;;
+  eio-early)
+    if [[ " \$* " == *" -v "* && ! -e "\$target/.vb-restore" ]]; then
+      fail "Input/output error"
+    fi
+    ;;
+esac
+if [[ -n '$real_setfattr' ]]; then
+  exec '$real_setfattr' "\$@"
+fi
+exit 0
+STUB
+
+  # Not supported: the restore works without the marker
+  printf 'unsupported\n' > "$CASE_ROOT/setfattr.mode"
+  replace_volume_with_marker "alpha" "old"
+  run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C 2> "$CASE_ROOT/unsupported.log" || {
+    cat "$CASE_ROOT/unsupported.log" >&2
+    return 1
+  }
+  [[ -e "$CASE_ROOT/setfattr.fired" ]] || return 1
+  assert_dirs_equal "$CASE_ROOT/new-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+
+  # A failure while finalizing keeps the journal; recovery completes it
+  rm -f "$CASE_ROOT/setfattr.fired"
+  printf 'eio-finalize\n' > "$CASE_ROOT/setfattr.mode"
+  replace_volume_with_marker "alpha" "old"
+  expect_injected_failure "$CASE_ROOT/setfattr.fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+  [[ "$(head -n 1 "$TEST_VOLUMES_ROOT/alpha/.vb-restore/state" 2>/dev/null)" == finalize ]] || {
+    log "BUG: the journal did not stay in phase finalize after a failed marker"
+    return 1
+  }
+  run_restore -X || return 1
+  assert_dirs_equal "$CASE_ROOT/new-alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # A failure before the journal exists leaves the volume untouched
+  rm -f "$CASE_ROOT/setfattr.fired"
+  printf 'eio-early\n' > "$CASE_ROOT/setfattr.mode"
+  replace_volume_with_marker "alpha" "old"
+  local before
+  before="$(volume_state alpha)"
+  expect_injected_failure "$CASE_ROOT/setfattr.fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha -C || return 1
+  [[ "$(volume_state alpha)" == "$before" ]] || {
+    log "BUG: a failure before the journal existed changed the volume"
+    return 1
+  }
+}
+
 # ------------------------------------------------------------------------------
 # Test runner
 # ------------------------------------------------------------------------------
@@ -3427,6 +3588,8 @@ run_test "rotation keeps recent backups (-D)"          test_rotation_keeps_recen
 run_test "rotation handles incomplete backups"         test_rotation_handles_incomplete_backups
 run_test "rotation interrupted between files"          test_rotation_interrupted_between_files
 run_test "rotation and publishing do not interleave"   test_rotation_and_publishing_do_not_interleave
+run_test "failed rollback keeps the journal"           test_failed_rollback_keeps_the_journal
+run_test "xattr marker fallback and failure"           test_xattr_marker_fallback_and_failure
 run_test "s3 backup fails closed on HEAD error"        test_s3_backup_fails_closed_on_head_error
 run_test "s3 rejects unsafe keys"                      test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                     test_s3_roundtrip_optional

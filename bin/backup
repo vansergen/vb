@@ -842,16 +842,16 @@ rotate_local() {
   for i in "${rotation_deletes[@]}"; do
     path="${cat_locations[i]}"
     if (( cat_sidecars[i] )); then
-      rm -f -- "${path}.sha256"
-      sync -- "$backup_root"
+      rm -f -- "${path}.sha256" || die "Rotation failed to delete ${path}.sha256"
+      sync -- "$backup_root" || die "Rotation failed to sync ${backup_root}"
       vb_test_point "rotate_pair" "$volume"
     fi
     if [[ "${cat_status[i]}" != orphan ]]; then
-      rm -f -- "$path"
+      rm -f -- "$path" || die "Rotation failed to delete ${path}"
     fi
     log INFO "Rotation deleted: $(rotation_entry_label "$i")"
   done
-  sync -- "$backup_root"
+  sync -- "$backup_root" || die "Rotation failed to sync ${backup_root}"
 
   exec {lock_fd}>&-
 }

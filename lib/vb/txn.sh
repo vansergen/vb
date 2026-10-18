@@ -13,6 +13,11 @@
 # the directories it touched are synced before the next phase is recorded.
 # The recorded phase therefore never runs ahead of the renames on disk, and
 # every phase and rollback step is idempotent.
+#
+# Every operation checks its own result and dies on failure instead of
+# relying on errexit, which is off inside conditions such as
+# `if ! ( abort_transaction )`. A failed step therefore always leaves the
+# journal in place for recovery.
 
 readonly TXN_NAME=".vb-restore"
 readonly TXN_SIGNATURE="vb-restore-journal v1"
@@ -25,15 +30,23 @@ declare -gA txn_lock_fds=()
 # Durable file helpers
 # ------------------------------------------------------------------------------
 
+txn_sync() {
+  sync -- "$@" || die "Failed to sync $*"
+}
+
+txn_mv() {
+  mv -T -- "$1" "$2" || die "Failed to move $1 to $2"
+}
+
 # Writes <content> to <dir>/<name> atomically and durably.
 txn_write() {
   local dir="$1" name="$2" content="$3"
   local tmp="${dir}/.${name}.tmp"
 
-  printf '%s\n' "$content" > "$tmp"
-  sync -- "$tmp"
-  mv -f -- "$tmp" "${dir}/${name}"
-  sync -- "$dir"
+  printf '%s\n' "$content" > "$tmp" || die "Failed to write $tmp"
+  txn_sync "$tmp"
+  mv -f -- "$tmp" "${dir}/${name}" || die "Failed to rename $tmp"
+  txn_sync "$dir"
 }
 
 txn_value() {
@@ -57,8 +70,12 @@ txn_signature_gid() {
   printf '%s\n' "$gid"
 }
 
+# Returns 0 if <dir> is empty and 1 if it is not. A directory that cannot be
+# read is fatal, never "empty".
 txn_dir_is_empty() {
-  [[ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+  local first
+  first="$(find "$1" -mindepth 1 -maxdepth 1 -print -quit)" || die "Failed to read the directory $1"
+  [[ -z "$first" ]]
 }
 
 # Prints the NUL-separated names of the top-level entries of <dir>,
@@ -135,9 +152,21 @@ txn_reserved_entries() {
   find "$1" -mindepth 1 -maxdepth 1 \( -name "${TXN_NAME}*" -o -name '.restore-in-progress.*' \) -printf '%f\n'
 }
 
+# Reads the root mtime marker of <dir> into txn_marker_value. Returns 1 when
+# there is none (or user xattrs are not available); other errors are fatal.
 txn_read_marker() {
+  local out
+  txn_marker_value=""
   command -v getfattr >/dev/null 2>&1 || return 1
-  getfattr --only-values --absolute-names -n "$TXN_MARKER_XATTR" -- "$1" 2>/dev/null
+
+  if out="$(LC_ALL=C getfattr --only-values --absolute-names -n "$TXN_MARKER_XATTR" -- "$1" 2>&1)"; then
+    txn_marker_value="$out"
+    return 0
+  fi
+  if txn__no_attribute "$out" || txn__xattr_unsupported "$out"; then
+    return 1
+  fi
+  die "Failed to read ${TXN_MARKER_XATTR} of $1: ${out}"
 }
 
 # Describes why a volume cannot be used as a restore target or backup source
@@ -150,7 +179,7 @@ txn_describe_reserved() {
     printf '%s: %s\n' "$name" "${class%% *}"
   done < <(txn_reserved_entries "$target")
 
-  if txn_read_marker "$target" >/dev/null; then
+  if txn_read_marker "$target"; then
     printf '%s: pending root mtime marker\n' "$TXN_MARKER_XATTR"
   fi
 }
@@ -190,18 +219,48 @@ txn_lock() {
 # Root metadata marker
 # ------------------------------------------------------------------------------
 
+# The marker keeps the final mtime of a volume root across a crash. Without
+# user xattrs (no tools, or a filesystem that does not support them) restores
+# work without it, and after a crash only the root mtime may differ. On a
+# filesystem that supports them, a failure is an error like any other.
+txn__xattr_unsupported() {
+  [[ "$1" == *"Operation not supported"* || "$1" == *"Not supported"* ]]
+}
+
+txn__no_attribute() {
+  [[ "$1" == *"No such attribute"* || "$1" == *"No data available"* ]]
+}
+
+txn__warn_no_xattr() {
+  [[ -z "${txn_xattr_warned:-}" ]] || return 0
+  txn_xattr_warned=1
+  log WARN "User extended attributes are not available; after a crash, the mtime of a volume root may not be restored${1:+ ($1)}"
+}
+
 txn_set_marker() {
-  command -v setfattr >/dev/null 2>&1 || return 0
-  setfattr -n "$TXN_MARKER_XATTR" -v "$2" -- "$1" 2>/dev/null || true
+  local target="$1" value="$2" err
+  if ! command -v setfattr >/dev/null 2>&1; then
+    txn__warn_no_xattr "setfattr is not installed"
+    return 0
+  fi
+  if ! err="$(LC_ALL=C setfattr -n "$TXN_MARKER_XATTR" -v "$value" -- "$target" 2>&1)"; then
+    if txn__xattr_unsupported "$err"; then
+      txn__warn_no_xattr "$err"
+      return 0
+    fi
+    die "Failed to set ${TXN_MARKER_XATTR} on ${target}: ${err}"
+  fi
 }
 
 txn_apply_marker() {
-  local target="$1" mtime="$2"
-  touch -m -d "@${mtime}" -- "$target"
-  if command -v setfattr >/dev/null 2>&1; then
-    setfattr -x "$TXN_MARKER_XATTR" -- "$target" 2>/dev/null || true
+  local target="$1" mtime="$2" err
+  touch -m -d "@${mtime}" -- "$target" || die "Failed to set the mtime of ${target}"
+  if command -v setfattr >/dev/null 2>&1 \
+    && ! err="$(LC_ALL=C setfattr -x "$TXN_MARKER_XATTR" -- "$target" 2>&1)" \
+    && ! txn__no_attribute "$err" && ! txn__xattr_unsupported "$err"; then
+    die "Failed to remove ${TXN_MARKER_XATTR} from ${target}: ${err}"
   fi
-  sync -- "$target"
+  txn_sync "$target"
 }
 
 # ------------------------------------------------------------------------------
@@ -218,24 +277,24 @@ txn_create() {
   local journal="${target}/${TXN_NAME}"
   local original_mtime
 
-  original_mtime="$(date -r "$target" +%s.%N)"
+  original_mtime="$(date -r "$target" +%s.%N)" || die "Failed to read the mtime of ${target}"
 
   # Lets recovery restore the root mtime even if only a creation directory
   # was left behind
   txn_set_marker "$target" "$original_mtime"
-  sync -- "$target"
+  txn_sync "$target"
 
-  mkdir -- "$creating"
+  mkdir -- "$creating" || die "Failed to create $creating"
   txn_write "$creating" VB-JOURNAL "$(printf '%s\ngid=%s' "$TXN_SIGNATURE" "$gid")"
   txn_write "$creating" group "$(printf 'gid=%s\nvolume=%s\ncoordinator=%s\nparticipants=%s\noriginal_mtime=%s' \
     "$gid" "$volume" "$coordinator" "$*" "$original_mtime")"
   txn_write "$creating" state staging
-  mkdir -- "${creating}/new" "${creating}/old"
-  sync -- "$creating"
+  mkdir -- "${creating}/new" "${creating}/old" || die "Failed to create the journal in $creating"
+  txn_sync "$creating"
 
   vb_test_point "txn_create_rename" "${target##*/}"
-  mv -T -- "$creating" "$journal"
-  sync -- "$target"
+  txn_mv "$creating" "$journal"
+  txn_sync "$target"
 }
 
 # Completes staging once the archive was extracted into journal/new and
@@ -251,13 +310,13 @@ txn_stage_complete() {
     die "The archive contains the reserved name '${name}' at its root; refusing to restore it"
   done < <(txn_reserved_entries "${journal}/new")
 
-  date -r "${journal}/new" +%s.%N > "${journal}/root.mtime"
+  date -r "${journal}/new" +%s.%N > "${journal}/root.mtime" || die "Failed to record the root mtime of ${target}"
   tar --create --no-recursion --numeric-owner "${tar_extra_flags[@]}" \
-    --file "${journal}/root.tar" --directory "${journal}/new" .
-  sync -- "${journal}/root.mtime" "${journal}/root.tar"
+    --file "${journal}/root.tar" --directory "${journal}/new" . || die "Failed to record the root metadata of ${target}"
+  txn_sync "${journal}/root.mtime" "${journal}/root.tar"
 
   # Make every extracted file durable before the switch can begin
-  sync -f -- "$target"
+  sync -f -- "$target" || die "Failed to sync the filesystem of ${target}"
   txn_write "$journal" state staged
   vb_test_point "txn_staged" "${target##*/}"
 }
@@ -272,10 +331,10 @@ txn_aside() {
   vb_test_point "txn_aside" "${target##*/}"
   mapfile -d '' -t names < <(txn_entries "$target")
   for name in "${names[@]}"; do
-    mv -T -- "${target}/${name}" "${journal}/old/${name}"
+    txn_mv "${target}/${name}" "${journal}/old/${name}"
     vb_test_point "txn_aside_entry" "${target##*/}"
   done
-  sync -- "$target" "${journal}/old"
+  txn_sync "$target" "${journal}/old"
 }
 
 txn_swap() {
@@ -288,10 +347,10 @@ txn_swap() {
   vb_test_point "txn_swap" "${target##*/}"
   mapfile -d '' -t names < <(find "${journal}/new" -mindepth 1 -maxdepth 1 -printf '%f\0')
   for name in "${names[@]}"; do
-    mv -T -- "${journal}/new/${name}" "${target}/${name}"
+    txn_mv "${journal}/new/${name}" "${target}/${name}"
     vb_test_point "txn_swap_entry" "${target##*/}"
   done
-  sync -- "$target" "${journal}/new"
+  txn_sync "$target" "${journal}/new"
   txn_write "$journal" state swapped
 }
 
@@ -303,10 +362,10 @@ txn__rb1() {
 
   mapfile -d '' -t names < <(txn_entries "$target")
   for name in "${names[@]}"; do
-    mv -T -- "${target}/${name}" "${journal}/new/${name}"
+    txn_mv "${target}/${name}" "${journal}/new/${name}"
     vb_test_point "txn_rb1_entry" "${target##*/}"
   done
-  sync -- "$target" "${journal}/new"
+  txn_sync "$target" "${journal}/new"
 }
 
 txn__rb2() {
@@ -317,10 +376,10 @@ txn__rb2() {
 
   mapfile -d '' -t names < <(find "${journal}/old" -mindepth 1 -maxdepth 1 -printf '%f\0')
   for name in "${names[@]}"; do
-    mv -T -- "${journal}/old/${name}" "${target}/${name}"
+    txn_mv "${journal}/old/${name}" "${target}/${name}"
     vb_test_point "txn_rb2_entry" "${target##*/}"
   done
-  sync -- "$target" "${journal}/old"
+  txn_sync "$target" "${journal}/old"
 }
 
 # Restores the original data of one participant, following the recovery
@@ -369,8 +428,8 @@ txn_retire() {
   trash="${target}/${TXN_NAME}.${kind}.${gid}"
 
   vb_test_point "txn_retire_${kind}" "${target##*/}"
-  mv -T -- "$journal" "$trash"
-  sync -- "$target"
+  txn_mv "$journal" "$trash"
+  txn_sync "$target"
   txn_cleanup_trash "$trash"
 }
 
@@ -381,34 +440,44 @@ txn_cleanup_trash() {
   [[ -d "$trash" ]] || return 0
 
   if [[ -e "${trash}/VB-JOURNAL" ]]; then
-    find "$trash" -mindepth 1 -maxdepth 1 ! -name VB-JOURNAL -exec rm -rf -- {} +
-    sync -- "$trash"
+    find "$trash" -mindepth 1 -maxdepth 1 ! -name VB-JOURNAL -exec rm -rf -- {} + \
+      || die "Failed to delete the contents of $trash"
+    txn_sync "$trash"
     vb_test_point "txn_trash_signature" "$(basename -- "$(dirname -- "$trash")")"
-    rm -f -- "${trash}/VB-JOURNAL"
+    rm -f -- "${trash}/VB-JOURNAL" || die "Failed to delete ${trash}/VB-JOURNAL"
   else
-    rm -f -- "${trash}/.VB-JOURNAL.tmp"
+    rm -f -- "${trash}/.VB-JOURNAL.tmp" || die "Failed to delete ${trash}/.VB-JOURNAL.tmp"
   fi
   vb_test_point "txn_trash_rmdir" "$(basename -- "$(dirname -- "$trash")")"
-  rmdir -- "$trash"
+  rmdir -- "$trash" || die "Failed to delete $trash"
 }
 
 # Completes one participant after the group's commit decision.
 txn_finalize() {
   local target="$1"
   local journal="${target}/${TXN_NAME}"
-  local mtime
+  local mtime state
+
+  # Every new entry must have been switched into place before the leftovers
+  # of journal/new are deleted (once finalize began, they may be gone)
+  state="$(txn_state "$journal")" || die "Journal state of ${target} is unreadable; refusing to touch it"
+  if [[ "$state" != finalize && -d "${journal}/new" ]] && ! txn_dir_is_empty "${journal}/new"; then
+    die "Journal of ${target} still holds new data in ${journal}/new; refusing to finalize it"
+  fi
 
   txn_write "$journal" state finalize
   vb_test_point "txn_finalize" "${target##*/}"
 
-  rm -rf -- "${journal}/old" "${journal}/new"
-  sync -- "$journal"
+  rm -rf -- "${journal}/old" "${journal}/new" || die "Failed to delete the old data in ${journal}"
+  txn_sync "$journal"
 
   tar --extract --no-recursion --numeric-owner --same-owner --preserve-permissions \
-    "${tar_extract_flags[@]}" --file "${journal}/root.tar" --directory "$target" .
-  mtime="$(head -n 1 "${journal}/root.mtime")"
+    "${tar_extract_flags[@]}" --file "${journal}/root.tar" --directory "$target" . \
+    || die "Failed to restore the root metadata of ${target}"
+  mtime="$(head -n 1 "${journal}/root.mtime")" && [[ -n "$mtime" ]] \
+    || die "Failed to read ${journal}/root.mtime"
   txn_set_marker "$target" "$mtime"
-  sync -- "$target"
+  txn_sync "$target"
 
   txn_retire "$target" "done"
   vb_test_point "txn_finalize_mtime" "${target##*/}"
@@ -423,10 +492,13 @@ txn_abort_participant() {
   local mtime
 
   txn_rollback "$target"
-  mtime="$(txn_value "${journal}/group" original_mtime)"
+  # Only an empty journal/old proves that every original entry is back
+  txn_dir_is_empty "${journal}/old" || die \
+    "Original data of ${target} is still in ${journal}/old after the rollback; keeping the journal. Run restore -X"
+  mtime="$(txn_value "${journal}/group" original_mtime)" || mtime=""
   if [[ -n "$mtime" ]]; then
     txn_set_marker "$target" "$mtime"
-    sync -- "$target"
+    txn_sync "$target"
   fi
   txn_retire "$target" aborted
   if [[ -n "$mtime" ]]; then
@@ -562,14 +634,13 @@ txn_recover() {
       class="$(txn_classify "$path" "$entry")"
       case "${class%% *}" in
         trash | creating) txn_cleanup_trash "${path}/${entry}" ;;
-        empty) rmdir -- "${path}/${entry}" ;;
+        empty) rmdir -- "${path}/${entry}" || die "Failed to delete ${path}/${entry}" ;;
       esac
     done < <(txn_reserved_entries "$path")
-    sync -- "$path"
+    txn_sync "$path"
 
-    local mtime
-    if mtime="$(txn_read_marker "$path")" && [[ -n "$mtime" ]]; then
-      txn_apply_marker "$path" "$mtime"
+    if txn_read_marker "$path" && [[ -n "$txn_marker_value" ]]; then
+      txn_apply_marker "$path" "$txn_marker_value"
     fi
   done
 }
