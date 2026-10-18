@@ -25,6 +25,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - [Automation with cron](#automation-with-cron)
 - [Production Recommendations](#production-recommendations)
 - [Troubleshooting](#troubleshooting)
+- [Running the Tests](#running-the-tests)
 - [FAQ](#faq)
 
 ---
@@ -1196,6 +1197,26 @@ An interrupted `restore -a` involved several volumes, and recovery needs all of 
 ### `Some files changed while they were archived`
 
 Files changed while the backup read them, so their copies may be inconsistent. The backup is still published. Stop the writing service during the backup, or use `-S` to make this an error.
+
+---
+
+## Running the Tests
+
+The test suite builds the test image and runs against two S3 servers ([versitygw](https://github.com/versity/versitygw), one of them with bucket versioning):
+
+```bash
+docker compose -f compose.test.yaml run --rm --build test
+```
+
+`bin/vb-test` also runs directly on a Linux host as root (it needs `bash`, GNU `tar`, `gpg`, `flock`, and for full coverage `getfattr`/`setfacl` and `zstd`). Useful variables:
+
+| Variable                     | Description                                                    |
+| ---------------------------- | -------------------------------------------------------------- |
+| `TEST_FILTER`                | Bash regex: run only the tests whose function name matches     |
+| `TEST_S3_BUCKET`, `AWS_*`    | S3 bucket and credentials for the S3 tests (skipped otherwise) |
+| `TEST_S3_VERSIONED_ENDPOINT` | Endpoint of a server with a versioned `TEST_S3_BUCKET`         |
+| `REQUIRE_S3_TESTS=1`         | Fail instead of skipping when S3 is not configured             |
+| `REQUIRE_XATTR_TESTS=1`      | Fail when ACLs and extended attributes cannot be tested        |
 
 ---
 

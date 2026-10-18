@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
+# Test functions are only called through run_test:
+# shellcheck disable=SC2329
 set -Eeuo pipefail
 
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
 BACKUP_BIN="${BACKUP_BIN:-$SCRIPT_DIR/backup}"
 RESTORE_BIN="${RESTORE_BIN:-$SCRIPT_DIR/restore}"
 
 readonly SKIP_RC=200
 
 TEST_ROOT="$(mktemp -d)"
-CURRENT_CASE=""
 CASE_ROOT=""
 TEST_BACKUP_ROOT=""
 TEST_VOLUMES_ROOT=""
@@ -297,7 +299,6 @@ run_restore_with_env() {
 setup_case() {
   local name="$1"
 
-  CURRENT_CASE="$name"
   CASE_ROOT="$TEST_ROOT/$name"
   TEST_BACKUP_ROOT="$CASE_ROOT/backups"
   TEST_VOLUMES_ROOT="$CASE_ROOT/volumes"
@@ -357,7 +358,7 @@ copy_volume_snapshot() {
 
 clear_volume_dir() {
   local vol="$1"
-  rm -rf "$TEST_VOLUMES_ROOT/$vol"
+  rm -rf "${TEST_VOLUMES_ROOT:?}/$vol"
   mkdir -p "$TEST_VOLUMES_ROOT/$vol"
 }
 
@@ -373,7 +374,7 @@ replace_volume_with_marker() {
   local vol="$1"
   local marker="$2"
 
-  rm -rf "$TEST_VOLUMES_ROOT/$vol"
+  rm -rf "${TEST_VOLUMES_ROOT:?}/$vol"
   mkdir -p "$TEST_VOLUMES_ROOT/$vol"
   printf '%s\n' "$marker" > "$TEST_VOLUMES_ROOT/$vol/marker.txt"
 }
@@ -1254,7 +1255,7 @@ test_restore_fails_when_target_not_mounted() {
   # does not — equivalent to forgetting --volume <name>:/volumes/<name>
   # while having some other unrelated mount under /volumes.
   local target_name="notmounted"
-  rm -rf "$TEST_VOLUMES_ROOT/$target_name"
+  rm -rf "${TEST_VOLUMES_ROOT:?}/$target_name"
 
   local rc=0
   run_restore -i "$archive" -t "$target_name" 2>/dev/null || rc=$?
@@ -2729,7 +2730,7 @@ STUB
   prepare_target_volume "alpha_restore"
   run_restore_with_env PATH="$stub:$PATH" -- -i "alpha_${ts}.tar" -t alpha_restore || return 1
   [[ -s "$stub/trace" ]] || return 1
-  if [[ -n "$(grep -v -- '--xattrs-exclude=security.selinux' "$stub/trace")" ]]; then
+  if grep -q -v -- '--xattrs-exclude=security.selinux' "$stub/trace"; then
     log "BUG: an extraction restores SELinux labels:"
     cat "$stub/trace" >&2
     return 1
@@ -3186,10 +3187,10 @@ test_s3_rotation_keeps_replaced_objects_optional() {
 
   t_s3_get "${prefix}/app_20250101_000001.tar" "$CASE_ROOT/after.tar" || return 1
   t_s3_get "${prefix}/app_20250101_000001.tar.sha256" "$CASE_ROOT/after.sha256" || return 1
-  cmp -s "$CASE_ROOT/b.tar" "$CASE_ROOT/after.tar" && cmp -s "$CASE_ROOT/b.sha256" "$CASE_ROOT/after.sha256" || {
+  if ! cmp -s "$CASE_ROOT/b.tar" "$CASE_ROOT/after.tar" || ! cmp -s "$CASE_ROOT/b.sha256" "$CASE_ROOT/after.sha256"; then
     log "BUG: rotation deleted objects that were replaced after it checked them"
     return 1
-  }
+  fi
   grep -q 'changed after it was checked' "$CASE_ROOT/paused.log" || return 1
 }
 
@@ -3280,11 +3281,11 @@ STUB
   prepare_target_volume "alpha_restore"
   run_restore_with_env PATH="$stub:$PATH" -- -i alpha_20250101_901000.tar -t alpha_restore || return 1
 
-  grep -q -- '--create.*--xattrs' "$stub/trace" && grep -q -- '--extract.*--xattrs' "$stub/trace" || {
+  if ! grep -q -- '--create.*--xattrs' "$stub/trace" || ! grep -q -- '--extract.*--xattrs' "$stub/trace"; then
     log "BUG: GNU tar was not detected; archives lose ACLs and extended attributes:"
     cat "$stub/trace" >&2
     return 1
-  }
+  fi
 }
 
 # ------------------------------------------------------------------------------

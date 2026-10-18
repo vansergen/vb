@@ -24,3 +24,25 @@ updates:
       - ci
     commit-message:
       prefix: ci
+
+  # Base image of the published image
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: daily
+    labels:
+      - dependabot
+      - docker
+    commit-message:
+      prefix: build
+
+  # S3 test server
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: daily
+    labels:
+      - dependabot
+      - ci
+    commit-message:
+      prefix: ci
