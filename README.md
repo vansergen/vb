@@ -134,6 +134,8 @@ docker run --rm \
 The container reads and writes volumes from `/volumes` inside itself.  
 Mount each volume you want to work with using `--volume <name>:/volumes/<name>`.
 
+Volume names follow Docker's naming rule: they must start with a letter or digit and may contain only letters, digits, `.`, `_`, and `-`. Each volume must be a directory directly inside `/volumes`; symlinks that point elsewhere are refused.
+
 ### Named Docker volumes
 
 ```bash
@@ -178,7 +180,7 @@ The key file must be present at `./gpg/public.asc` (or another path specified wi
 | `-a`          | Back up all volumes found in `/volumes`                                   |
 | `-d <dir>`    | Backup directory override (default: `/backups`)                           |
 | `-T <ts>`     | Set timestamp manually (format: `YYYYMMDD_HHMMSS`)                        |
-| `-j <N>`      | Parallel jobs in `-a` mode (default: `1`)                                 |
+| `-j <N>`      | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                       |
 | `-c`          | Compress with `pigz` if available, otherwise `gzip`                       |
 | `-e`          | Asymmetric GPG encryption (public key)                                    |
 | `-s`          | Symmetric GPG encryption (passphrase)                                     |
@@ -294,7 +296,7 @@ Runs up to 3 backups concurrently.
 | `-d <dir>`    | Backup directory override (default: `/backups`)                         |
 | `-T <ts>`     | In `-a` mode: restore only backups with this exact timestamp            |
 | `-v <name>`   | In `-a` mode: filter by volume name (repeatable)                        |
-| `-j <N>`      | Parallel jobs in `-a` mode (default: `1`)                               |
+| `-j <N>`      | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                     |
 | `-C`          | Clear the target volume before restoring                                |
 | `-s`          | Symmetric GPG decryption (passphrase)                                   |
 | `-k <file>`   | Private key file for asymmetric GPG decryption (default: `private.gpg`) |
@@ -928,6 +930,14 @@ Before uploading, the backup script checks that the target S3 object does not al
 ### `Volume 'xxx' is not mounted into /volumes`
 
 The volume is not mounted into the container. Add `--volume <vol-name>:/volumes/<vol-name>` to your `docker run` command.
+
+### `Invalid volume name` / `does not resolve to a directory directly inside /volumes`
+
+The name passed to `-v` or `-t` must start with a letter or digit and contain only letters, digits, `.`, `_`, and `-` — names such as `.` or `..` are rejected. The volume must also be a real directory directly inside `/volumes`, not a symlink to another location.
+
+### `Skipping backup with unsafe volume name`
+
+In `restore -a` mode, files in `BACKUP_ROOT` whose names do not map to a valid volume name (for example macOS `._*` AppleDouble files on a NAS share) are ignored.
 
 ### `Backup file already exists`
 

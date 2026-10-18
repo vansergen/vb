@@ -1,32 +1,27 @@
-FROM alpine:3.23.3
+# dl.min.io no longer serves MinIO client binaries, so build the same pinned
+# release (RELEASE.2025-08-13T08-35-41Z) from source. The Go checksum database
+# verifies the module contents. Cross-compiling on the build platform avoids
+# running the Go toolchain under QEMU for foreign architectures.
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine3.23 AS mc
 
+ARG TARGETOS
 ARG TARGETARCH
-ARG TARGETVARIANT
-ARG MC_VERSION=RELEASE.2025-08-13T08-35-41Z
+ARG MC_MODULE_VERSION=v0.0.0-20250813083541-7394ce0dd2a8
+
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+  go install -trimpath -ldflags '-s -w' "github.com/minio/mc@${MC_MODULE_VERSION}" && \
+  install -D -m 0755 "$(find /go/bin -type f -name mc)" /out/mc
+
+FROM alpine:3.23.3
 
 RUN apk add --no-cache \
   bash \
   coreutils \
-  curl \
-  gcompat \
   gpg \
   gpg-agent \
   gpgconf \
   pigz \
-  tar && \
-  case "$TARGETARCH${TARGETVARIANT:+/$TARGETVARIANT}" in \
-  amd64)        mc_arch='amd64';   mc_sha256='01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891' ;; \
-  arm64|arm64/v8) mc_arch='arm64'; mc_sha256='14c8c9616cfce4636add161304353244e8de383b2e2752c0e9dad01d4c27c12c' ;; \
-  ppc64le)      mc_arch='ppc64le'; mc_sha256='0cf8776e6e1b1e2cd8a5c9e43ab26a1e2fbe57f57f51c9d99accaee3b0a2152b' ;; \
-  *) echo "Unsupported TARGETARCH/TARGETVARIANT: $TARGETARCH${TARGETVARIANT:+/$TARGETVARIANT}" >&2; exit 1 ;; \
-  esac && \
-  mc_url="https://dl.min.io/client/mc/release/linux-${mc_arch}/archive/mc.${MC_VERSION}" && \
-  curl "$mc_url" \
-  --location \
-  --create-dirs \
-  --output /usr/local/bin/mc && \
-  printf '%s  /usr/local/bin/mc\n' "$mc_sha256" | sha256sum -c - && \
-  chmod +x /usr/local/bin/mc && \
-  apk del --purge curl
+  tar
 
+COPY --from=mc /out/mc /usr/local/bin/mc
 COPY bin/backup bin/restore bin/vb-test /usr/local/bin/

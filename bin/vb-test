@@ -31,6 +31,7 @@ TESTS_SKIPPED=0
 #   AWS_ENDPOINT_URL    (optional)
 #   TEST_S3_BUCKET      (required for S3 tests)
 #   TEST_S3_PREFIX      (optional)
+#   REQUIRE_S3_TESTS=1  (optional, turn S3 skips into failures)
 
 # ------------------------------------------------------------------------------
 # Logging helpers
@@ -313,6 +314,19 @@ s3_tests_enabled() {
   [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] || return 1
   command -v mc >/dev/null 2>&1 || return 1
   return 0
+}
+
+# Returns 0 when S3 tests can run, SKIP_RC when they cannot, and 1 instead of
+# skipping when REQUIRE_S3_TESTS=1 (CI must not go green on silent skips).
+require_s3_or_skip() {
+  s3_tests_enabled && return 0
+
+  if [[ "${REQUIRE_S3_TESTS:-0}" == 1 ]]; then
+    log "S3 tests are required (REQUIRE_S3_TESTS=1) but S3 is not configured"
+    return 1
+  fi
+
+  return "$SKIP_RC"
 }
 
 # ------------------------------------------------------------------------------
@@ -904,8 +918,135 @@ test_local_checksum_detects_tampering_after_move() {
   }
 }
 
+test_rejects_dot_and_escaping_volume_names() {
+  setup_case "rejects_dot_and_escaping_volume_names"
+
+  make_volume_content "alpha"
+  make_volume_content "victim"
+
+  local ts="20250101_131313"
+  local rejected_ts="20250101_131314"
+  local archive="$TEST_BACKUP_ROOT/alpha_${ts}.tar"
+  local snapshot="$CASE_ROOT/expected-victim"
+
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "victim" "$snapshot"
+
+  # A symlink inside VOLUMES_ROOT must not be followed out of it
+  mkdir -p "$CASE_ROOT/outside"
+  printf 'outside\n' > "$CASE_ROOT/outside/keep.txt"
+  ln -s ../outside "$TEST_VOLUMES_ROOT/escape"
+
+  local name rc
+  for name in . .. escape; do
+    rc=0
+    run_restore -i "$archive" -t "$name" -C 2>/dev/null || rc=$?
+    (( rc != 0 )) || {
+      log "BUG: restore accepted target volume '$name'"
+      return 1
+    }
+
+    rc=0
+    run_backup -v "$name" -T "$rejected_ts" 2>/dev/null || rc=$?
+    (( rc != 0 )) || {
+      log "BUG: backup accepted volume '$name'"
+      return 1
+    }
+  done
+
+  assert_dirs_equal "$snapshot" "$TEST_VOLUMES_ROOT/victim" || return 1
+  assert_file_exists "$archive" || return 1
+  assert_text_file_contains "$CASE_ROOT/outside/keep.txt" "outside" || return 1
+
+  [[ -z "$(find "$TEST_BACKUP_ROOT" -name "*_${rejected_ts}.tar*")" ]] || {
+    log "BUG: backup wrote an archive for a rejected volume name"
+    return 1
+  }
+}
+
+test_restore_all_skips_dot_named_backup_files() {
+  setup_case "restore_all_skips_dot_named_backup_files"
+
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_141414"
+  local newer="20250101_151515"
+  local snapshot_alpha="$CASE_ROOT/expected-alpha"
+  local snapshot_beta="$CASE_ROOT/expected-beta"
+
+  run_backup -v alpha -T "$ts" || return 1
+  copy_volume_snapshot "alpha" "$snapshot_alpha"
+  copy_volume_snapshot "beta" "$snapshot_beta"
+
+  # Stray files whose names parse as volumes '.', '..' and '._alpha'
+  # (e.g. macOS AppleDouble files left on a NAS share)
+  local stray
+  for stray in "._${newer}.tar" ".._${newer}.tar" "._alpha_${newer}.tar"; do
+    cp "$TEST_BACKUP_ROOT/alpha_${ts}.tar" "$TEST_BACKUP_ROOT/$stray"
+  done
+
+  replace_volume_with_marker "alpha" "alpha-mutated"
+
+  run_restore -a -C || return 1
+
+  assert_dirs_equal "$snapshot_alpha" "$TEST_VOLUMES_ROOT/alpha" || return 1
+  assert_dirs_equal "$snapshot_beta" "$TEST_VOLUMES_ROOT/beta" || return 1
+  assert_file_exists "$TEST_BACKUP_ROOT/alpha_${ts}.tar" || return 1
+}
+
+test_jobs_value_is_validated_before_use() {
+  setup_case "jobs_value_is_validated_before_use"
+
+  make_volume_content "alpha"
+
+  local marker="$CASE_ROOT/injected"
+  local payload="PATH[\$(touch $marker)]"
+  local rc
+
+  local -a invalid_runs=(
+    "backup -v alpha -n -j $payload"
+    "backup -a -n -j $payload"
+    "restore -i missing.tar -t alpha -j $payload"
+    "restore -a -n -j $payload"
+    "backup -a -n -j 0"
+    "backup -a -n -j 100"
+    "backup -a -n -j 1x"
+  )
+
+  local entry tool
+  local -a args
+  for entry in "${invalid_runs[@]}"; do
+    read -r -a args <<<"$entry"
+    tool="${args[0]}"
+    args=("${args[@]:1}")
+
+    rc=0
+    if [[ "$tool" == backup ]]; then
+      run_backup "${args[@]}" 2>/dev/null || rc=$?
+    else
+      run_restore "${args[@]}" 2>/dev/null || rc=$?
+    fi
+
+    (( rc != 0 )) || {
+      log "BUG: '$entry' was accepted"
+      return 1
+    }
+  done
+
+  assert_file_not_exists "$marker" || {
+    log "BUG: -j value was evaluated as an arithmetic expression"
+    return 1
+  }
+
+  run_backup -a -n -j 99 2>/dev/null || {
+    log "Expected -j 99 to be accepted"
+    return 1
+  }
+}
+
 test_s3_roundtrip_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
 
   setup_case "s3_roundtrip_optional"
 
@@ -933,7 +1074,7 @@ test_s3_roundtrip_optional() {
 }
 
 test_s3_checksum_roundtrip_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
 
   setup_case "s3_checksum_roundtrip_optional"
 
@@ -1018,7 +1159,7 @@ EOF
 }
 
 test_s3_backup_fails_on_overwrite_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
 
   setup_case "s3_backup_fails_on_overwrite_optional"
 
@@ -1054,7 +1195,7 @@ test_s3_backup_fails_on_overwrite_optional() {
 }
 
 test_s3_roundtrip_encrypted_optional() {
-  s3_tests_enabled || return "$SKIP_RC"
+  require_s3_or_skip || return $?
   command -v gpg >/dev/null 2>&1 || return "$SKIP_RC"
 
   setup_case "s3_roundtrip_encrypted_optional"
@@ -1163,6 +1304,9 @@ run_test "backup/restore sparse file"               test_backup_restore_sparse_f
 run_test "restore fails: VOLUMES_ROOT missing"      test_restore_fails_when_volumes_root_missing
 run_test "restore fails: target not mounted"        test_restore_fails_when_target_not_mounted
 run_test "local checksum detects tampering"         test_local_checksum_detects_tampering_after_move
+run_test "rejects ./.. and escaping volume names"   test_rejects_dot_and_escaping_volume_names
+run_test "restore all: skips dot-named files"       test_restore_all_skips_dot_named_backup_files
+run_test "-j is validated before use"               test_jobs_value_is_validated_before_use
 run_test "s3 roundtrip (optional)"                  test_s3_roundtrip_optional
 run_test "s3 checksum roundtrip (optional)"         test_s3_checksum_roundtrip_optional
 run_test "s3 backup fails closed on stat error"     test_s3_backup_fails_closed_on_stat_error

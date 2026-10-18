@@ -25,6 +25,9 @@ jobs:
       - name: commitlint
         run: npm run commitlint
 
+      - name: ShellCheck
+        run: shellcheck bin/backup bin/restore
+
       - name: Test
         run: docker compose -f compose.test.yaml run --rm --build test
 

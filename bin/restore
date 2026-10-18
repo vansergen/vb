@@ -2,14 +2,20 @@
 set -Eeuo pipefail
 umask 077
 
-readonly SCRIPT_NAME="$(basename "$0")"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
 readonly SELF_SCRIPT="${DVR_SELF:-$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")}"
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
 readonly GPG_ROOT="${GPG_ROOT:-/gpg}"
 
+# Docker volume names must start with an alphanumeric character; this also
+# rules out '.', '..' and other dot-names that would escape VOLUMES_ROOT.
+readonly VOLUME_NAME_RE='^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
+
 backup_root="$DEFAULT_BACKUP_ROOT"
+volumes_root_real=""
 
 source_arg=""
 target_volume=""
@@ -155,7 +161,7 @@ Options:
     -T <ts>     In -a mode, restore only backups with this timestamp
                 Format: YYYYMMDD_HHMMSS
     -v <name>   In -a mode, restore only this volume (repeatable)
-    -j <N>      Number of parallel restores in -a mode (default: 1)
+    -j <N>      Number of parallel restores in -a mode (1-99, default: 1)
     -C          Clear target volume before restore
     -n          Dry-run
     -h          Show help
@@ -244,10 +250,22 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+is_valid_volume_name() {
+  [[ "$1" =~ $VOLUME_NAME_RE ]]
+}
+
 validate_volume_name() {
-  local volume="$1"
-  [[ "$volume" =~ ^[a-zA-Z0-9._-]+$ ]] || die \
-    "Target volume name must contain only alphanumeric characters, dots, dashes, and underscores"
+  is_valid_volume_name "$1" || die \
+    "Invalid volume name '$1': it must start with a letter or digit and contain only alphanumeric characters, dots, dashes, and underscores"
+}
+
+# Prints the canonical path of VOLUMES_ROOT/<name>. Fails unless it resolves to
+# a directory that is a direct child of VOLUMES_ROOT (no symlink escapes).
+resolve_volume_dir() {
+  local real
+  real="$(realpath -e -- "${VOLUMES_ROOT%/}/$1" 2>/dev/null)" || return 1
+  [[ -d "$real" && "${real%/*}" == "$volumes_root_real" && "$real" != "$volumes_root_real" ]] || return 1
+  printf '%s\n' "$real"
 }
 
 dir_has_entries() {
@@ -435,10 +453,11 @@ validate_single_mode() {
   resolve_source
   detect_format
 
-  target_dir="${VOLUMES_ROOT%/}/$target_volume"
-
-  [[ -d "$target_dir" ]] || die \
+  [[ -d "${VOLUMES_ROOT%/}/$target_volume" ]] || die \
     "Target volume '$target_volume' is not mounted into ${VOLUMES_ROOT}. Add --volume ${target_volume}:${VOLUMES_ROOT%/}/${target_volume} to your docker run command."
+
+  target_dir="$(resolve_volume_dir "$target_volume")" || die \
+    "Refusing target volume '$target_volume': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
 
   if dir_has_entries "$target_dir" && (( clear_target == 0 )); then
     die "Target volume is not empty: $target_dir. Use -C to clear it before restore"
@@ -482,7 +501,8 @@ validate_single_mode() {
 clear_target_contents() {
   [[ -n "$target_dir" ]] || die "Internal error: target_dir is empty"
   [[ "$target_dir" != "/" ]] || die "Refusing to clear '/'"
-  [[ "$target_dir" == "${VOLUMES_ROOT%/}/"* ]] || die "Refusing to clear path outside ${VOLUMES_ROOT}"
+  [[ "${target_dir%/*}" == "$volumes_root_real" && "$target_dir" != "$volumes_root_real" ]] || die \
+    "Refusing to clear path outside ${VOLUMES_ROOT}: $target_dir"
 
   if [[ ! -d "$target_dir" ]]; then
     return 0
@@ -588,7 +608,7 @@ collect_backups_for_all_mode() {
     local vol="$parsed_volume"
     local ts="$parsed_timestamp"
 
-    if ! [[ "$vol" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    if ! is_valid_volume_name "$vol"; then
       log WARN "Skipping backup with unsafe volume name '${vol}': $filename"
       continue
     fi
@@ -790,8 +810,6 @@ run_all_restores() {
       "Invalid timestamp format: '$timestamp_filter'. Expected YYYYMMDD_HHMMSS"
   fi
 
-  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "Invalid -j value: '$jobs'. Expected positive integer"
-
   collect_backups_for_all_mode
   validate_requested_filters_in_all_mode
   build_child_args
@@ -889,11 +907,16 @@ done
 shift $((OPTIND - 1))
 [[ $# -eq 0 ]] || die "Unexpected extra arguments: $*"
 
+# Validate before any arithmetic: bash evaluates array subscripts in (( )).
+[[ "$jobs" =~ ^[1-9][0-9]?$ ]] || die "Invalid -j value: '$jobs'. Expected an integer from 1 to 99"
+
 # ------------------------------------------------------------------------------
 # Mode selection
 # ------------------------------------------------------------------------------
 
 [[ -d "$VOLUMES_ROOT" ]] || die "Volumes root not found: $VOLUMES_ROOT"
+volumes_root_real="$(realpath -e -- "$VOLUMES_ROOT")" || die "Unable to resolve volumes root: $VOLUMES_ROOT"
+[[ "$volumes_root_real" != "/" ]] || die "VOLUMES_ROOT must not be the filesystem root"
 
 if (( all_volumes )); then
   [[ -z "$source_arg" ]] || die "Option -i cannot be used with -a"
