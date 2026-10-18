@@ -681,7 +681,92 @@ docker run --rm \
   ghcr.io/vansergen/vb backup -v postgres_data -c -b my-bucket -f daily/prod
 ```
 
+### Self-hosted S3-compatible servers
+
+Every change is tested in CI against these servers. Each operation was checked separately, because support for one conditional request says nothing about the others:
+
+| Server                                              | Tested version | Conditional PUT (checksum file) | Conditional CompleteMultipartUpload (archive) | Conditional DELETE (rotation) | Upload token after multipart | Versioning |
+| --------------------------------------------------- | -------------- | ------------------------------- | --------------------------------------------- | ----------------------------- | ---------------------------- | ---------- |
+| [versitygw](https://github.com/versity/versitygw)   | 1.8.0          | yes (412)                       | yes (412)                                     | yes (412)                     | yes                          | yes¹       |
+| [SeaweedFS](https://github.com/seaweedfs/seaweedfs) | 4.48           | yes (412)                       | yes (412)                                     | yes (412)                     | yes                          | yes        |
+| [RustFS](https://github.com/rustfs/rustfs)          | 1.0.1          | yes (412)                       | yes (412)                                     | yes (412)                     | yes                          | yes        |
+
+¹ versitygw keeps versions only when started with `--versioning-dir`.
+
+All of them need path-style requests, which is the default for a custom `AWS_ENDPOINT_URL`, and accept `AWS_REGION=us-east-1`. The examples below start a single server with a Docker volume for its data; secure them (TLS, credentials) before exposing them.
+
+#### versitygw
+
+```bash
+docker run -d --name s3 -p 7070:7070 \
+  --env ROOT_ACCESS_KEY=<KEY_ID> --env ROOT_SECRET_KEY=<SECRET_KEY> \
+  --volume s3-data:/data \
+  versity/versitygw:v1.8.0 --port :7070 posix /data
+```
+
+#### SeaweedFS
+
+```bash
+docker run -d --name s3 -p 8333:8333 \
+  --env AWS_ACCESS_KEY_ID=<KEY_ID> --env AWS_SECRET_ACCESS_KEY=<SECRET_KEY> \
+  --volume s3-data:/data \
+  chrislusf/seaweedfs:4.48 mini -dir=/data
+```
+
+Without the two keys, SeaweedFS accepts anonymous requests.
+
+#### RustFS
+
+```bash
+docker run -d --name s3 -p 9000:9000 \
+  --env RUSTFS_ACCESS_KEY=<KEY_ID> --env RUSTFS_SECRET_KEY=<SECRET_KEY> \
+  --volume s3-data:/data \
+  rustfs/rustfs:1.0.1
+```
+
+#### Create a bucket and use it
+
+Any S3 client can create the bucket; `curl` is enough. Replace `s3-host:8333` with the address and port of your server:
+
+```bash
+curl --fail --user <KEY_ID>:<SECRET_KEY> --aws-sigv4 aws:amz:us-east-1:s3 \
+  -X PUT http://s3-host:8333/my-bucket
+```
+
+Then point the tool at the server:
+
+```bash
+docker run --rm \
+  --volume postgres_data:/volumes/postgres_data \
+  --env AWS_ACCESS_KEY_ID=<KEY_ID> \
+  --env AWS_SECRET_ACCESS_KEY=<SECRET_KEY> \
+  --env AWS_REGION=us-east-1 \
+  --env AWS_ENDPOINT_URL=http://s3-host:8333 \
+  ghcr.io/vansergen/vb backup -v postgres_data -z -b my-bucket -f daily -R 7
+
+docker run --rm --env AWS_ACCESS_KEY_ID=<KEY_ID> --env AWS_SECRET_ACCESS_KEY=<SECRET_KEY> \
+  --env AWS_ENDPOINT_URL=http://s3-host:8333 \
+  ghcr.io/vansergen/vb restore -l -b my-bucket -f daily
+
+docker run --rm \
+  --volume postgres_data:/volumes/postgres_data \
+  --env AWS_ACCESS_KEY_ID=<KEY_ID> --env AWS_SECRET_ACCESS_KEY=<SECRET_KEY> \
+  --env AWS_ENDPOINT_URL=http://s3-host:8333 \
+  ghcr.io/vansergen/vb restore -a -b my-bucket -f daily -C
+```
+
+To keep versions of overwritten or rotated objects (with a lifecycle rule that expires them), enable versioning on the bucket:
+
+```bash
+curl --fail --user <KEY_ID>:<SECRET_KEY> --aws-sigv4 aws:amz:us-east-1:s3 \
+  -X PUT -H 'Content-Type: application/xml' \
+  --data-binary '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' \
+  'http://s3-host:8333/my-bucket?versioning'
+```
+
 ### Back up to MinIO
+
+Not tested in CI: the MinIO community edition is no longer maintained, and its last images date from 2025.
 
 ```bash
 docker run --rm \
@@ -1202,11 +1287,15 @@ Files changed while the backup read them, so their copies may be inconsistent. T
 
 ## Running the Tests
 
-The test suite builds the test image and runs against two S3 servers ([versitygw](https://github.com/versity/versitygw), one of them with bucket versioning):
+The test suite builds the test image and runs the whole suite against [versitygw](https://github.com/versity/versitygw) (two servers, one with bucket versioning). `TEST_S3_TARGET` runs the S3 tests against another server instead:
 
 ```bash
 docker compose -f compose.test.yaml run --rm --build test
+docker compose -f compose.test.yaml run --rm --build -e TEST_S3_TARGET=seaweedfs test
+docker compose -f compose.test.yaml run --rm --build -e TEST_S3_TARGET=rustfs test
 ```
+
+With Podman, use `podman compose` with the same arguments.
 
 `bin/vb-test` also runs directly on a Linux host as root (it needs `bash`, GNU `tar`, `gpg`, `flock`, and for full coverage `getfattr`/`setfacl` and `zstd`). Useful variables:
 
@@ -1214,7 +1303,10 @@ docker compose -f compose.test.yaml run --rm --build test
 | ---------------------------- | -------------------------------------------------------------- |
 | `TEST_FILTER`                | Bash regex: run only the tests whose function name matches     |
 | `TEST_S3_BUCKET`, `AWS_*`    | S3 bucket and credentials for the S3 tests (skipped otherwise) |
-| `TEST_S3_VERSIONED_ENDPOINT` | Endpoint of a server with a versioned `TEST_S3_BUCKET`         |
+| `TEST_S3_VERSIONED_ENDPOINT` | Endpoint of the versioned bucket (default: `AWS_ENDPOINT_URL`) |
+| `TEST_S3_VERSIONED_BUCKET`   | Bucket with versioning (default: `TEST_S3_BUCKET`)             |
+| `TEST_S3_CREATE_BUCKETS=1`   | Wait for the server, create the buckets, enable versioning     |
+| `TEST_S3_PROVIDER`           | Name of the S3 server, shown in the log                        |
 | `REQUIRE_S3_TESTS=1`         | Fail instead of skipping when S3 is not configured             |
 | `REQUIRE_XATTR_TESTS=1`      | Fail when ACLs and extended attributes cannot be tested        |
 
