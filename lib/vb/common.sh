@@ -133,6 +133,10 @@ resolve_volume_dir() {
 # Stores the output of a command in an array. The command runs in the current
 # shell (not in a process substitution), so `die` inside it ends the script,
 # and any other failure is fatal too: a partial list is never used.
+#
+# The command runs with errexit off (it is called inside ||). It must report
+# every failure through its exit status or die: a function either checks each
+# of its steps or ends with the one pipeline whose status matters.
 #   vb_collect <array> <nul|line> <command> [args...]
 vb_collect() {
   local -n vb__collect_into="$1"

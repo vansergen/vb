@@ -161,7 +161,7 @@ catalog_scan_s3() {
   vb_collect lines line s3_list "$bucket" "$prefix"
   for line in "${lines[@]}"; do
     IFS=$'\t' read -r key size etag <<< "$line"
-    [[ -n "$key" ]] || continue
+    [[ -n "$key" ]] || die "Malformed listing of s3://${bucket}/${prefix}: an entry has no key"
     name="${key##*/}"
     sizes[$name]="$size"
     etags[$name]="$etag"

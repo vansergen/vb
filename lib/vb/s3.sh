@@ -441,7 +441,18 @@ s3__xml_unescape() {
   '
 }
 
+# Returns 0 if the response <file> contains <text> and 1 if it does not. A
+# read error is fatal: it must never pass for "not found".
+s3__body_contains() {
+  local rc=0
+  grep -qF -- "$2" "$1" || rc=$?
+  (( rc <= 1 )) || die "Failed to read the S3 response $1 (grep exit ${rc})"
+  return "$rc"
+}
+
 # Lists the direct children of a prefix as "<key>\t<size>\t<etag>" lines.
+# Meant for vb_collect: any failure, including a malformed entry, is fatal,
+# so a listing is either complete or not used at all.
 s3_list() {
   local bucket="$1" prefix="$2"
   local base body headers query token=""
@@ -460,21 +471,29 @@ s3_list() {
     s3__call "$body" "$headers" --retry 3 "${base}?${query}"
     [[ "$S3_STATUS" == 200 && "$S3_CURL_RC" == 0 ]] || die \
       "Failed to list s3://${bucket}/${prefix}: $(s3__describe "$body")"
-    grep -q '</ListBucketResult>' "$body" || die \
+    s3__body_contains "$body" '</ListBucketResult>' || die \
       "Incomplete listing of s3://${bucket}/${prefix}: the response ended early"
 
+    # Every entry needs a key and a size
     tr '<' '\n' < "$body" | awk -F'>' '
       $1 == "Contents" { key = ""; size = ""; etag = ""; inside = 1 }
       inside && $1 == "Key" { key = $2 }
       inside && $1 == "Size" { size = $2 }
       inside && $1 == "ETag" { etag = $2 }
-      $1 == "/Contents" { print key "\t" size "\t" etag; inside = 0 }
-    ' | s3__xml_unescape
+      $1 == "/Contents" {
+        if (key == "" || size !~ /^[0-9]+$/) { bad = 1; exit }
+        print key "\t" size "\t" etag
+        inside = 0
+      }
+      END { if (bad) exit 3 }
+    ' | s3__xml_unescape || die "Failed to parse the listing of s3://${bucket}/${prefix}"
 
-    grep -q '<IsTruncated>true</IsTruncated>' "$body" || break
+    s3__body_contains "$body" '<IsTruncated>true</IsTruncated>' || break
 
-    token="$(sed -n 's:.*<NextContinuationToken>\([^<]*\)</NextContinuationToken>.*:\1:p' "$body" | head -n 1)"
-    token="$(printf '%s\n' "$token" | s3__xml_unescape)"
+    token="$(sed -n 's:.*<NextContinuationToken>\([^<]*\)</NextContinuationToken>.*:\1:p' "$body")" \
+      || die "Failed to read the continuation token of s3://${bucket}/${prefix}"
+    token="$(printf '%s\n' "${token%%$'\n'*}" | s3__xml_unescape)" \
+      || die "Failed to decode the continuation token of s3://${bucket}/${prefix}"
     [[ -n "$token" ]] || die "S3 listing of s3://${bucket}/${prefix} is truncated but has no continuation token"
   done
 }

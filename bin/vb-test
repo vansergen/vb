@@ -563,8 +563,10 @@ t_s3_delete_prefix() {
 #   delete-ignores-if-match
 #                          drop the If-Match header of every DELETE (a provider
 #                          that ignores conditional deletes)
+#   list-paged             list two keys per page
 #   list-paged-fail        list two keys per page and answer 503 to every page
 #                          after the first
+#   list-malformed         drop the <Key> of every beta entry from listings
 #   list-truncated         cut a listing after its second entry, as a broken
 #                          transfer (HTTP 200, curl exit 18)
 #   get-truncated          cut a downloaded checksum file after the digest, as a
@@ -601,9 +603,9 @@ is_complete=0
 [[ \$is_post == 1 && "\$url" == *"?uploadId="* ]] && is_complete=1
 
 case "\$mode" in
-  list-paged-fail)
+  list-paged | list-paged-fail)
     if [[ "\$url" == *"list-type=2"* ]]; then
-      if [[ "\$url" == *"continuation-token="* ]]; then
+      if [[ "\$mode" == list-paged-fail && "\$url" == *"continuation-token="* ]]; then
         : > "\$state/fired"
         printf '<Error><Code>ServiceUnavailable</Code></Error>' > "\$out"
         printf '503'
@@ -615,6 +617,17 @@ case "\$mode" in
         args+=("\$arg")
       done
       exec "\$real_curl" "\${args[@]}"
+    fi
+    ;;
+  list-malformed)
+    if [[ "\$url" == *"list-type=2"* ]]; then
+      code="\$("\$real_curl" "\$@")" || exit \$?
+      body="\$(cat "\$out")"
+      cut="\$(sed 's:<Key>[^<]*/beta_[^<]*</Key>::g' <<< "\$body")"
+      [[ "\$cut" == "\$body" ]] || : > "\$state/fired"
+      printf '%s' "\$cut" > "\$out"
+      printf '%s' "\$code"
+      exit 0
     fi
     ;;
   list-truncated)
@@ -856,6 +869,29 @@ write_wrapper() {
   mkdir -p "$dir"
   cat > "$dir/$command"
   chmod +x "$dir/$command"
+}
+
+# Writes a wrapper <dir>/<command> that runs the real command, except for the
+# <n>th call whose arguments contain <text>: that call reports an I/O error,
+# touches <dir>/fired and exits 2. Calls are counted in <dir>/<command>.count.
+#   write_failing_wrapper <dir> <command> <text> <n>
+write_failing_wrapper() {
+  local dir="$1" command="$2" text="$3" n="$4" real
+  real="$(command -v "$command")"
+  write_wrapper "$dir" "$command" <<STUB
+#!/usr/bin/env bash
+text=$(printf '%q' "$text")
+if [[ " \$* " == *"\$text"* ]]; then
+  count=\$(( \$(cat '$dir/$command.count' 2>/dev/null || echo 0) + 1 ))
+  echo "\$count" > '$dir/$command.count'
+  if (( count == $n )); then
+    : > '$dir/fired'
+    echo '$command: Input/output error' >&2
+    exit 2
+  fi
+fi
+exec '$real' "\$@"
+STUB
 }
 
 # Runs a command that must fail because of an injected fault. Checks first
@@ -3606,10 +3642,11 @@ test_invalid_commit_decision_stops_recovery() {
 
 # Backups of alpha and beta in S3, a curl stub in <mode> that lets the
 # complete pair of alpha through and fails afterwards: restore -a and -l must
-# refuse, and the volumes stay as they are.
-#   check_incomplete_listing_is_refused <case> <mode>
+# refuse, and the volumes stay as they are. <setup>, if given, is called with
+# the stub directory to add more wrappers (which touch its "fired" too).
+#   check_incomplete_listing_is_refused <case> <mode> [<setup>]
 check_incomplete_listing_is_refused() {
-  local name="$1" mode="$2" ts="20250101_903000" prefix stub
+  local name="$1" mode="$2" setup="${3:-}" ts="20250101_903000" prefix stub
   require_s3_or_skip || return $?
   setup_case "$name"
   make_volume_content "alpha"
@@ -3621,13 +3658,14 @@ check_incomplete_listing_is_refused() {
 
   stub="$CASE_ROOT/stub"
   make_curl_stub "$stub" "$mode"
+  [[ -z "$setup" ]] || "$setup" "$stub"
   expect_injected_failure "$stub/fired" \
     run_restore_with_env PATH="$stub:$PATH" -- -a -b "$TEST_S3_BUCKET" -f "$prefix" -C || return 1
   assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
   assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
   assert_no_reserved_entries alpha beta || return 1
 
-  rm -f "$stub/fired"
+  rm -f "$stub/fired" "$stub"/*.count
   expect_injected_failure "$stub/fired" \
     run_restore_with_env PATH="$stub:$PATH" -- -l -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 }
@@ -3638,6 +3676,30 @@ test_s3_failed_listing_page_fails_optional() {
 
 test_s3_truncated_listing_fails_optional() {
   check_incomplete_listing_is_refused "s3_truncated_listing_fails_optional" list-truncated
+}
+
+# The parser of the second page (beta) fails; matched by its awk program
+listing_parser_fails_on_page_2() {
+  # shellcheck disable=SC2016
+  write_failing_wrapper "$1" awk '$1 == "Contents"' 2
+}
+
+test_s3_failed_listing_parser_fails_optional() {
+  check_incomplete_listing_is_refused "s3_failed_listing_parser_fails_optional" list-paged \
+    listing_parser_fails_on_page_2
+}
+
+# Reading the first page (alpha) to see whether more follow fails
+listing_read_fails() {
+  write_failing_wrapper "$1" grep '<IsTruncated>true</IsTruncated>' 1
+}
+
+test_s3_unreadable_listing_fails_optional() {
+  check_incomplete_listing_is_refused "s3_unreadable_listing_fails_optional" list-paged listing_read_fails
+}
+
+test_s3_malformed_listing_fails_optional() {
+  check_incomplete_listing_is_refused "s3_malformed_listing_fails_optional" list-malformed
 }
 
 test_s3_truncated_checksum_fails_optional() {
@@ -3887,6 +3949,9 @@ run_test "s3 rotation on versioned bucket"             test_s3_rotation_on_versi
 run_test "s3 failed listing page fails"                test_s3_failed_listing_page_fails_optional
 run_test "s3 truncated listing fails"                  test_s3_truncated_listing_fails_optional
 run_test "s3 truncated checksum fails"                 test_s3_truncated_checksum_fails_optional
+run_test "s3 failed listing parser fails"              test_s3_failed_listing_parser_fails_optional
+run_test "s3 unreadable listing fails"                 test_s3_unreadable_listing_fails_optional
+run_test "s3 malformed listing fails"                  test_s3_malformed_listing_fails_optional
 
 # ------------------------------------------------------------------------------
 # Summary
