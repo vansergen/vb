@@ -52,6 +52,7 @@ jobs:
         id: build
         with:
           context: .
+          target: runtime
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true

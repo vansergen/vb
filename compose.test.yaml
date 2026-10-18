@@ -20,7 +20,9 @@ services:
       - s3-data:/data
 
   test:
-    build: .
+    build:
+      context: .
+      target: test
     entrypoint: []
     command:
       - bash
@@ -31,8 +33,11 @@ services:
         # The S3 image ships no health probe, so wait until the bucket can be created.
         ready=0
         for _ in $$(seq 1 60); do
-          if mc alias set local http://s3:7070 vb_test_access_key vb_test_secret_key >/dev/null 2>&1 &&
-            mc mb --ignore-existing local/vb-test >/dev/null 2>&1; then
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            --user vb_test_access_key:vb_test_secret_key \
+            --aws-sigv4 aws:amz:us-east-1:s3 \
+            http://s3:7070/vb-test || true)
+          if [ "$$code" = 200 ] || [ "$$code" = 409 ]; then
             ready=1
             break
           fi
@@ -51,6 +56,8 @@ services:
       watch:
         - action: rebuild
           path: ./bin
+        - action: rebuild
+          path: ./lib
 
 volumes:
   s3-data:

@@ -63,6 +63,9 @@ die() {
 # ------------------------------------------------------------------------------
 
 cleanup() {
+  if [[ -n "${T_S3_CONFIG:-}" && -f "$T_S3_CONFIG" ]]; then
+    t_s3_delete_prefix "$S3_RUN_PREFIX" || true
+  fi
   rm -rf "$TEST_ROOT"
 }
 
@@ -319,18 +322,27 @@ EOF
 # Optional S3 helpers
 # ------------------------------------------------------------------------------
 
+# These helpers talk to S3 with plain curl on purpose: the tests must not rely
+# on the S3 client code they are testing.
+
+S3_RUN_PREFIX=""
+T_S3_CONFIG=""
+
 s3_tests_enabled() {
   [[ -n "${TEST_S3_BUCKET:-}" ]] || return 1
   [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] || return 1
   [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] || return 1
-  command -v mc >/dev/null 2>&1 || return 1
+  command -v curl >/dev/null 2>&1 || return 1
   return 0
 }
 
 # Returns 0 when S3 tests can run, SKIP_RC when they cannot, and 1 instead of
 # skipping when REQUIRE_S3_TESTS=1 (CI must not go green on silent skips).
 require_s3_or_skip() {
-  s3_tests_enabled && return 0
+  if s3_tests_enabled; then
+    t_s3_init
+    return 0
+  fi
 
   if [[ "${REQUIRE_S3_TESTS:-0}" == 1 ]]; then
     log "S3 tests are required (REQUIRE_S3_TESTS=1) but S3 is not configured"
@@ -338,6 +350,205 @@ require_s3_or_skip() {
   fi
 
   return "$SKIP_RC"
+}
+
+t_s3_init() {
+  [[ -z "$T_S3_CONFIG" ]] || return 0
+
+  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
+  base_prefix="${base_prefix#/}"
+  base_prefix="${base_prefix%/}"
+  S3_RUN_PREFIX="${base_prefix:+${base_prefix}/}run-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+
+  T_S3_CONFIG="$TEST_ROOT/curl-s3.conf"
+  (
+    umask 077
+    printf 'silent\nshow-error\npath-as-is\n'
+    printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+    printf 'aws-sigv4 = "aws:amz:%s:s3"\n' "${AWS_REGION:-us-east-1}"
+    if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
+      printf 'header = "x-amz-security-token: %s"\n' "$AWS_SESSION_TOKEN"
+    fi
+  ) > "$T_S3_CONFIG"
+}
+
+# Unique per-test prefix below the per-run prefix
+t_s3_prefix() {
+  printf '%s/%s\n' "$S3_RUN_PREFIX" "$1"
+}
+
+t_s3_url() {
+  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  printf '%s/%s/%s' "${endpoint%/}" "$TEST_S3_BUCKET" "$1"
+}
+
+# Prints the HTTP status of a HEAD request for the key
+t_s3_head() {
+  curl -K "$T_S3_CONFIG" -o /dev/null -w '%{http_code}' --head "$(t_s3_url "$1")" || true
+}
+
+t_s3_get() {
+  curl -K "$T_S3_CONFIG" --fail -o "$2" "$(t_s3_url "$1")"
+}
+
+# Uploads a file unconditionally; prints the HTTP status
+t_s3_put() {
+  local key="$1" file="$2"
+  shift 2
+  curl -K "$T_S3_CONFIG" -o /dev/null -w '%{http_code}' --upload-file "$file" "$@" "$(t_s3_url "$key")" || true
+}
+
+# Prints the number of in-progress multipart uploads for the key
+t_s3_pending_uploads() {
+  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${TEST_S3_BUCKET}?uploads&prefix=$1" \
+    | grep -o '<UploadId>' | wc -l
+}
+
+# Deletes every object below a prefix (test cleanup only)
+t_s3_delete_prefix() {
+  local prefix="$1" endpoint key
+  endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
+  [[ -n "$prefix" ]] || return 0
+
+  curl -K "$T_S3_CONFIG" --fail "${endpoint%/}/${TEST_S3_BUCKET}?list-type=2&prefix=${prefix}/" 2>/dev/null \
+    | tr '<' '\n' | awk -F'>' '$1 == "Key" { print $2 }' \
+    | while IFS= read -r key; do
+      curl -K "$T_S3_CONFIG" -o /dev/null -X DELETE "$(t_s3_url "$key")" || true
+    done
+}
+
+# Creates a curl wrapper in <dir> that records every invocation's arguments in
+# <dir>/curl.trace and can simulate S3 behaviour selected by <mode>:
+#   trace                  pass everything through
+#   deny                   answer every request with HTTP 403
+#   complete-501           answer conditional CompleteMultipartUpload with 501
+#   complete-lost          run the first CompleteMultipartUpload, then report a
+#                          transport error (the response got lost)
+#   complete-lost-foreign  instead of the first CompleteMultipartUpload, store a
+#                          foreign object at the key and report a transport error
+make_curl_stub() {
+  local dir="$1" mode="$2" real_curl
+  real_curl="$(command -v curl)"
+  mkdir -p "$dir"
+
+  cat > "$dir/curl" <<STUB
+#!/usr/bin/env bash
+real_curl='$real_curl'
+mode='$mode'
+state='$dir'
+printf '%s\n' "\$*" >> "\$state/curl.trace"
+
+out="" url="" conditional=0 is_post=0 has_w=0 prev=""
+for arg in "\$@"; do
+  case "\$prev" in
+    -o) out="\$arg" ;;
+    -w) has_w=1 ;;
+    -X) [[ "\$arg" == POST ]] && is_post=1 ;;
+    -H) [[ "\$arg" == "If-None-Match: *" ]] && conditional=1 ;;
+  esac
+  [[ "\$arg" == http://* || "\$arg" == https://* ]] && url="\$arg"
+  prev="\$arg"
+done
+is_complete=0
+[[ \$is_post == 1 && "\$url" == *"?uploadId="* ]] && is_complete=1
+
+case "\$mode" in
+  deny)
+    [[ -n "\$out" && "\$out" != /dev/null && "\$out" != - ]] && printf '<Error><Code>AccessDenied</Code></Error>' > "\$out"
+    if (( has_w )); then
+      printf '403'
+      exit 0
+    fi
+    exit 22
+    ;;
+  complete-501)
+    if (( is_complete && conditional )); then
+      printf '<Error><Code>NotImplemented</Code></Error>' > "\$out"
+      printf '501'
+      exit 0
+    fi
+    ;;
+  complete-lost)
+    if (( is_complete )) && [[ ! -e "\$state/lost.done" ]]; then
+      : > "\$state/lost.done"
+      "\$real_curl" "\$@" > /dev/null 2>&1
+      printf '000'
+      exit 52
+    fi
+    ;;
+  complete-lost-foreign)
+    if (( is_complete )) && [[ ! -e "\$state/lost.done" ]]; then
+      : > "\$state/lost.done"
+      printf 'foreign' > "\$state/foreign.bin"
+      "\$real_curl" -K '$T_S3_CONFIG' -o /dev/null --upload-file "\$state/foreign.bin" "\${url%%\?*}"
+      printf '000'
+      exit 52
+    fi
+    ;;
+esac
+
+exec "\$real_curl" "\$@"
+STUB
+  chmod +x "$dir/curl"
+}
+
+# Prints the PIDs of a process and all of its descendants
+process_tree_pids() {
+  local root="$1" stat_file content pid ppid current
+  local -A children=()
+
+  for stat_file in /proc/[0-9]*/stat; do
+    content="$(cat "$stat_file" 2>/dev/null)" || continue
+    pid="${content%% *}"
+    content="${content##*) }"
+    ppid="${content#* }"
+    ppid="${ppid%% *}"
+    children[$ppid]+=" $pid"
+  done
+
+  local -a queue=("$root")
+  while (( ${#queue[@]} > 0 )); do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+    printf '%s\n' "$current"
+    for pid in ${children[$current]:-}; do
+      queue+=("$pid")
+    done
+  done
+}
+
+# Runs backup in the background, pausing at a test point:
+#   start_paused_backup <point> [env assignments...] -- <backup args...>
+start_paused_backup() {
+  local point="$1"
+  shift
+  PAUSE_DIR="$CASE_ROOT/pause"
+  mkdir -p "$PAUSE_DIR"
+
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_PAUSE_AT="$point" VB_TEST_PAUSE_DIR="$PAUSE_DIR" "$@" \
+    > "$CASE_ROOT/paused.log" 2>&1 &
+  PAUSED_PID=$!
+}
+
+wait_for_point() {
+  local point="$1" i
+  for (( i = 0; i < 600; i++ )); do
+    [[ -e "$PAUSE_DIR/${point}.reached" ]] && return 0
+    kill -0 "$PAUSED_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  log "Process did not reach test point '$point'"
+  cat "$CASE_ROOT/paused.log" >&2 || true
+  return 1
+}
+
+resume_and_wait() {
+  local point="$1" rc=0
+  : > "$PAUSE_DIR/${point}.continue"
+  wait "$PAUSED_PID" || rc=$?
+  cat "$CASE_ROOT/paused.log" >&2 || true
+  return "$rc"
 }
 
 # ------------------------------------------------------------------------------
@@ -1044,23 +1255,13 @@ test_s3_roundtrip_optional() {
   make_volume_content "alpha"
 
   local ts="20250101_040000"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
-
-  local suffix="$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  local key="alpha_${ts}.tar.gz"
-  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+  local prefix
+  prefix="$(t_s3_prefix roundtrip)"
 
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
   prepare_target_volume "alpha_restore"
-  run_restore -i "$s3_uri" -t alpha_restore -C || return 1
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar.gz" -t alpha_restore -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
 }
 
@@ -1072,79 +1273,101 @@ test_s3_checksum_roundtrip_optional() {
   make_volume_content "alpha"
 
   local ts="20250101_040001"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
-
-  local suffix="chk-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  local key="alpha_${ts}.tar.gz"
-  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+  local prefix key
+  prefix="$(t_s3_prefix checksum)"
+  key="${prefix}/alpha_${ts}.tar.gz"
 
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
-  # Verify .sha256 was uploaded alongside the archive using mc directly
-  local mc_cfg
-  mc_cfg="$(mktemp -d)"
-  local endpoint="${AWS_ENDPOINT_URL:-https://s3.${AWS_REGION:-us-east-1}.amazonaws.com}"
-  local -a st_flags=()
-  [[ -z "${AWS_SESSION_TOKEN:-}" ]] || st_flags=(--session-token "$AWS_SESSION_TOKEN")
-  mc --config-dir "$mc_cfg" alias set vb "$endpoint" \
-    "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "${st_flags[@]}" >/dev/null 2>&1
-  local sha_exists=0
-  mc --config-dir "$mc_cfg" stat "vb/${TEST_S3_BUCKET}/${prefix}/${key}.sha256" \
-    >/dev/null 2>&1 && sha_exists=1
-  rm -rf "$mc_cfg"
-
-  (( sha_exists )) || {
+  [[ "$(t_s3_head "${key}.sha256")" == 200 ]] || {
     log "BUG: .sha256 was not uploaded to S3 alongside the archive"
     return 1
   }
 
-  # Restore normally — checksum is verified automatically during download
-  prepare_target_volume "alpha_restore"
-  run_restore -i "$s3_uri" -t alpha_restore -C || return 1
+  # The archive and its sidecar carry the same publication token
+  local archive_token sidecar_token
+  archive_token="$(curl -K "$T_S3_CONFIG" --head "$(t_s3_url "$key")" | tr -d '\r' | awk 'tolower($1) == "x-amz-meta-vb-token:" { print $2 }')"
+  sidecar_token="$(curl -K "$T_S3_CONFIG" --head "$(t_s3_url "${key}.sha256")" | tr -d '\r' | awk 'tolower($1) == "x-amz-meta-vb-token:" { print $2 }')"
+  [[ -n "$archive_token" && "$archive_token" == "$sidecar_token" ]] || {
+    log "BUG: archive and sidecar tokens differ: '$archive_token' vs '$sidecar_token'"
+    return 1
+  }
+
+  # A corrupted sidecar must make the restore fail and leave the target alone
+  t_s3_get "${key}.sha256" "$CASE_ROOT/good.sha256" || return 1
+  printf '%064d  alpha_%s.tar.gz\n' 0 "$ts" > "$CASE_ROOT/bad.sha256"
+  [[ "$(t_s3_put "${key}.sha256" "$CASE_ROOT/bad.sha256")" == 200 ]] || return 1
+
+  replace_volume_with_marker "alpha_restore" "must-survive"
+  local rc=0
+  run_restore -i "s3://${TEST_S3_BUCKET}/${key}" -t alpha_restore -C 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: restore accepted an archive that does not match its checksum"
+    return 1
+  }
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha_restore/marker.txt" "must-survive" || return 1
+
+  [[ "$(t_s3_put "${key}.sha256" "$CASE_ROOT/good.sha256")" == 200 ]] || return 1
+  run_restore -i "s3://${TEST_S3_BUCKET}/${key}" -t alpha_restore -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
 }
 
-test_s3_backup_fails_closed_on_stat_error() {
-  setup_case "s3_backup_fails_closed_on_stat_error"
+test_s3_backup_fails_closed_on_head_error() {
+  setup_case "s3_backup_fails_closed_on_head_error"
   make_volume_content "alpha"
 
-  # Stub `mc` that simulates a non-"not found" error from `mc stat`
-  # (e.g. access denied, network issue) while letting alias/pipe pass.
-  local stub_bin="$CASE_ROOT/stub-bin"
-  mkdir -p "$stub_bin"
-  cat > "$stub_bin/mc" <<'EOF'
-#!/usr/bin/env bash
-# args: --config-dir <dir> <verb> ...
-verb="$3"
-if [[ "$verb" == "stat" ]]; then
-  printf 'mc: <ERROR> Unable to stat: Access Denied.\n' >&2
-  exit 1
-fi
-# Pretend other verbs succeed silently — the script must die before reaching them.
-exit 0
-EOF
-  chmod +x "$stub_bin/mc"
+  # A HEAD answer other than 200/404 (here: 403) must stop the backup before
+  # anything is uploaded; it must never be read as "object does not exist".
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" deny
 
   local rc=0
-  env \
-    NO_COLOR=1 \
-    BACKUP_ROOT="$TEST_BACKUP_ROOT" \
-    VOLUMES_ROOT="$TEST_VOLUMES_ROOT" \
-    GPG_ROOT="$TEST_GPG_ROOT" \
+  run_backup_with_env \
     AWS_ACCESS_KEY_ID=dummy \
     AWS_SECRET_ACCESS_KEY=dummy \
-    PATH="$stub_bin:$PATH" \
-    bash "$BACKUP_BIN" -v alpha -T 20250101_444444 -c -b irrelevant 2>/dev/null || rc=$?
+    AWS_ENDPOINT_URL=http://127.0.0.1:9 \
+    PATH="$stub:$PATH" \
+    -- -v alpha -T 20250101_444444 -c -b irrelevant 2>/dev/null || rc=$?
 
   (( rc != 0 )) || {
-    log "BUG: backup proceeded despite ambiguous mc stat error — should fail closed"
+    log "BUG: backup proceeded despite an ambiguous HEAD answer — should fail closed"
+    return 1
+  }
+
+  ! grep -q '?uploads' "$stub/curl.trace" || {
+    log "BUG: backup started an upload after an ambiguous HEAD answer"
+    return 1
+  }
+}
+
+test_s3_rejects_unsafe_keys() {
+  setup_case "s3_rejects_unsafe_keys"
+  make_volume_content "alpha"
+  prepare_target_volume "alpha_restore"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" deny
+
+  local -a s3_env=(
+    AWS_ACCESS_KEY_ID=dummy
+    AWS_SECRET_ACCESS_KEY=dummy
+    AWS_ENDPOINT_URL=http://127.0.0.1:9
+    PATH="$stub:$PATH"
+  )
+
+  local folder
+  for folder in 'a/../b' 'a//b' './x' 'a/./b' 'a b' 'a/..'; do
+    expect_rejected run_backup_with_env "${s3_env[@]}" -- -v alpha -T 20250101_454545 -b bucket -f "$folder" || return 1
+  done
+
+  local source
+  for source in 's3://bucket/a/../x.tar' 's3://bucket//x.tar' 's3://bucket/' 's3://Bad_Bucket/x.tar'; do
+    expect_rejected run_restore_with_env "${s3_env[@]}" -- -i "$source" -t alpha_restore || return 1
+  done
+
+  [[ ! -s "$stub/curl.trace" ]] || {
+    log "BUG: an unsafe key reached the network:"
+    cat "$stub/curl.trace" >&2
     return 1
   }
 }
@@ -1157,25 +1380,14 @@ test_s3_backup_fails_on_overwrite_optional() {
   make_volume_content "alpha"
 
   local ts="20250101_333333"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
+  local prefix
+  prefix="$(t_s3_prefix overwrite)"
 
-  local suffix="overwrite-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  # First backup — must succeed
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
   # Mutate the source so a re-run would produce different bytes
   printf 'second-version\n' > "$TEST_VOLUMES_ROOT/alpha/second.txt"
 
-  # Second backup with the same timestamp must fail — the local backup path
-  # already protects against this via [[ ! -e ]], so the default for S3
-  # should match. A silent overwrite destroys the original recovery point.
   local rc=0
   run_backup -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
 
@@ -1195,24 +1407,266 @@ test_s3_roundtrip_encrypted_optional() {
   export GPG_PASSPHRASE="test-s3-encrypted-passphrase"
 
   local ts="20250101_090006"
-  local base_prefix="${TEST_S3_PREFIX:-docker-volume-tests}"
-  base_prefix="${base_prefix#/}"
-  base_prefix="${base_prefix%/}"
-
-  local suffix="enc-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
-  local prefix="$suffix"
-  if [[ -n "$base_prefix" ]]; then
-    prefix="${base_prefix}/${suffix}"
-  fi
-
-  local key="alpha_${ts}.tar.gz.gpg"
-  local s3_uri="s3://${TEST_S3_BUCKET}/${prefix}/${key}"
+  local prefix
+  prefix="$(t_s3_prefix encrypted)"
 
   run_backup -v alpha -T "$ts" -c -s -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
 
   prepare_target_volume "alpha_restore"
-  run_restore -i "$s3_uri" -t alpha_restore -s -C || return 1
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar.gz.gpg" -t alpha_restore -s -C || return 1
   assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_multipart_roundtrip_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_multipart_roundtrip_optional"
+
+  make_volume_content "alpha"
+  dd if=/dev/urandom of="$TEST_VOLUMES_ROOT/alpha/big.bin" bs=1M count=12 status=none
+
+  local ts="20250101_500000"
+  local prefix
+  prefix="$(t_s3_prefix multipart)"
+
+  # 12 MiB of random data in 5 MiB parts: three parts, the last one short
+  run_backup_with_env S3_PART_SIZE=5 -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_${ts}.tar" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_failed_stream_publishes_nothing_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_failed_stream_publishes_nothing_optional"
+  make_volume_content "alpha"
+
+  # A compressor that emits 7 MiB (more than one 5 MiB part) and then fails:
+  # the uploader sees a normal end of stream, but nothing may be published.
+  local stub="$CASE_ROOT/stub"
+  mkdir -p "$stub"
+  printf '#!/usr/bin/env bash\nhead -c 7340032 /dev/urandom\nexit 1\n' > "$stub/pigz"
+  chmod +x "$stub/pigz"
+
+  local ts="20250101_510000"
+  local prefix key
+  prefix="$(t_s3_prefix failed-stream)"
+  key="${prefix}/alpha_${ts}.tar.gz"
+
+  local rc=0
+  run_backup_with_env S3_PART_SIZE=5 PATH="$stub:$PATH" -- \
+    -v alpha -T "$ts" -c -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
+
+  (( rc != 0 )) || {
+    log "BUG: backup reported success although the compressor failed"
+    return 1
+  }
+
+  [[ "$(t_s3_head "$key")" == 404 ]] || {
+    log "BUG: a truncated archive was published at $key"
+    return 1
+  }
+  [[ "$(t_s3_head "${key}.sha256")" == 404 ]] || return 1
+
+  [[ "$(t_s3_pending_uploads "$key")" == 0 ]] || {
+    log "BUG: the failed multipart upload was not aborted"
+    return 1
+  }
+}
+
+test_s3_concurrent_object_is_not_overwritten_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_concurrent_object_is_not_overwritten_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_520000"
+  local prefix key
+  prefix="$(t_s3_prefix concurrent)"
+  key="${prefix}/alpha_${ts}.tar"
+
+  start_paused_backup s3_before_complete -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point s3_before_complete || return 1
+
+  # Another writer publishes the same key after our existence check
+  printf 'foreign\n' > "$CASE_ROOT/foreign.bin"
+  [[ "$(t_s3_put "$key" "$CASE_ROOT/foreign.bin")" == 200 ]] || return 1
+
+  local rc=0
+  resume_and_wait s3_before_complete 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup overwrote an object that appeared while it was uploading"
+    return 1
+  }
+
+  t_s3_get "$key" "$CASE_ROOT/after.bin" || return 1
+  cmp -s "$CASE_ROOT/foreign.bin" "$CASE_ROOT/after.bin" || {
+    log "BUG: the concurrently written object was replaced"
+    return 1
+  }
+  [[ "$(t_s3_pending_uploads "$key")" == 0 ]] || return 1
+}
+
+test_s3_requires_conditional_writes_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_requires_conditional_writes_optional"
+  make_volume_content "alpha"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" complete-501
+
+  local prefix
+  prefix="$(t_s3_prefix no-conditional)"
+
+  local rc=0
+  run_backup_with_env PATH="$stub:$PATH" -- \
+    -v alpha -T 20250101_530000 -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup published without overwrite protection and without opt-in"
+    return 1
+  }
+  [[ "$(t_s3_head "${prefix}/alpha_20250101_530000.tar")" == 404 ]] || return 1
+
+  # Explicit opt-in publishes without the condition
+  run_backup_with_env PATH="$stub:$PATH" S3_ALLOW_UNCONDITIONAL_WRITES=1 -- \
+    -v alpha -T 20250101_530001 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_20250101_530001.tar" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+}
+
+test_s3_lost_complete_response_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_lost_complete_response_optional"
+  make_volume_content "alpha"
+
+  local prefix
+  prefix="$(t_s3_prefix lost-response)"
+
+  # Our own completion succeeded but the response got lost: the retry sees
+  # the object, recognises our token, and the backup succeeds.
+  local stub_ours="$CASE_ROOT/stub-ours"
+  make_curl_stub "$stub_ours" complete-lost
+  run_backup_with_env PATH="$stub_ours:$PATH" -- \
+    -v alpha -T 20250101_540000 -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+
+  prepare_target_volume "alpha_restore"
+  run_restore -i "s3://${TEST_S3_BUCKET}/${prefix}/alpha_20250101_540000.tar" -t alpha_restore || return 1
+  assert_dirs_equal "$TEST_VOLUMES_ROOT/alpha" "$TEST_VOLUMES_ROOT/alpha_restore" || return 1
+
+  # Someone else's object occupies the key: the retry sees a foreign token
+  local stub_foreign="$CASE_ROOT/stub-foreign"
+  make_curl_stub "$stub_foreign" complete-lost-foreign
+  local key="${prefix}/alpha_20250101_540001.tar"
+  local rc=0
+  run_backup_with_env PATH="$stub_foreign:$PATH" -- \
+    -v alpha -T 20250101_540001 -b "$TEST_S3_BUCKET" -f "$prefix" 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup claimed a foreign object as its own"
+    return 1
+  }
+
+  t_s3_get "$key" "$CASE_ROOT/after.bin" || return 1
+  [[ "$(cat "$CASE_ROOT/after.bin")" == foreign ]] || return 1
+  [[ "$(t_s3_head "${key}.sha256")" == 404 ]] || return 1
+}
+
+test_s3_sidecar_conflict_keeps_archive_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_sidecar_conflict_keeps_archive_optional"
+  make_volume_content "alpha"
+
+  local ts="20250101_550000"
+  local prefix key
+  prefix="$(t_s3_prefix sidecar-conflict)"
+  key="${prefix}/alpha_${ts}.tar"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" trace
+
+  start_paused_backup s3_before_sidecar PATH="$stub:$PATH" -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point s3_before_sidecar || return 1
+
+  printf '%064d  foreign\n' 1 > "$CASE_ROOT/foreign.sha256"
+  [[ "$(t_s3_put "${key}.sha256" "$CASE_ROOT/foreign.sha256")" == 200 ]] || return 1
+
+  local rc=0
+  resume_and_wait s3_before_sidecar 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: backup reported success although its sidecar could not be published"
+    return 1
+  }
+
+  [[ "$(t_s3_head "$key")" == 200 ]] || {
+    log "BUG: the uploaded archive was removed"
+    return 1
+  }
+  t_s3_get "${key}.sha256" "$CASE_ROOT/after.sha256" || return 1
+  cmp -s "$CASE_ROOT/foreign.sha256" "$CASE_ROOT/after.sha256" || {
+    log "BUG: the foreign sidecar was overwritten"
+    return 1
+  }
+
+  # No object DELETE at all (aborting a multipart upload uses ?uploadId=)
+  ! grep -E -- '-X DELETE' "$stub/curl.trace" | grep -vq 'uploadId=' || {
+    log "BUG: backup issued an object DELETE"
+    return 1
+  }
+
+  # Without -U, the archive whose sidecar is foreign must not be restored
+  prepare_target_volume "alpha_restore"
+  rc=0
+  run_restore -i "s3://${TEST_S3_BUCKET}/${key}" -t alpha_restore 2>/dev/null || rc=$?
+  (( rc != 0 )) || {
+    log "BUG: restore accepted an archive with a mismatching sidecar"
+    return 1
+  }
+}
+
+test_s3_credentials_stay_off_the_command_line_optional() {
+  require_s3_or_skip || return $?
+
+  setup_case "s3_credentials_stay_off_the_command_line_optional"
+  make_volume_content "alpha"
+
+  local stub="$CASE_ROOT/stub"
+  make_curl_stub "$stub" trace
+
+  local ts="20250101_560000"
+  local prefix
+  prefix="$(t_s3_prefix credentials)"
+
+  start_paused_backup s3_before_complete PATH="$stub:$PATH" -- -v alpha -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix"
+  wait_for_point s3_before_complete || return 1
+
+  # No running process may carry the secret in its command line
+  # No process of the paused backup may carry the secret in its command line.
+  # Compare inside bash: an external grep would carry the secret in its argv.
+  local pid content leaked=0
+  while IFS= read -r pid; do
+    content="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || continue
+    [[ "$content" != *"$AWS_SECRET_ACCESS_KEY"* ]] || leaked=1
+  done < <(process_tree_pids "$PAUSED_PID")
+
+  resume_and_wait s3_before_complete 2>/dev/null || return 1
+
+  (( leaked == 0 )) || {
+    log "BUG: the S3 secret appeared in a process command line"
+    return 1
+  }
+
+  local trace
+  trace="$(cat "$stub/curl.trace")"
+  [[ -n "$trace" && "$trace" != *"$AWS_SECRET_ACCESS_KEY"* ]] || {
+    log "BUG: the S3 secret was passed to curl on the command line (or curl was never called)"
+    return 1
+  }
 }
 
 # ------------------------------------------------------------------------------
@@ -1298,11 +1752,19 @@ run_test "local checksum detects tampering"         test_local_checksum_detects_
 run_test "rejects ./.. and escaping volume names"   test_rejects_dot_and_escaping_volume_names
 run_test "restore all: skips dot-named files"       test_restore_all_skips_dot_named_backup_files
 run_test "-j is validated before use"               test_jobs_value_is_validated_before_use
+run_test "s3 backup fails closed on HEAD error"     test_s3_backup_fails_closed_on_head_error
+run_test "s3 rejects unsafe keys"                   test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                  test_s3_roundtrip_optional
 run_test "s3 checksum roundtrip (optional)"         test_s3_checksum_roundtrip_optional
-run_test "s3 backup fails closed on stat error"     test_s3_backup_fails_closed_on_stat_error
 run_test "s3 backup fails on overwrite (optional)"  test_s3_backup_fails_on_overwrite_optional
 run_test "s3 roundtrip encrypted (optional)"        test_s3_roundtrip_encrypted_optional
+run_test "s3 multipart roundtrip (optional)"        test_s3_multipart_roundtrip_optional
+run_test "s3 failed stream publishes nothing"       test_s3_failed_stream_publishes_nothing_optional
+run_test "s3 concurrent object kept (optional)"     test_s3_concurrent_object_is_not_overwritten_optional
+run_test "s3 needs conditional writes (optional)"   test_s3_requires_conditional_writes_optional
+run_test "s3 lost Complete response (optional)"     test_s3_lost_complete_response_optional
+run_test "s3 sidecar conflict keeps archive"        test_s3_sidecar_conflict_keeps_archive_optional
+run_test "s3 credentials not on command line"       test_s3_credentials_stay_off_the_command_line_optional
 
 # ------------------------------------------------------------------------------
 # Summary

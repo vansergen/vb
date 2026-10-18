@@ -26,7 +26,7 @@ jobs:
         run: npm run commitlint
 
       - name: ShellCheck
-        run: shellcheck bin/backup bin/restore
+        run: shellcheck -x bin/backup bin/restore lib/vb/*.sh
 
       - name: Test
         run: docker compose -f compose.test.yaml run --rm --build test

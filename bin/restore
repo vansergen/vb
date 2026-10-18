@@ -4,18 +4,25 @@ umask 077
 
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly SELF_SCRIPT="${DVR_SELF:-$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")}"
+SCRIPT_REAL="$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")"
+readonly SCRIPT_REAL
+readonly SELF_SCRIPT="${DVR_SELF:-$SCRIPT_REAL}"
+readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
+
+[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" ]] || {
+  printf '%s: library directory not found: %s (set VB_LIB_DIR)\n' "$SCRIPT_NAME" "$VB_LIB_DIR" >&2
+  exit 1
+}
+# shellcheck source=SCRIPTDIR/../lib/vb/common.sh
+source "${VB_LIB_DIR}/common.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/s3.sh
+source "${VB_LIB_DIR}/s3.sh"
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
 readonly GPG_ROOT="${GPG_ROOT:-/gpg}"
 
-# Docker volume names must start with an alphanumeric character; this also
-# rules out '.', '..' and other dot-names that would escape VOLUMES_ROOT.
-readonly VOLUME_NAME_RE='^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
-
 backup_root="$DEFAULT_BACKUP_ROOT"
-volumes_root_real=""
 
 source_arg=""
 target_volume=""
@@ -42,12 +49,11 @@ compressed=0
 src_path=""
 source_name=""
 target_dir=""
-tmp_dir=""
 tmp_restore_dir=""
 s3_expected_checksum=""
 s3_sha_file=""
-mc_config_dir=""
-s3_mc_path=""
+s3_bucket=""
+s3_key=""
 
 parsed_volume=""
 parsed_timestamp=""
@@ -55,75 +61,11 @@ parsed_timestamp=""
 gpg_raw_private_key="${GPG_PRIVATE_KEY:-}"
 gpg_passphrase="${GPG_PASSPHRASE:-}"
 
-aws_access_key_id="${AWS_ACCESS_KEY_ID:-}"
-aws_secret_access_key="${AWS_SECRET_ACCESS_KEY:-}"
-aws_session_token="${AWS_SESSION_TOKEN:-}"
-aws_region="${AWS_REGION:-us-east-1}"
-aws_endpoint_url="${AWS_ENDPOINT_URL:-}"
-
 decompressor_cmd=()
 decompressor_name="none"
 
-tar_extra_flags=()
-
 failed=0
 wait_supports_p=0
-
-# ------------------------------------------------------------------------------
-# Colors
-# ------------------------------------------------------------------------------
-
-if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
-  readonly COLOR_RESET=$'\033[0m'
-  readonly COLOR_RED=$'\033[0;31m'
-  readonly COLOR_YELLOW=$'\033[0;33m'
-  readonly COLOR_GREEN=$'\033[0;32m'
-else
-  readonly COLOR_RESET=""
-  readonly COLOR_RED=""
-  readonly COLOR_YELLOW=""
-  readonly COLOR_GREEN=""
-fi
-
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
-
-log() {
-  local level="INFO"
-  local color="$COLOR_GREEN"
-
-  case "${1:-}" in
-    ERROR)
-      level="ERROR"
-      color="$COLOR_RED"
-      shift
-      ;;
-    WARN)
-      level="WARN"
-      color="$COLOR_YELLOW"
-      shift
-      ;;
-    INFO)
-      level="INFO"
-      color="$COLOR_GREEN"
-      shift
-      ;;
-  esac
-
-  printf '[%s] %s %b[%s]%b %s\n' \
-    "$SCRIPT_NAME" \
-    "$(date '+%Y-%m-%d %H:%M:%S')" \
-    "$color" \
-    "$level" \
-    "$COLOR_RESET" \
-    "$*" >&2
-}
-
-die() {
-  log ERROR "$*"
-  exit 1
-}
 
 # ------------------------------------------------------------------------------
 # Usage
@@ -180,8 +122,10 @@ Environment variables:
   AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 restore)
   AWS_SECRET_ACCESS_KEY S3 secret access key (required for S3 restore)
   AWS_SESSION_TOKEN     Optional session token for temporary credentials
-  AWS_REGION            S3 region (default: us-east-1)
-  AWS_ENDPOINT_URL      Optional custom S3 endpoint (MinIO, Yandex Cloud, DO Spaces, etc.)
+  AWS_REGION            S3 region (AWS: detected from the bucket when unset; custom endpoints: us-east-1)
+  AWS_DEFAULT_REGION    Fallback for AWS_REGION
+  AWS_ENDPOINT_URL      Optional custom S3 endpoint, scheme://host[:port] (MinIO, Yandex Cloud, DO Spaces, etc.)
+  S3_ADDRESSING_STYLE   auto (default), path or virtual
   NO_COLOR              Disable colors in logs
 
 Supported formats:
@@ -220,13 +164,7 @@ cleanup() {
     rm -rf "$tmp_restore_dir"
   fi
 
-  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
-    rm -rf "$tmp_dir"
-  fi
-
-  if [[ -n "$mc_config_dir" && -d "$mc_config_dir" ]]; then
-    rm -rf "$mc_config_dir"
-  fi
+  cleanup_work_dir
 }
 
 terminate_children() {
@@ -245,28 +183,6 @@ trap 'log WARN "Terminated"; terminate_children; wait || true; exit 143' TERM
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
-}
-
-is_valid_volume_name() {
-  [[ "$1" =~ $VOLUME_NAME_RE ]]
-}
-
-validate_volume_name() {
-  is_valid_volume_name "$1" || die \
-    "Invalid volume name '$1': it must start with a letter or digit and contain only alphanumeric characters, dots, dashes, and underscores"
-}
-
-# Prints the canonical path of VOLUMES_ROOT/<name>. Fails unless it resolves to
-# a directory that is a direct child of VOLUMES_ROOT (no symlink escapes).
-resolve_volume_dir() {
-  local real
-  real="$(realpath -e -- "${VOLUMES_ROOT%/}/$1" 2>/dev/null)" || return 1
-  [[ -d "$real" && "${real%/*}" == "$volumes_root_real" && "$real" != "$volumes_root_real" ]] || return 1
-  printf '%s\n' "$real"
-}
 
 dir_has_entries() {
   local dir="$1"
@@ -314,53 +230,14 @@ detect_format() {
   fi
 }
 
-construct_s3_path() {
-  local s3_path="${src_path#s3://}"
-  local bucket="${s3_path%%/*}"
-  local key="${s3_path#*/}"
+parse_s3_source() {
+  local path="${src_path#s3://}"
+  s3_bucket="${path%%/*}"
+  s3_key="${path#*/}"
 
-  [[ -n "$bucket" && "$bucket" != "$s3_path" ]] || die "Invalid S3 path: $src_path"
-
-  s3_mc_path="vb/${bucket}/${key}"
-}
-
-prepare_s3_client() {
-  mc_config_dir="$(mktemp -d)"
-
-  local endpoint
-  if [[ -n "$aws_endpoint_url" ]]; then
-    endpoint="$aws_endpoint_url"
-  else
-    endpoint="https://s3.${aws_region}.amazonaws.com"
-  fi
-
-  local -a session_token_flag=()
-  if [[ -n "$aws_session_token" ]]; then
-    session_token_flag=(--session-token "$aws_session_token")
-  fi
-
-  mc --config-dir "$mc_config_dir" alias set vb \
-    "$endpoint" \
-    "$aws_access_key_id" \
-    "$aws_secret_access_key" \
-    "${session_token_flag[@]}" \
-    >/dev/null 2>&1 \
-    || die "Failed to configure S3 client"
-}
-
-prepare_tar_flags() {
-  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
-    tar_extra_flags=(--acls --xattrs '--xattrs-include=*' --sparse)
-  fi
-}
-
-prepare_gpg_home() {
-  tmp_dir="$(mktemp -d)"
-  export GNUPGHOME="${tmp_dir}/gnupg"
-  mkdir -p "$GNUPGHOME"
-  chmod 700 "$GNUPGHOME"
-  printf 'allow-loopback-pinentry\n' > "${GNUPGHOME}/gpg-agent.conf"
-  gpgconf --launch gpg-agent >/dev/null 2>&1 || true
+  [[ -n "$s3_bucket" && "$s3_bucket" != "$path" && -n "$s3_key" ]] || die "Invalid S3 path: $src_path"
+  s3_validate_bucket "$s3_bucket"
+  s3_validate_key "$s3_key"
 }
 
 prepare_asymmetric_gpg() {
@@ -369,7 +246,7 @@ prepare_asymmetric_gpg() {
   prepare_gpg_home
 
   if [[ -n "$gpg_raw_private_key" ]]; then
-    key_source="${tmp_dir}/private.key"
+    key_source="${work_dir}/private.key"
     printf '%s' "$gpg_raw_private_key" > "$key_source"
     chmod 600 "$key_source"
   else
@@ -418,17 +295,18 @@ verify_local_checksum_if_present() {
 setup_s3_checksum_verification() {
   (( download_from_s3 )) || return 0
 
-  [[ -n "$tmp_dir" ]] || tmp_dir="$(mktemp -d)"
-  local s3_sha_mc_path="${s3_mc_path}.sha256"
-  local checksum_file="${tmp_dir}/expected.sha256"
+  ensure_work_dir
+  local sidecar="${work_dir}/expected.sha256"
 
-  if ! mc --config-dir "$mc_config_dir" cat "$s3_sha_mc_path" > "$checksum_file" 2>/dev/null; then
+  # Only a confirmed "not found" may skip verification; any other error is fatal.
+  if ! s3_head "$s3_bucket" "${s3_key}.sha256"; then
     log WARN "No checksum file found in S3, skipping verification"
     return 0
   fi
 
-  s3_expected_checksum="$(awk '{print $1}' "$checksum_file")"
-  s3_sha_file="${tmp_dir}/actual.sha"
+  s3_get_file "$s3_bucket" "${s3_key}.sha256" "$sidecar" || die "Checksum file disappeared from S3: ${src_path}.sha256"
+  s3_expected_checksum="$(read_sidecar_digest "$sidecar")" || die "Checksum file is empty or malformed: ${src_path}.sha256"
+  s3_sha_file="${work_dir}/actual.sha"
   log INFO "S3 checksum file found (will verify after restore)"
 }
 
@@ -488,11 +366,8 @@ validate_single_mode() {
   fi
 
   if (( download_from_s3 )); then
-    [[ -n "$aws_access_key_id" ]] || die "AWS_ACCESS_KEY_ID environment variable is not set"
-    [[ -n "$aws_secret_access_key" ]] || die "AWS_SECRET_ACCESS_KEY environment variable is not set"
-    require_command mc
-    prepare_s3_client
-    construct_s3_path
+    parse_s3_source
+    s3_init "$s3_bucket"
   fi
 
   prepare_tar_flags
@@ -514,7 +389,7 @@ clear_target_contents() {
 
 source_stream() {
   if (( download_from_s3 )); then
-    mc --config-dir "$mc_config_dir" cat "$s3_mc_path"
+    s3_get "$s3_bucket" "$s3_key"
   else
     cat -- "$src_path"
   fi
@@ -779,10 +654,14 @@ run_single_restore() {
   tmp_restore_dir="$(mktemp -d "${target_dir}/.restore-in-progress.XXXXXX")"
 
   if [[ -n "$s3_sha_file" ]]; then
-    source_stream \
-      | tee >(sha256sum > "$s3_sha_file") \
-      | decrypt_stream | decompress_stream | extract_stream
-    wait
+    # A FIFO with a waitable reader: `wait` cannot wait for a process
+    # substitution started inside a pipeline element.
+    local sha_fifo="${work_dir}/sha.fifo" sha_pid
+    mkfifo "$sha_fifo"
+    sha256sum < "$sha_fifo" > "$s3_sha_file" &
+    sha_pid=$!
+    source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | extract_stream
+    wait "$sha_pid"
   else
     source_stream | decrypt_stream | decompress_stream | extract_stream
   fi
@@ -914,9 +793,7 @@ shift $((OPTIND - 1))
 # Mode selection
 # ------------------------------------------------------------------------------
 
-[[ -d "$VOLUMES_ROOT" ]] || die "Volumes root not found: $VOLUMES_ROOT"
-volumes_root_real="$(realpath -e -- "$VOLUMES_ROOT")" || die "Unable to resolve volumes root: $VOLUMES_ROOT"
-[[ "$volumes_root_real" != "/" ]] || die "VOLUMES_ROOT must not be the filesystem root"
+init_volumes_root
 
 if (( all_volumes )); then
   [[ -z "$source_arg" ]] || die "Option -i cannot be used with -a"

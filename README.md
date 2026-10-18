@@ -416,13 +416,17 @@ docker run --rm \
 
 ### AWS / S3
 
-| Variable                | Default     | Description                                                          |
-| ----------------------- | ----------- | -------------------------------------------------------------------- |
-| `AWS_ACCESS_KEY_ID`     | —           | S3 access key                                                        |
-| `AWS_SECRET_ACCESS_KEY` | —           | S3 secret key                                                        |
-| `AWS_SESSION_TOKEN`     | —           | Session token for temporary IAM credentials                          |
-| `AWS_REGION`            | `us-east-1` | S3 region                                                            |
-| `AWS_ENDPOINT_URL`      | —           | Custom S3-compatible endpoint (MinIO, Yandex Cloud, DO Spaces, etc.) |
+| Variable                        | Default | Description                                                                                                        |
+| ------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `AWS_ACCESS_KEY_ID`             | —       | S3 access key                                                                                                      |
+| `AWS_SECRET_ACCESS_KEY`         | —       | S3 secret key                                                                                                      |
+| `AWS_SESSION_TOKEN`             | —       | Session token for temporary IAM credentials                                                                        |
+| `AWS_REGION`                    | —       | S3 region. On AWS it is detected from the bucket when unset; for custom endpoints the default is `us-east-1`       |
+| `AWS_DEFAULT_REGION`            | —       | Fallback for `AWS_REGION`                                                                                          |
+| `AWS_ENDPOINT_URL`              | —       | Custom S3-compatible endpoint as `scheme://host[:port]` (Yandex Cloud, MinIO, DO Spaces, etc.)                     |
+| `S3_ADDRESSING_STYLE`           | `auto`  | `path`, `virtual`, or `auto` (virtual-hosted on AWS unless the bucket name contains dots, path style elsewhere)    |
+| `S3_PART_SIZE`                  | `64`    | Multipart part size in MiB (`5`–`5120`). A stream may have at most 10000 parts, so the default allows ~625 GiB     |
+| `S3_ALLOW_UNCONDITIONAL_WRITES` | —       | Set to `1` to publish on providers without conditional writes; this gives up protection against concurrent writers |
 
 ---
 
@@ -558,10 +562,25 @@ docker run --rm \
 
 ## Examples: S3
 
-S3 uploads and downloads use the MinIO client (`mc`).
-This works with AWS S3, MinIO, Yandex Cloud Object Storage, DigitalOcean Spaces, and other S3-compatible endpoints.
+S3 uploads and downloads are done with `curl` and AWS Signature Version 4 — no extra S3 client is bundled.
+This works with AWS S3, Yandex Cloud Object Storage, MinIO, DigitalOcean Spaces, and other S3-compatible endpoints.
 
-> **Compatible storage:** AWS S3, Yandex Cloud Object Storage, MinIO, DigitalOcean Spaces, and any S3-compatible endpoint.
+### How uploads work
+
+- The backup stream is uploaded as a **multipart upload** in parts of `S3_PART_SIZE` MiB (default 64), so the size never has to be known in advance. Each part is buffered in a temporary file, so `TMPDIR` needs `S3_PART_SIZE` of free space per running backup.
+- The object only becomes visible once every stage (tar, compression, encryption, upload) has succeeded. If anything fails, the upload is aborted and nothing is published.
+- Objects are published with `If-None-Match: *`, so an existing recovery point is **never overwritten**, even by a concurrent backup with the same timestamp. A provider that rejects conditional writes (`501 Not Implemented`) makes the backup fail; set `S3_ALLOW_UNCONDITIONAL_WRITES=1` only if you accept losing that protection.
+- The `.sha256` sidecar is published last and carries the same token (`x-amz-meta-vb-token`) as the archive. An archive without its sidecar counts as incomplete.
+- Credentials are written to a private curl configuration file and never appear on a command line.
+
+### Required permissions
+
+`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, and `s3:AbortMultipartUpload` on the bucket (or prefix). Without `s3:ListBucket`, S3 answers `403` instead of `404` for missing keys, and the backup refuses to continue.
+
+### Recommended bucket settings
+
+- A lifecycle rule **AbortIncompleteMultipartUpload** (for example after 1 day) cleans up parts left behind by a killed container.
+- Object versioning, and ideally object lock, keep previous recovery points even if credentials leak.
 
 ### Back up to AWS S3
 
@@ -915,13 +934,9 @@ A good strategy: keep a local copy **and** an offsite copy in S3 or another obje
 
 High `-j` with compression can saturate CPU, disk, and network simultaneously. Start with `-j 1` and increase gradually.
 
-### S3 uploads use the MinIO client (`mc`)
-
-`mc pipe` handles upload from a stream and uses multipart upload internally when needed. It works with AWS S3, MinIO, Yandex Cloud Object Storage, DigitalOcean Spaces, and other S3-compatible endpoints.
-
 ### Protect recovery points with bucket-side versioning
 
-Before uploading, the backup script checks that the target S3 object does not already exist and refuses to proceed otherwise (a stat error that is not a confirmed "not found" is also treated as fatal — fail-closed). This handles accidental reruns and most ambiguous failures, but it does not give strict atomicity: two parallel backups racing on the same key may both pass the existence check, and S3-side write ordering then decides the winner. For production, enable bucket-side **object versioning** (and ideally retention / object lock) so that even a same-key upload preserves the previous recovery point as a prior version. AWS S3, Yandex Cloud Object Storage, MinIO, and most S3-compatible stores expose this as a bucket-level setting.
+Before uploading, the backup script checks that neither the archive nor its sidecar exists (any answer other than a confirmed `404` is fatal), and it publishes with conditional writes, so a same-key upload cannot replace an existing recovery point. Still, enable bucket-side **object versioning** (and ideally retention / object lock): it protects recovery points against deletion with leaked credentials and against providers that silently ignore conditional writes. AWS S3, Yandex Cloud Object Storage, MinIO, and most S3-compatible stores expose this as a bucket-level setting.
 
 ---
 
@@ -947,9 +962,17 @@ A file with that name already exists in `BACKUP_ROOT`. Use a different timestamp
 
 The target volume already contains data. Add `-C` to clear it before restoring.
 
-### `Failed to configure S3 client`
+### `Access denied while checking s3://…` / `Failed to check s3://…`
 
-The `mc` client could not connect to the S3 endpoint. Check that `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_ENDPOINT_URL` (if using a custom store) are set correctly and that the endpoint is reachable from inside the container.
+The existence check before an upload got an answer other than `200`/`404`. Check `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and `AWS_ENDPOINT_URL` (if using a custom store), make sure the endpoint is reachable from inside the container, and grant `s3:ListBucket` (without it S3 answers `403` for missing keys).
+
+### `The S3 provider does not support conditional writes`
+
+The provider answered `501` to `If-None-Match: *`. Nothing was published. If you accept that a concurrent backup with the same timestamp could overwrite this one, set `S3_ALLOW_UNCONDITIONAL_WRITES=1`.
+
+### `Publication incomplete`
+
+The archive was uploaded, but another object already occupied its `.sha256` name. The archive is kept, but counts as incomplete: restore refuses it unless its checksum matches. Inspect both objects before reusing the timestamp.
 
 ### `GPG_PASSPHRASE environment variable is not set`
 
