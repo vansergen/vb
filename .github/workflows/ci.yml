@@ -113,6 +113,11 @@ jobs:
 
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
+    # semantic-release pushes the release commit and tag with the token that
+    # actions/checkout keeps in the git config (GITHUB_TOKEN)
+    permissions:
+      contents: write
+
     runs-on: ubuntu-latest
 
     steps:
