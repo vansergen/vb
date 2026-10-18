@@ -837,7 +837,8 @@ preflight_participant() {
     "Refusing target volume '${volume}': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
   part_paths[index]="$path"
 
-  mounts="$(mounts_below "$path")"
+  mounts="$(mounts_below "$path")" || die \
+    "Cannot read the mount table, so mount points inside target volume '${volume}' cannot be ruled out"
   [[ -z "$mounts" ]] || die \
     "Target volume '${volume}' contains other mount points, which a restore cannot replace: $(printf '%s ' "$mounts")"
 

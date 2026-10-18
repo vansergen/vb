@@ -3702,6 +3702,70 @@ test_s3_malformed_listing_fails_optional() {
   check_incomplete_listing_is_refused "s3_malformed_listing_fails_optional" list-malformed
 }
 
+test_s3_failed_token_check_fails_optional() {
+  require_s3_or_skip || return $?
+  setup_case "s3_failed_token_check_fails_optional"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_904100" prefix stub="$CASE_ROOT/stub"
+  prefix="$(t_s3_prefix failed-token-check)"
+  run_backup -a -T "$ts" -b "$TEST_S3_BUCKET" -f "$prefix" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # Reading the token of alpha's checksum file (the second token read) fails
+  write_failing_wrapper "$stub" awk 'name=x-amz-meta-vb-token' 2
+  expect_injected_failure "$stub/fired" \
+    run_restore_with_env PATH="$stub:$PATH" -- -a -b "$TEST_S3_BUCKET" -f "$prefix" -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+}
+
+test_unreadable_checksum_file_fails_the_catalog() {
+  setup_case "unreadable_checksum_file_fails_the_catalog"
+  make_volume_content "alpha"
+  make_volume_content "beta"
+
+  local ts="20250101_904000" stub="$CASE_ROOT/stub"
+  run_backup -a -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old-alpha"
+  replace_volume_with_marker "beta" "old-beta"
+
+  # Reading beta's checksum file fails: an I/O error, not a malformed file
+  write_failing_wrapper "$stub" awk "/beta_${ts}.tar.sha256" 1
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- -a -T "$ts" -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old-alpha" || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/beta/marker.txt" "old-beta" || return 1
+  assert_no_reserved_entries alpha beta || return 1
+
+  rm -f "$stub/fired" "$stub"/*.count
+  expect_injected_failure "$stub/fired" run_restore_with_env PATH="$stub:$PATH" -- -l || return 1
+}
+
+test_restore_refuses_unreadable_mount_table() {
+  setup_case "restore_refuses_unreadable_mount_table"
+  make_volume_content "alpha"
+  local ts="20250101_904200" missing="$CASE_ROOT/no-mountinfo"
+  run_backup -v alpha -T "$ts" || return 1
+  replace_volume_with_marker "alpha" "old"
+
+  # Without the mount table, mount points inside the target cannot be ruled out
+  expect_rejected run_restore_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$missing" -- \
+    -i "alpha_${ts}.tar" -t alpha -C || return 1
+  assert_text_file_contains "$TEST_VOLUMES_ROOT/alpha/marker.txt" "old" || return 1
+  assert_no_reserved_entries alpha || return 1
+
+  # A backup is the same either way; only its warning about mount points is lost
+  run_backup_with_env VB_TEST_HOOKS=1 VB_TEST_MOUNTINFO="$missing" -- -v alpha -T 20250101_904201 \
+    2> "$CASE_ROOT/backup.log" || return 1
+  grep -q "Cannot read the mount table" "$CASE_ROOT/backup.log" || {
+    log "Expected a warning about the unreadable mount table"
+    return 1
+  }
+}
+
 test_s3_truncated_checksum_fails_optional() {
   require_s3_or_skip || return $?
   setup_case "s3_truncated_checksum_fails_optional"
@@ -3952,6 +4016,9 @@ run_test "s3 truncated checksum fails"                 test_s3_truncated_checksu
 run_test "s3 failed listing parser fails"              test_s3_failed_listing_parser_fails_optional
 run_test "s3 unreadable listing fails"                 test_s3_unreadable_listing_fails_optional
 run_test "s3 malformed listing fails"                  test_s3_malformed_listing_fails_optional
+run_test "s3 failed token check fails"                 test_s3_failed_token_check_fails_optional
+run_test "unreadable checksum file fails the catalog"  test_unreadable_checksum_file_fails_the_catalog
+run_test "restore refuses unreadable mount table"      test_restore_refuses_unreadable_mount_table
 
 # ------------------------------------------------------------------------------
 # Summary

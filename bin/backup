@@ -480,7 +480,9 @@ validate_single_mode() {
   check_backup_root_outside_volume
 
   local mounts
-  mounts="$(mounts_below "$directory")"
+  # Only a warning depends on it: the backup itself is the same either way
+  mounts="$(mounts_below "$directory")" || log WARN \
+    "Cannot read the mount table; mount points inside volume '$volume' were not checked"
   [[ -z "$mounts" ]] || log WARN \
     "Volume '$volume' contains other mount points ($(printf '%s ' "$mounts")); their contents are included in the backup, but a restore refuses targets with mount points"
 

@@ -186,9 +186,10 @@ prepare_tar_flags() {
 
 # Prints the SHA-256 digest recorded in a checksum sidecar. Accepts the
 # "<digest>  <name>" and "<digest> *<name>" forms and ignores the name.
+# Returns 1 for malformed content; a file that cannot be read is fatal.
 read_sidecar_digest() {
   local digest
-  digest="$(awk 'NR == 1 { print $1; exit }' "$1" 2>/dev/null)" || return 1
+  digest="$(awk 'NR == 1 { print $1; exit }' "$1")" || die "Failed to read the checksum file $1"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
   printf '%s\n' "$digest"
 }
@@ -323,12 +324,13 @@ stop_process_tree() {
 # ------------------------------------------------------------------------------
 
 # Prints the mount points (from /proc/self/mountinfo) strictly below a path.
+# Returns non-zero when the mount table cannot be read: never "no mounts".
 mounts_below() {
   local base="${1%/}" mountinfo=/proc/self/mountinfo
   if [[ "${VB_TEST_HOOKS:-0}" == 1 && -n "${VB_TEST_MOUNTINFO:-}" ]]; then
     mountinfo="$VB_TEST_MOUNTINFO"
   fi
-  [[ -r "$mountinfo" ]] || return 0
+  [[ -r "$mountinfo" ]] || return 1
   awk '{ print $5 }' "$mountinfo" | while IFS= read -r point; do
     point="$(printf '%b' "${point//\\/\\0}")"
     if [[ "$point" == "$base"/* ]]; then

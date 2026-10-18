@@ -49,9 +49,12 @@ txn_write() {
   txn_sync "$dir"
 }
 
+# Prints the value of <key> in a key=value file (empty when the key is
+# missing). Fails when the file is missing or cannot be read.
+#   txn_value <file> <key>
 txn_value() {
   [[ -f "$1" ]] || return 1
-  sed -n "s/^$2=//p" "$1" | head -n 1
+  sed -n "/^$2=/{s/^$2=//p;q;}" "$1"
 }
 
 txn_state() {
@@ -610,7 +613,8 @@ txn_recover() {
       involved[$name]=1
     fi
     if [[ -d "${path}/${TXN_NAME}" ]]; then
-      participants="$(txn_value "${path}/${TXN_NAME}/group" participants)" || participants=""
+      participants="$(txn_value "${path}/${TXN_NAME}/group" participants)" \
+        || die "Failed to read the journal group of ${path}"
       for member in $participants; do
         involved[$member]=1
       done
@@ -688,19 +692,25 @@ txn_recover() {
 txn__recover_group() {
   local gid="$1"
   shift
-  local name path coordinator="" coordinator_path participants member
+  local name path coordinator="" coordinator_path participants="" member found=""
   local -a member_paths=()
 
   for name in "$@"; do
     path="$(resolve_volume_dir "$name")"
     if [[ -d "${path}/${TXN_NAME}" && "$(txn_signature_gid "${path}/${TXN_NAME}")" == "$gid" ]]; then
-      coordinator="$(txn_value "${path}/${TXN_NAME}/group" coordinator)"
-      participants="$(txn_value "${path}/${TXN_NAME}/group" participants)"
+      coordinator="$(txn_value "${path}/${TXN_NAME}/group" coordinator)" \
+        || die "Failed to read the journal group of ${path}"
+      participants="$(txn_value "${path}/${TXN_NAME}/group" participants)" \
+        || die "Failed to read the journal group of ${path}"
+      found="$path"
       break
     fi
   done
 
-  [[ -n "$coordinator" ]] || return 0
+  # The group was finished by an earlier step
+  [[ -n "$found" ]] || return 0
+  [[ -n "$coordinator" && -n "$participants" ]] || die \
+    "Journal of ${found} names no coordinator or participants; refusing to touch restore group ${gid}"
 
   for member in $participants; do
     member_paths+=("$(resolve_volume_dir "$member")")

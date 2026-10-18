@@ -95,7 +95,8 @@ catalog__valid_name() {
 }
 
 # Checks the sidecar of a local archive. Prints the reason when the pair is
-# incomplete.
+# incomplete; a sidecar that cannot be read is fatal (callers check the
+# status, as this runs in a command substitution).
 catalog__local_pair_problem() {
   local sidecar="$1" name="$2" named
 
@@ -108,7 +109,8 @@ catalog__local_pair_problem() {
     return
   }
   # "<digest>  <name>" or "<digest> *<name>"; version 1.0 wrote an absolute path
-  named="$(awk 'NR == 1 { sub(/^[^ \t]+[ \t]+/, ""); sub(/^\*/, ""); print; exit }' "$sidecar")"
+  named="$(awk 'NR == 1 { sub(/^[^ \t]+[ \t]+/, ""); sub(/^\*/, ""); print; exit }' "$sidecar")" \
+    || die "Failed to read the checksum file $sidecar"
   if [[ -n "$named" && "${named##*/}" != "$name" ]]; then
     printf 'checksum file names %s\n' "${named##*/}"
   fi
@@ -129,7 +131,7 @@ catalog_scan_local() {
   for path in "${paths[@]}"; do
     name="${path##*/}"
     catalog__valid_name "$name" || continue
-    problem="$(catalog__local_pair_problem "${path}.sha256" "$name")"
+    problem="$(catalog__local_pair_problem "${path}.sha256" "$name")" || die "Failed to check ${path}.sha256"
     status=complete
     [[ -z "$problem" ]] || status=incomplete
     size="$(stat -c %s -- "$path")" || die "Failed to read the size of ${path}"
@@ -203,10 +205,12 @@ catalog_check_s3_tokens() {
   [[ "${cat_status[i]}" == complete ]] || return 0
 
   if s3_head "$bucket" "${cat_keys[i]}"; then
-    token="$(s3__header "$s3_head_headers" x-amz-meta-vb-token)"
+    token="$(s3__header "$s3_head_headers" x-amz-meta-vb-token)" \
+      || die "Failed to read the headers of s3://${bucket}/${cat_keys[i]}"
   fi
   if s3_head "$bucket" "${cat_keys[i]}.sha256"; then
-    sidecar_token="$(s3__header "$s3_head_headers" x-amz-meta-vb-token)"
+    sidecar_token="$(s3__header "$s3_head_headers" x-amz-meta-vb-token)" \
+      || die "Failed to read the headers of s3://${bucket}/${cat_keys[i]}.sha256"
   fi
   if [[ "$token" != "$sidecar_token" ]]; then
     cat_status[i]=incomplete
