@@ -1,10 +1,12 @@
 FROM alpine:3.23.3 AS base
 
 RUN apk add --no-cache \
+  attr \
   bash \
   coreutils \
   curl \
   findutils \
+  flock \
   gpg \
   gpg-agent \
   gpgconf \
@@ -24,8 +26,7 @@ ENTRYPOINT ["/sbin/tini", "-g", "--"]
 FROM base AS test
 
 RUN apk add --no-cache \
-  acl \
-  attr
+  acl
 
 COPY bin/vb-test /usr/local/bin/
 

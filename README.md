@@ -40,6 +40,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Assign a shared timestamp to a group of backups
 - Write a SHA256 checksum alongside every archive (local and S3)
 - Preserve sparse files, POSIX ACLs, and extended attributes when GNU `tar` is available
+- Back up live volumes: files that change while they are read only produce a warning (`-S` makes it an error)
 
 **Restore:**
 
@@ -49,8 +50,9 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Filter by a specific timestamp
 - Clear a volume before restoring (`-C`)
 - Run restores for multiple volumes in parallel
-- Verify the archive against its SHA256 checksum automatically (local and S3) when one is present
-- Staged extraction: the archive is unpacked and verified in a staging directory inside the target volume, and only swapped in after a successful and verified extract — a failure during extract/verify leaves the original data intact
+- Verify every archive against its SHA256 checksum (local and S3); archives without one are refused unless `-U` is given
+- Transactional restore: all selected volumes switch to the new data together or all keep their original data, even after a crash or power loss (see [Transactional restore](#transactional-restore))
+- Restore the owner, mode, ACLs, extended attributes, and mtime of the volume root itself
 
 ---
 
@@ -81,7 +83,27 @@ local file or S3 → [SHA256 verification] → [GPG decryption] → [gzip decomp
 
 The format is detected automatically from the file extension.
 
-If a `.sha256` companion file is present, the archive is verified against it. A mismatch aborts the restore and leaves the target volume untouched.
+The archive is verified against its `.sha256` companion file while it is extracted. A missing or unreadable checksum file aborts the restore before anything is changed (pass `-U` to restore an archive that has none, such as a backup whose upload was interrupted), and a mismatch leaves the target volume untouched.
+
+### Transactional restore
+
+A restore of one volume and a restore of many volumes with `-a` both work as one transaction:
+
+1. **Stage.** Each archive is extracted and verified into a journal directory, `.vb-restore`, inside its target volume. Nothing outside the journal changes yet, so a wrong passphrase, a corrupt archive, or a network error in any of the volumes leaves **all** of them untouched.
+2. **Switch.** The current top-level entries of every volume are renamed into the journal and the new ones are renamed into place. Renames are quick and need no extra space.
+3. **Commit.** Once every volume has switched, the commit decision is written durably to the journal of the first volume.
+4. **Finalize.** The old data is deleted and the owner, mode, ACLs, extended attributes, and mtime of each volume root are restored.
+
+Every step is written ahead to the journal and synced to disk before it starts. If the restore is interrupted (`SIGKILL`, a crash, power loss) before the commit, the volumes are rolled back to their original data; after the commit, the new data is kept and the cleanup is completed. This happens automatically the next time a restore touches those volumes, or explicitly with `restore -X`. Recovery needs every volume of the interrupted restore mounted and refuses to change anything otherwise.
+
+Things to keep in mind:
+
+- **Disk space.** Until a restore finishes, a target volume holds both the old and the new data, so it needs free space for the extracted archive.
+- **Locking.** A restore holds an exclusive lock (`flock`) on each target volume, and a backup holds a shared lock on its source volume. A backup and a restore of the same volume, or two restores, never run at the same time; the second one fails immediately with `Another backup or restore is using …`. The lock is taken on the volume directory itself, so the filesystem must support `flock` (some NFS setups do not, and the tool then refuses to run).
+- **Reserved names.** Top-level names starting with `.vb-restore` belong to the tool. A backup refuses a volume that holds such an entry, and a restore refuses an archive that contains one. Entries that the tool cannot identify as its own journal (by their name and signature) are never deleted; the tool stops and asks you to inspect them. Directories named `.restore-in-progress.*`, left by an interrupted restore of version 1, are treated the same way, because they may hold the only copy of data.
+- **Nested mounts.** A target volume that contains another mount point (for example a bind mount inside the volume) is refused, because its contents cannot be switched by renames.
+- **Root mtime.** The final mtime of a volume root is kept in the `user.vb-restore.mtime` extended attribute until the restore completes. On filesystems without user extended attributes, a crash during the very last cleanup step can leave the mtime of the volume root (and nothing else) different.
+- **Stopping.** `docker stop` before the commit rolls back immediately. After the commit, the restore exits and the next restore (or `restore -X`) finishes it. For large volumes, give the container time to roll back (`docker stop -t 60`).
 
 ---
 
@@ -188,6 +210,7 @@ The key file must be present at `./gpg/public.asc` (or another path specified wi
 | `-f <path>`   | Folder / prefix inside the S3 bucket                                      |
 | `-k <file>`   | Public key file inside `/gpg` (default: `public.gpg`)                     |
 | `-n`          | Dry run: validate and print what would be done without creating any files |
+| `-S`          | Strict: fail when files change while they are archived (default: warning) |
 | `-h`          | Show help                                                                 |
 
 ### Examples
@@ -283,8 +306,11 @@ Runs up to 3 backups concurrently.
 | Single volume             | `restore -i <file\|s3://...> -t <name> [options]` |
 | All volumes               | `restore -a [options]`                            |
 | Selected volumes from all | `restore -a -v <name> [-v <name> ...] [options]`  |
+| Recovery only             | `restore -X`                                      |
 
 > **Note:** The `-a` mode only works with local files in `BACKUP_ROOT`. To restore from S3, use single mode with `-i s3://...`.
+>
+> Without `-v`, `-a` restores the latest backup of every **mounted** volume and skips backups of volumes that are not mounted, with a warning. With `-v`, every requested volume must be mounted and have a backup.
 
 ### Options
 
@@ -297,13 +323,15 @@ Runs up to 3 backups concurrently.
 | `-T <ts>`     | In `-a` mode: restore only backups with this exact timestamp            |
 | `-v <name>`   | In `-a` mode: filter by volume name (repeatable)                        |
 | `-j <N>`      | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                     |
-| `-C`          | Clear the target volume before restoring                                |
+| `-C`          | Replace the existing contents of the target volume                      |
+| `-U`          | Allow restoring an archive without a `.sha256` checksum file            |
+| `-X`          | Only complete or roll back interrupted restores, then exit              |
 | `-s`          | Symmetric GPG decryption (passphrase)                                   |
 | `-k <file>`   | Private key file for asymmetric GPG decryption (default: `private.gpg`) |
 | `-n`          | Dry run: validate and print what would be done without restoring        |
 | `-h`          | Show help                                                               |
 
-> **Note on `-C`:** Without `-C`, restore will fail if the target volume is not empty. This protects against accidental data loss. With `-C`, the archive is fully extracted **and** verified in a staging directory inside the target volume **before** any existing data is touched, so a failure during extraction, decryption, decompression, or checksum verification (network drop, disk error, wrong passphrase, checksum mismatch) leaves the original data intact. After verification succeeds, the script clears the old contents and moves the new ones in — an interruption during this final step (`SIGKILL`, power loss, disk error) can leave the volume in a partially restored state.
+> **Note on `-C`:** Without `-C`, restore will fail if the target volume is not empty. This protects against accidental data loss. With `-C`, the existing contents are replaced as described in [Transactional restore](#transactional-restore): a failure or interruption at any point leaves either the original or the restored data, never a mix.
 
 ### Specifying the source (`-i`)
 
@@ -958,6 +986,10 @@ In `restore -a` mode, files in `BACKUP_ROOT` whose names do not map to a valid v
 
 A file with that name already exists in `BACKUP_ROOT`. Use a different timestamp (`-T`) or remove the existing file.
 
+### `A checksum file without its archive already exists`
+
+A `.sha256` file with the name of the new backup exists, but its archive does not (for example, left behind by version 1 or created by hand). The backup refuses to publish next to it, so that a checksum is never attributed to the wrong archive. Inspect and remove it, or use another timestamp.
+
 ### `Target volume is not empty`
 
 The target volume already contains data. Add `-C` to clear it before restoring.
@@ -999,9 +1031,32 @@ This is a warning, not an error: backups for different volumes have different ti
 
 The scripts create a temporary `GNUPGHOME` with correct permissions automatically. If GPG still fails, pull the latest image: `docker pull ghcr.io/vansergen/vb`.
 
-### Unexpected `.restore-in-progress.*` directories
+### `Checksum file not found`
 
-At the start of each restore, any `.restore-in-progress.*` directories left behind by a previously interrupted restore are automatically removed from the target volume. Do not use this prefix for your own data inside a volume.
+The archive has no `.sha256` file next to it, so it may be incomplete (for example, a backup that was interrupted while it was published). If you trust the archive, restore it with `-U`.
+
+### `Another backup or restore is using …`
+
+Another backup or restore holds the lock on that volume. Wait until it finishes. A stale lock cannot remain: it is released when the process that holds it exits.
+
+### `Unable to lock … the filesystem may not support locking`
+
+The directory that holds the volume does not support `flock` (some NFS mounts). Backups and restores refuse to run without it.
+
+### `holds reserved entries` / `Reserved name in use`
+
+The volume contains a top-level entry whose name starts with `.vb-restore` (or `.restore-in-progress.`, used by version 1):
+
+- If a restore was interrupted, run `restore -X` to complete or roll it back.
+- If the tool cannot identify the entry as its own, it never deletes it. Inspect it and move it out of the volume (a `.restore-in-progress.*` directory may hold the only copy of data from an interrupted version 1 restore).
+
+### `takes part in an unfinished restore but is not mounted`
+
+An interrupted `restore -a` involved several volumes, and recovery needs all of them. Mount every listed volume and run `restore -X`.
+
+### `Some files changed while they were archived`
+
+Files changed while the backup read them, so their copies may be inconsistent. The backup is still published. Stop the writing service during the backup, or use `-S` to make this an error.
 
 ---
 

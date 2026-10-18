@@ -8,6 +8,7 @@ x-test-env: &test-env
   TEST_S3_BUCKET: vb-test
   TEST_S3_PREFIX: docker-volume-tests
   REQUIRE_S3_TESTS: "1"
+  REQUIRE_XATTR_TESTS: "1"
 
 services:
   s3:
@@ -24,6 +25,11 @@ services:
       context: .
       target: test
     entrypoint: []
+    # The nested mount test needs to bind-mount inside the test container
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
     command:
       - bash
       - -ec

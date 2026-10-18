@@ -56,6 +56,13 @@ die() {
   exit 1
 }
 
+# ERR trap handler: reports the failing command of the main process (not of
+# subshells, which report through their exit status).
+report_unexpected_error() {
+  [[ "${BASHPID:-$$}" == "$$" ]] || return 0
+  log ERROR "Unexpected failure (exit $1) at line $2: $3"
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
@@ -154,21 +161,154 @@ prepare_gpg_home() {
 }
 
 # ------------------------------------------------------------------------------
+# Processes
+# ------------------------------------------------------------------------------
+
+# Prints the PIDs of a process and all of its descendants.
+process_tree_pids() {
+  local root="$1" stat_file content pid ppid current
+  local -A children=()
+
+  for stat_file in /proc/[0-9]*/stat; do
+    content="$(cat "$stat_file" 2>/dev/null)" || continue
+    pid="${content%% *}"
+    content="${content##*) }"
+    ppid="${content#* }"
+    ppid="${ppid%% *}"
+    children[$ppid]+=" $pid"
+  done
+
+  local -a queue=("$root")
+  while (( ${#queue[@]} > 0 )); do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+    printf '%s\n' "$current"
+    for pid in ${children[$current]:-}; do
+      queue+=("$pid")
+    done
+  done
+}
+
+# Sends a signal to a process and all of its descendants, then waits (up to
+# about 30 seconds) until none of them is left.
+stop_process_tree() {
+  local root="$1" signal="${2:-TERM}" pid i
+  local -a pids=()
+
+  mapfile -t pids < <(process_tree_pids "$root")
+  for pid in "${pids[@]}"; do
+    kill "-${signal}" "$pid" 2>/dev/null || true
+  done
+
+  for (( i = 0; i < 300; i++ )); do
+    local alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null && [[ "$(cut -d' ' -f3 "/proc/${pid}/stat" 2>/dev/null)" != Z ]]; then
+        alive=1
+        break
+      fi
+    done
+    (( alive )) || break
+    sleep 0.1
+  done
+  wait "$root" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Mounts
+# ------------------------------------------------------------------------------
+
+# Prints the mount points (from /proc/self/mountinfo) strictly below a path.
+mounts_below() {
+  local base="${1%/}" mountinfo=/proc/self/mountinfo
+  if [[ "${VB_TEST_HOOKS:-0}" == 1 && -n "${VB_TEST_MOUNTINFO:-}" ]]; then
+    mountinfo="$VB_TEST_MOUNTINFO"
+  fi
+  [[ -r "$mountinfo" ]] || return 0
+  awk '{ print $5 }' "$mountinfo" | while IFS= read -r point; do
+    point="$(printf '%b' "${point//\\/\\0}")"
+    if [[ "$point" == "$base"/* ]]; then
+      printf '%s\n' "$point"
+    fi
+  done
+}
+
+# ------------------------------------------------------------------------------
 # Test hooks (inactive unless VB_TEST_HOOKS=1)
 # ------------------------------------------------------------------------------
 
-# Pauses at a named point so tests can interleave other actions:
-#   VB_TEST_PAUSE_AT=<point>[,<point>...]  VB_TEST_PAUSE_DIR=<dir>
-# On reaching a point, creates <dir>/<point>.reached and waits for
-# <dir>/<point>.continue to appear.
+if [[ "${VB_TEST_HOOKS:-0}" == 1 ]]; then
+  export VB_TEST_ROOT_PID="${VB_TEST_ROOT_PID:-$$}"
+fi
+
+# Named points where tests can pause or crash a run. A point matches an entry
+# "<point>" or "<point>:<volume>" of the comma-separated lists:
+#   VB_TEST_PAUSE_AT  create <dir>/<entry>.reached in VB_TEST_PAUSE_DIR and
+#                     wait for <dir>/<entry>.continue
+#   VB_TEST_FAIL_AT   kill the whole run (the top-level script and all of
+#                     its descendants) with SIGKILL, like a crash
 vb_test_point() {
   [[ "${VB_TEST_HOOKS:-0}" == 1 ]] || return 0
 
-  local point="$1"
-  if [[ ",${VB_TEST_PAUSE_AT:-}," == *",${point},"* && -n "${VB_TEST_PAUSE_DIR:-}" ]]; then
-    : > "${VB_TEST_PAUSE_DIR}/${point}.reached"
-    while [[ ! -e "${VB_TEST_PAUSE_DIR}/${point}.continue" ]]; do
-      sleep 0.1
+  local point="$1" volume="${2:-}" entry
+  for entry in "$point" ${volume:+"${point}:${volume}"}; do
+    if [[ ",${VB_TEST_FAIL_AT:-}," == *",${entry},"* ]]; then
+      vb__crash
+    fi
+    if [[ ",${VB_TEST_PAUSE_AT:-}," == *",${entry},"* && -n "${VB_TEST_PAUSE_DIR:-}" ]]; then
+      : > "${VB_TEST_PAUSE_DIR}/${entry}.reached"
+      while [[ ! -e "${VB_TEST_PAUSE_DIR}/${entry}.continue" ]]; do
+        sleep 0.1
+      done
+    fi
+  done
+}
+
+# Fills vb__tree with the PIDs of a process and its descendants without
+# forking (a fork would add a process to the tree being collected).
+vb__collect_tree() {
+  local root="$1" stat_file content pid ppid current i
+  local -A children=()
+
+  for stat_file in /proc/[0-9]*/stat; do
+    { read -r content < "$stat_file"; } 2>/dev/null || continue
+    pid="${content%% *}"
+    content="${content##*) }"
+    ppid="${content#* }"
+    ppid="${ppid%% *}"
+    children[$ppid]+=" $pid"
+  done
+
+  vb__tree=("$root")
+  for (( i = 0; i < ${#vb__tree[@]}; i++ )); do
+    current="${vb__tree[i]}"
+    for pid in ${children[$current]:-}; do
+      vb__tree+=("$pid")
     done
-  fi
+  done
+}
+
+# Simulates a crash of the whole run: stops every process of the tree until
+# no new one appears (so nothing forked meanwhile survives with inherited
+# locks), then kills them all and finally itself.
+vb__crash() {
+  local root="${VB_TEST_ROOT_PID:-$$}" pid changed=1
+  local -A stopped=()
+  local -a vb__tree=()
+
+  while (( changed )); do
+    changed=0
+    vb__collect_tree "$root"
+    for pid in "${vb__tree[@]}"; do
+      [[ "$pid" != "$BASHPID" && -z "${stopped[$pid]:-}" ]] || continue
+      stopped[$pid]=1
+      changed=1
+      kill -STOP "$pid" 2>/dev/null || true
+    done
+  done
+
+  for pid in "${!stopped[@]}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  kill -KILL "$BASHPID"
 }

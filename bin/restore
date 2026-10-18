@@ -9,7 +9,7 @@ readonly SCRIPT_REAL
 readonly SELF_SCRIPT="${DVR_SELF:-$SCRIPT_REAL}"
 readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
 
-[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" ]] || {
+[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" ]] || {
   printf '%s: library directory not found: %s (set VB_LIB_DIR)\n' "$SCRIPT_NAME" "$VB_LIB_DIR" >&2
   exit 1
 }
@@ -17,10 +17,15 @@ readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
 source "${VB_LIB_DIR}/common.sh"
 # shellcheck source=SCRIPTDIR/../lib/vb/s3.sh
 source "${VB_LIB_DIR}/s3.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/txn.sh
+source "${VB_LIB_DIR}/txn.sh"
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
 readonly GPG_ROOT="${GPG_ROOT:-/gpg}"
+
+# Set for internal stage workers started by an "all" restore
+readonly RESTORE_PHASE="${VB_RESTORE_PHASE:-}"
 
 backup_root="$DEFAULT_BACKUP_ROOT"
 
@@ -29,31 +34,43 @@ target_volume=""
 private_key_file="private.gpg"
 
 all_volumes=0
+recover_only=0
 timestamp_filter=""
 jobs=1
 dry_run=0
 clear_target=0
 symmetric=0
+allow_unverified=0
 
 declare -A volume_filters=()
 declare -A latest_file=()
 declare -A latest_ts=()
 declare -A unique_timestamps=()
-declare -A pid_to_volume=()
-declare -a running_pids=()
 
+# Participants of the restore transaction (sorted by volume name)
+declare -a part_volumes=()
+declare -a part_sources=()
+declare -a part_paths=()
+
+# Transaction state (orchestrator)
+txn_gid=""
+txn_coordinator_path=""
+txn_started=0
+txn_committed=0
+txn_done=0
+declare -a stage_pids=()
+declare -A stage_pid_volume=()
+pipeline_pid=""
+
+# State of the source being processed
 download_from_s3=0
 decrypt=0
 compressed=0
-
 src_path=""
 source_name=""
-target_dir=""
-tmp_restore_dir=""
-s3_expected_checksum=""
-s3_sha_file=""
 s3_bucket=""
 s3_key=""
+expected_digest=""
 
 parsed_volume=""
 parsed_timestamp=""
@@ -63,9 +80,6 @@ gpg_passphrase="${GPG_PASSPHRASE:-}"
 
 decompressor_cmd=()
 decompressor_name="none"
-
-failed=0
-wait_supports_p=0
 
 # ------------------------------------------------------------------------------
 # Usage
@@ -83,14 +97,19 @@ Usage:
   # Restore selected volumes in "all" mode
   $SCRIPT_NAME -a -v <VOLUME_NAME> [-v <VOLUME_NAME> ...] [options]
 
+  # Finish or roll back an interrupted restore
+  $SCRIPT_NAME -X
+
 Options:
   Modes:
-    -a          Restore all volumes from local backup files in BACKUP_ROOT
+    -a          Restore all mounted volumes from local backup files in BACKUP_ROOT
     -i <source> Backup source:
                   - file name inside current BACKUP_ROOT
                   - absolute/relative local path
                   - s3://bucket/key
     -t <name>   Target volume name inside ${VOLUMES_ROOT}
+    -X          Recover: complete or roll back interrupted restores on all
+                mounted volumes, then exit
 
                 Without -a:
                   -i and -t are required
@@ -103,8 +122,9 @@ Options:
     -T <ts>     In -a mode, restore only backups with this timestamp
                 Format: YYYYMMDD_HHMMSS
     -v <name>   In -a mode, restore only this volume (repeatable)
-    -j <N>      Number of parallel restores in -a mode (1-99, default: 1)
-    -C          Clear target volume before restore
+    -j <N>      Number of volumes staged in parallel in -a mode (1-99, default: 1)
+    -C          Replace the existing contents of the target volume
+    -U          Allow restoring a backup without a .sha256 checksum file
     -n          Dry-run
     -h          Show help
 
@@ -148,10 +168,20 @@ Examples:
   GPG_PASSPHRASE='secret' $SCRIPT_NAME -a -s -C
 
 Notes:
-  - In -a mode, restore is performed from local files in BACKUP_ROOT only.
+  - Restores are transactional. Every selected archive is extracted and
+    verified inside its target volume first; only then are the volumes
+    switched, and the old data is deleted only after all of them switched.
+    A failure or interruption before that point leaves every volume with its
+    original data. The target volume needs room for both copies.
+  - After a crash, the next restore of the affected volumes (or -X) completes
+    or rolls back the interrupted one.
+  - A restore locks its target volumes and a backup its source volume, so
+    they never run on the same volume at the same time.
+  - Top-level names starting with .vb-restore are reserved for the journal.
+  - In -a mode, backups of volumes that are not mounted are skipped.
   - Without -T, the latest backup is selected independently for each volume.
-  - If selected backups have different timestamps, restore may be inconsistent
-    across volumes. Prefer using -T for full snapshot restore.
+    If selected backups have different timestamps, the volumes may not form a
+    consistent snapshot. Prefer -T for a full snapshot restore.
 EOF
 }
 
@@ -159,85 +189,124 @@ EOF
 # Cleanup / signals
 # ------------------------------------------------------------------------------
 
+stop_stage_workers() {
+  local pid
+  for pid in "${stage_pids[@]}"; do
+    stop_process_tree "$pid" TERM
+  done
+  stage_pids=()
+}
+
 cleanup() {
-  if [[ -n "$tmp_restore_dir" && -d "$tmp_restore_dir" ]]; then
-    rm -rf "$tmp_restore_dir"
+  stop_stage_workers
+  if [[ -n "$pipeline_pid" ]]; then
+    stop_process_tree "$pipeline_pid" TERM
+    pipeline_pid=""
+  fi
+
+  if [[ -z "$RESTORE_PHASE" ]]; then
+    if (( txn_started && ! txn_committed && ! txn_done )); then
+      log WARN "Rolling back; the target volumes keep their original data"
+      if ! ( abort_transaction ); then
+        log ERROR "Rollback did not finish; run '$SCRIPT_NAME -X' to complete it"
+      fi
+    elif (( txn_committed && ! txn_done )); then
+      log WARN "Interrupted after the commit point; run '$SCRIPT_NAME -X' to finish the restore"
+    fi
   fi
 
   cleanup_work_dir
 }
 
-terminate_children() {
-  local pid
-  for pid in "${!pid_to_volume[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
+on_signal() {
+  trap '' INT TERM
+  log WARN "Received SIG$1, stopping"
+  exit "$2"
 }
 
 trap cleanup EXIT
-trap 'log WARN "Interrupted"; terminate_children; wait || true; exit 130' INT
-trap 'log WARN "Terminated"; terminate_children; wait || true; exit 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'report_unexpected_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Sources
 # ------------------------------------------------------------------------------
 
 dir_has_entries() {
-  local dir="$1"
-  [[ -d "$dir" ]] || return 1
-  [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 ! -name '.restore-in-progress.*' -print -quit 2>/dev/null)" ]]
+  [[ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
 }
 
-resolve_source() {
-  if [[ "$source_arg" == s3://* ]]; then
+# Resolves a source argument and detects its format.
+setup_source() {
+  local source="$1"
+  download_from_s3=0
+  decrypt=0
+  compressed=0
+  s3_bucket=""
+  s3_key=""
+
+  if [[ "$source" == s3://* ]]; then
     download_from_s3=1
-    src_path="$source_arg"
+    src_path="$source"
     source_name="${src_path##*/}"
-    return
-  fi
-
-  if [[ "$source_arg" == /* || "$source_arg" == ./* || "$source_arg" == ../* ]]; then
-    src_path="$source_arg"
-  elif [[ -f "$source_arg" ]]; then
-    src_path="$source_arg"
   else
-    src_path="${backup_root%/}/$source_arg"
+    if [[ "$source" == /* || "$source" == ./* || "$source" == ../* || -f "$source" ]]; then
+      src_path="$source"
+    else
+      src_path="${backup_root%/}/$source"
+    fi
+    [[ -f "$src_path" ]] || die "Backup file not found: $src_path"
+    source_name="$(basename "$src_path")"
   fi
 
-  [[ -f "$src_path" ]] || die "Backup file not found: $src_path"
-  source_name="$(basename "$src_path")"
-}
-
-detect_format() {
   local name="$source_name"
-
   if [[ "$name" == *.gpg ]]; then
     decrypt=1
     name="${name%.gpg}"
   fi
-
   if [[ "$name" == *.gz ]]; then
     compressed=1
     name="${name%.gz}"
   fi
-
   [[ "$name" == *.tar ]] || die "Unsupported backup format: $source_name. Expected .tar[.gz][.gpg]"
 
-  if (( symmetric )) && (( decrypt == 0 )); then
-    die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
+  if (( download_from_s3 )); then
+    local path="${src_path#s3://}"
+    s3_bucket="${path%%/*}"
+    s3_key="${path#*/}"
+    [[ -n "$s3_bucket" && "$s3_bucket" != "$path" && -n "$s3_key" ]] || die "Invalid S3 path: $src_path"
+    s3_validate_bucket "$s3_bucket"
+    s3_validate_key "$s3_key"
   fi
 }
 
-parse_s3_source() {
-  local path="${src_path#s3://}"
-  s3_bucket="${path%%/*}"
-  s3_key="${path#*/}"
+check_decryption_prerequisites() {
+  (( decrypt )) || return 0
+  require_command gpg
 
-  [[ -n "$s3_bucket" && "$s3_bucket" != "$path" && -n "$s3_key" ]] || die "Invalid S3 path: $src_path"
-  s3_validate_bucket "$s3_bucket"
-  s3_validate_key "$s3_key"
+  if (( symmetric )); then
+    [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
+  elif [[ -z "$gpg_raw_private_key" ]]; then
+    local key_source="$private_key_file"
+    [[ "$key_source" == /* ]] || key_source="${GPG_ROOT%/}/$private_key_file"
+    [[ -f "$key_source" ]] || die "Private key file not found: $key_source"
+  fi
+}
+
+prepare_decompressor() {
+  (( compressed )) || return 0
+
+  if command -v pigz >/dev/null 2>&1; then
+    decompressor_cmd=(pigz -dc)
+    decompressor_name="pigz"
+  elif command -v gzip >/dev/null 2>&1; then
+    decompressor_cmd=(gzip -dc)
+    decompressor_name="gzip"
+    log WARN "pigz not found, falling back to gzip"
+  else
+    die "Compressed backup detected, but neither pigz nor gzip is installed"
+  fi
 }
 
 prepare_asymmetric_gpg() {
@@ -249,142 +318,52 @@ prepare_asymmetric_gpg() {
     key_source="${work_dir}/private.key"
     printf '%s' "$gpg_raw_private_key" > "$key_source"
     chmod 600 "$key_source"
+  elif [[ "$private_key_file" == /* ]]; then
+    key_source="$private_key_file"
   else
-    if [[ "$private_key_file" == /* ]]; then
-      key_source="$private_key_file"
-    else
-      key_source="${GPG_ROOT%/}/$private_key_file"
-    fi
+    key_source="${GPG_ROOT%/}/$private_key_file"
   fi
 
   [[ -f "$key_source" ]] || die "Private key file not found: $key_source"
   gpg --batch --import "$key_source" >/dev/null 2>&1 || die "Failed to import private key"
 }
 
-verify_local_checksum_if_present() {
-  (( download_from_s3 == 0 )) || return 0
+prepare_decryption() {
+  (( decrypt )) || return 0
+  check_decryption_prerequisites
 
-  local checksum_file="${src_path}.sha256"
-  [[ -f "$checksum_file" ]] || return 0
-
-  log INFO "Checksum file found: $checksum_file"
-
-  # Re-hash src_path directly and compare against the recorded digest.
-  # We deliberately ignore the filename field in the sidecar — using it
-  # (as `sha256sum -c` does) makes verification fall back to whatever
-  # path the sidecar was originally written with, which silently accepts
-  # a tampered archive moved next to a stale-but-intact original.
-  local expected actual
-  expected="$(awk '{print $1; exit}' "$checksum_file")"
-  [[ -n "$expected" ]] || die "Checksum file is empty or malformed: $checksum_file"
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$src_path" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$src_path" | awk '{print $1}')"
+  if (( symmetric )); then
+    prepare_gpg_home
   else
-    log WARN "sha256sum/shasum not found, checksum verification skipped"
-    return 0
+    prepare_asymmetric_gpg
   fi
-
-  [[ "$expected" == "$actual" ]] \
-    || die "Checksum verification failed (expected: $expected, got: $actual)"
-  log INFO "Checksum verification passed"
 }
 
-setup_s3_checksum_verification() {
-  (( download_from_s3 )) || return 0
-
+# Loads the expected digest from the .sha256 sidecar. The sidecar is
+# mandatory unless -U was given; any error other than "not found" is fatal.
+load_expected_digest() {
+  local sidecar
+  expected_digest=""
   ensure_work_dir
-  local sidecar="${work_dir}/expected.sha256"
-
-  # Only a confirmed "not found" may skip verification; any other error is fatal.
-  if ! s3_head "$s3_bucket" "${s3_key}.sha256"; then
-    log WARN "No checksum file found in S3, skipping verification"
-    return 0
-  fi
-
-  s3_get_file "$s3_bucket" "${s3_key}.sha256" "$sidecar" || die "Checksum file disappeared from S3: ${src_path}.sha256"
-  s3_expected_checksum="$(read_sidecar_digest "$sidecar")" || die "Checksum file is empty or malformed: ${src_path}.sha256"
-  s3_sha_file="${work_dir}/actual.sha"
-  log INFO "S3 checksum file found (will verify after restore)"
-}
-
-verify_s3_checksum_after_restore() {
-  [[ -n "$s3_expected_checksum" ]] || return 0
-
-  local actual_checksum
-  actual_checksum="$(awk '{print $1}' "$s3_sha_file")"
-  [[ -n "$actual_checksum" ]] || die "S3 checksum computation produced no output"
-  [[ "$actual_checksum" == "$s3_expected_checksum" ]] \
-    || die "S3 checksum verification failed (expected: $s3_expected_checksum, got: $actual_checksum)"
-  log INFO "S3 checksum verification passed"
-}
-
-validate_single_mode() {
-  [[ -n "$source_arg" ]] || die "Required flag is missing: -i <backup-file|s3://bucket/key>"
-  [[ -n "$target_volume" ]] || die "Required flag is missing: -t <target-volume>"
-  validate_volume_name "$target_volume"
-
-  require_command tar
-
-  resolve_source
-  detect_format
-
-  [[ -d "${VOLUMES_ROOT%/}/$target_volume" ]] || die \
-    "Target volume '$target_volume' is not mounted into ${VOLUMES_ROOT}. Add --volume ${target_volume}:${VOLUMES_ROOT%/}/${target_volume} to your docker run command."
-
-  target_dir="$(resolve_volume_dir "$target_volume")" || die \
-    "Refusing target volume '$target_volume': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
-
-  if dir_has_entries "$target_dir" && (( clear_target == 0 )); then
-    die "Target volume is not empty: $target_dir. Use -C to clear it before restore"
-  fi
-
-  if (( compressed )); then
-    if command -v pigz >/dev/null 2>&1; then
-      decompressor_cmd=(pigz -dc)
-      decompressor_name="pigz"
-    elif command -v gzip >/dev/null 2>&1; then
-      decompressor_cmd=(gzip -dc)
-      decompressor_name="gzip"
-      log WARN "pigz not found, falling back to gzip"
-    else
-      die "Compressed backup detected, but neither pigz nor gzip is installed"
-    fi
-  fi
-
-  if (( decrypt )); then
-    require_command gpg
-
-    if (( symmetric )); then
-      [[ -n "$gpg_passphrase" ]] || die "GPG_PASSPHRASE environment variable is not set"
-      prepare_gpg_home
-    else
-      prepare_asymmetric_gpg
-    fi
-  fi
 
   if (( download_from_s3 )); then
-    parse_s3_source
-    s3_init "$s3_bucket"
+    sidecar="${work_dir}/expected.sha256"
+    if s3_head "$s3_bucket" "${s3_key}.sha256"; then
+      s3_get_file "$s3_bucket" "${s3_key}.sha256" "$sidecar" || die "Checksum file disappeared from S3: ${src_path}.sha256"
+      expected_digest="$(read_sidecar_digest "$sidecar")" || die "Checksum file is empty or malformed: ${src_path}.sha256"
+      return 0
+    fi
+  else
+    sidecar="${src_path}.sha256"
+    if [[ -f "$sidecar" ]]; then
+      expected_digest="$(read_sidecar_digest "$sidecar")" || die "Checksum file is empty or malformed: $sidecar"
+      return 0
+    fi
   fi
 
-  prepare_tar_flags
-}
-
-clear_target_contents() {
-  [[ -n "$target_dir" ]] || die "Internal error: target_dir is empty"
-  [[ "$target_dir" != "/" ]] || die "Refusing to clear '/'"
-  [[ "${target_dir%/*}" == "$volumes_root_real" && "$target_dir" != "$volumes_root_real" ]] || die \
-    "Refusing to clear path outside ${VOLUMES_ROOT}: $target_dir"
-
-  if [[ ! -d "$target_dir" ]]; then
-    return 0
-  fi
-
-  log INFO "Clearing target volume: $target_dir"
-  find "$target_dir" -mindepth 1 -maxdepth 1 ! -name "$(basename "$tmp_restore_dir")" -exec rm -rf -- {} +
+  (( allow_unverified )) || die \
+    "Checksum file not found: ${src_path}.sha256. The backup may be incomplete; use -U to restore it without verification"
+  log WARN "No checksum file for ${src_path}; restoring without verification (-U)"
 }
 
 source_stream() {
@@ -434,16 +413,221 @@ extract_stream() {
   tar \
     --extract \
     --file - \
-    --directory "$tmp_restore_dir" \
+    --directory "$1" \
     --numeric-owner \
     --same-owner \
     --preserve-permissions \
     "${tar_extra_flags[@]}"
 }
 
+# ------------------------------------------------------------------------------
+# Staging (phase 1)
+# ------------------------------------------------------------------------------
+
+# Extracts and verifies one archive into the journal of its target volume
+# (created beforehand by the orchestrator).
+#   stage_participant <volume> <source> <target-path> <gid>
+stage_participant() {
+  local volume="$1" source="$2" target="$3" gid="$4"
+  local journal="${target}/${TXN_NAME}"
+  local sha_fifo sha_out sha_pid actual rc=0 sha_rc=0
+
+  [[ "$(txn_signature_gid "$journal" 2>/dev/null)" == "$gid" && "$(txn_state "$journal")" == staging ]] || die \
+    "Journal of ${target} does not belong to this restore"
+
+  setup_source "$source"
+  if (( symmetric && ! decrypt )); then
+    die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
+  fi
+  prepare_decompressor
+  prepare_decryption
+  if (( download_from_s3 )); then
+    s3_init "$s3_bucket"
+  fi
+  load_expected_digest
+
+  local decryption="none"
+  if (( decrypt )); then
+    if (( symmetric )); then decryption="symmetric GPG"; else decryption="asymmetric GPG"; fi
+  fi
+  log INFO "Staging ${volume} from ${src_path} (compression: ${decompressor_name}, decryption: ${decryption})"
+
+  ensure_work_dir
+  sha_fifo="${work_dir}/sha.fifo"
+  sha_out="${work_dir}/sha.out"
+  rm -f -- "$sha_fifo"
+  mkfifo "$sha_fifo"
+
+  # Readers first, then the writers; the checksum reader is a direct child so
+  # it can be waited for.
+  sha256sum < "$sha_fifo" > "$sha_out" &
+  sha_pid=$!
+
+  # The pipeline runs in the background so signals are handled promptly.
+  (source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | extract_stream "${journal}/new") &
+  pipeline_pid=$!
+
+  wait "$pipeline_pid" || rc=$?
+  pipeline_pid=""
+  wait "$sha_pid" || sha_rc=$?
+
+  (( rc == 0 )) || die "Failed to read, decrypt, decompress or extract ${src_path}"
+  (( sha_rc == 0 )) || die "Failed to compute the checksum of ${src_path}"
+
+  if [[ -n "$expected_digest" ]]; then
+    actual="$(awk '{ print $1 }' "$sha_out")"
+    [[ "$actual" == "$expected_digest" ]] || die \
+      "Checksum verification failed for ${src_path} (expected: ${expected_digest}, got: ${actual})"
+    log INFO "Checksum verification passed: ${src_path}"
+  fi
+
+  txn_stage_complete "$target"
+  log INFO "Staged ${volume}"
+}
+
+child_finished() {
+  local content state
+  content="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  content="${content##*) }"
+  state="${content%% *}"
+  [[ "$state" == Z || "$state" == X ]]
+}
+
+launch_stage_worker() {
+  local index="$1"
+  local -a args=(-i "${part_sources[index]}" -t "${part_volumes[index]}")
+
+  if (( symmetric )) && [[ "${part_sources[index]}" == *.gpg ]]; then
+    args+=(-s)
+  fi
+  if [[ "$private_key_file" != "private.gpg" ]]; then
+    args+=(-k "$private_key_file")
+  fi
+  if (( allow_unverified )); then
+    args+=(-U)
+  fi
+
+  VB_RESTORE_PHASE=stage \
+    VB_TXN_GID="$txn_gid" \
+    BACKUP_ROOT="$backup_root" \
+    bash "$SELF_SCRIPT" "${args[@]}" &
+
+  stage_pids+=("$!")
+  stage_pid_volume[$!]="${part_volumes[index]}"
+}
+
+# Waits until at least one stage worker has finished. Returns 1 if any of
+# the finished workers failed.
+reap_stage_workers() {
+  local pid status reaped=0 failed=0
+  local -a running=()
+
+  while (( ! reaped )); do
+    running=()
+    for pid in "${stage_pids[@]}"; do
+      if child_finished "$pid"; then
+        status=0
+        wait "$pid" || status=$?
+        reaped=1
+        if (( status != 0 )); then
+          log ERROR "Failed to stage ${stage_pid_volume[$pid]}"
+          failed=1
+        fi
+      else
+        running+=("$pid")
+      fi
+    done
+    stage_pids=("${running[@]}")
+    (( reaped )) || sleep 0.2
+  done
+
+  return "$failed"
+}
+
+stage_all_participants() {
+  local failed=0 index
+  local -a pending=("${!part_volumes[@]}")
+
+  if (( ${#part_volumes[@]} == 1 )); then
+    stage_participant "${part_volumes[0]}" "${part_sources[0]}" "${part_paths[0]}" "$txn_gid"
+    return
+  fi
+
+  while (( ${#pending[@]} > 0 || ${#stage_pids[@]} > 0 )); do
+    while (( ! failed && ${#pending[@]} > 0 && ${#stage_pids[@]} < jobs )); do
+      index="${pending[0]}"
+      pending=("${pending[@]:1}")
+      launch_stage_worker "$index"
+    done
+
+    if (( ${#stage_pids[@]} > 0 )) && ! reap_stage_workers; then
+      failed=1
+      pending=()
+      stop_stage_workers
+    fi
+  done
+
+  (( ! failed )) || die "Staging failed; no volume was changed"
+}
+
+# Rolls back every participant and removes leftovers of this transaction.
+abort_transaction() {
+  local path
+  txn_abort_group "$txn_coordinator_path" "${part_paths[@]}"
+  for path in "${part_paths[@]}"; do
+    txn_cleanup_trash "${path}/${TXN_NAME}.new.${txn_gid}"
+  done
+  txn_done=1
+}
+
+# ------------------------------------------------------------------------------
+# Transaction
+# ------------------------------------------------------------------------------
+
+run_transaction() {
+  local coordinator="${part_volumes[0]}"
+  local participants="${part_volumes[*]}"
+  local index
+
+  txn_gid="$(random_hex 16)"
+  txn_coordinator_path="${part_paths[0]}"
+  txn_started=1
+
+  # Journals are created in order, coordinator first: a participant journal
+  # therefore never exists without the coordinator journal, which recovery
+  # relies on to decide the outcome of the group.
+  for index in "${!part_paths[@]}"; do
+    # shellcheck disable=SC2086 # volume names never contain whitespace
+    txn_create "${part_paths[index]}" "$txn_gid" "${part_volumes[index]}" "$coordinator" $participants
+  done
+
+  # Phase 1: extract and verify every archive; no volume changes yet
+  stage_all_participants
+
+  # Phase 2: switch every volume (renames only)
+  for index in "${!part_paths[@]}"; do
+    log INFO "Switching ${part_volumes[index]}"
+    txn_aside "${part_paths[index]}"
+    txn_swap "${part_paths[index]}"
+  done
+
+  # Commit point: from here on the new data wins, even after a crash
+  vb_test_point "txn_before_decision"
+  txn_write "${txn_coordinator_path}/${TXN_NAME}" decision commit
+  txn_committed=1
+  vb_test_point "txn_after_decision"
+
+  # Phase 3: delete the old data and restore the root metadata
+  txn_finalize_group "$txn_coordinator_path" "${part_paths[@]}"
+  txn_done=1
+}
+
+# ------------------------------------------------------------------------------
+# Participants
+# ------------------------------------------------------------------------------
+
 parse_backup_filename() {
-  local base="$1"
-  local name="$base"
+  local name="$1"
 
   parsed_volume=""
   parsed_timestamp=""
@@ -471,8 +655,10 @@ parse_backup_filename() {
 collect_backups_for_all_mode() {
   [[ -d "$backup_root" ]] || die "Backup directory not found: $backup_root"
 
+  local filepath filename vol ts
+  local -A seen=()
+
   while IFS= read -r -d '' filepath; do
-    local filename
     filename="$(basename "$filepath")"
 
     if ! parse_backup_filename "$filename"; then
@@ -480,8 +666,8 @@ collect_backups_for_all_mode() {
       continue
     fi
 
-    local vol="$parsed_volume"
-    local ts="$parsed_timestamp"
+    vol="$parsed_volume"
+    ts="$parsed_timestamp"
 
     if ! is_valid_volume_name "$vol"; then
       log WARN "Skipping backup with unsafe volume name '${vol}': $filename"
@@ -496,6 +682,11 @@ collect_backups_for_all_mode() {
       continue
     fi
 
+    if [[ -n "${seen[${vol}_${ts}]:-}" ]]; then
+      die "Ambiguous backups for volume '${vol}' at ${ts}: $(basename "${seen[${vol}_${ts}]}") and ${filename}"
+    fi
+    seen[${vol}_${ts}]="$filepath"
+
     if [[ -z "${latest_ts[$vol]:-}" || "$ts" > "${latest_ts[$vol]}" ]]; then
       latest_file["$vol"]="$filepath"
       latest_ts["$vol"]="$ts"
@@ -507,254 +698,191 @@ collect_backups_for_all_mode() {
   )
 }
 
-validate_requested_filters_in_all_mode() {
-  if (( ${#volume_filters[@]} == 0 )); then
-    return 0
-  fi
+build_participants_for_all_mode() {
+  local vol requested missing=0
 
-  local missing_requested=0
-  while IFS= read -r requested; do
-    if [[ -z "${latest_file[$requested]:-}" ]]; then
-      log ERROR "No backup found for requested volume: $requested"
-      missing_requested=1
-    fi
-  done < <(printf '%s\n' "${!volume_filters[@]}" | sort)
-
-  (( missing_requested == 0 )) || die "One or more requested volumes have no matching backups"
-}
-
-build_child_args() {
-  declare -ga CHILD_ARGS=()
-
-  if (( symmetric )); then
-    CHILD_ARGS+=(-s)
-  fi
-
-  if (( symmetric == 0 )) && [[ "$private_key_file" != "private.gpg" ]]; then
-    CHILD_ARGS+=(-k "$private_key_file")
-  fi
-
-  if (( clear_target )); then
-    CHILD_ARGS+=(-C)
-  fi
-}
-
-remove_running_pid() {
-  local pid_to_remove="$1"
-  local pid
-  local new_running=()
-
-  for pid in "${running_pids[@]}"; do
-    if [[ "$pid" != "$pid_to_remove" ]]; then
-      new_running+=("$pid")
-    fi
-  done
-
-  running_pids=("${new_running[@]}")
-}
-
-launch_child_restore() {
-  local vol="$1"
-  local filepath="$2"
-
-  BACKUP_ROOT="$backup_root" \
-  bash "$SELF_SCRIPT" -i "$filepath" -t "$vol" "${CHILD_ARGS[@]}" &
-
-  local pid=$!
-  pid_to_volume["$pid"]="$vol"
-  running_pids+=("$pid")
-
-  log INFO "Launched restore: $vol (pid=$pid)"
-}
-
-reap_one_child() {
-  local pid=""
-  local vol=""
-  local status=0
-
-  if (( wait_supports_p )); then
-    if wait -n -p pid; then
-      status=0
-    else
-      status=$?
-    fi
-  else
-    pid="${running_pids[0]}"
-    if wait "$pid"; then
-      status=0
-    else
-      status=$?
-    fi
-  fi
-
-  vol="${pid_to_volume[$pid]:-unknown}"
-  remove_running_pid "$pid"
-  unset 'pid_to_volume[$pid]'
-
-  if (( status == 0 )); then
-    log INFO "Restore completed: $vol"
-  else
-    log ERROR "Restore failed: $vol"
-    failed=1
-  fi
-}
-
-wait_for_all_children() {
-  while (( ${#running_pids[@]} > 0 )); do
-    reap_one_child
-  done
-}
-
-run_single_restore() {
-  validate_single_mode
-  verify_local_checksum_if_present
-  setup_s3_checksum_verification
-
-  log INFO "Starting restore"
-  log INFO "Source: $src_path"
-
-  if (( download_from_s3 )); then
-    log INFO "Source type: S3"
-  else
-    log INFO "Source type: local file"
-  fi
-
-  log INFO "Target volume: $target_volume"
-  log INFO "Target directory: $target_dir"
-
-  if (( compressed )); then
-    log INFO "Compression: ${decompressor_name}"
-  else
-    log INFO "Compression: none"
-  fi
-
-  if (( decrypt )); then
-    if (( symmetric )); then
-      log INFO "Decryption: symmetric GPG"
-    else
-      log INFO "Decryption: asymmetric GPG"
-    fi
-  else
-    log INFO "Decryption: none"
-  fi
-
-  if (( clear_target )); then
-    log INFO "Target mode: clear before restore"
-  else
-    log INFO "Target mode: must be empty"
-  fi
-
-  if (( dry_run )); then
-    log INFO "Dry-run: no changes made"
-    return 0
-  fi
-
-  find "$target_dir" -mindepth 1 -maxdepth 1 -name '.restore-in-progress.*' -exec rm -rf -- {} +
-
-  tmp_restore_dir="$(mktemp -d "${target_dir}/.restore-in-progress.XXXXXX")"
-
-  if [[ -n "$s3_sha_file" ]]; then
-    # A FIFO with a waitable reader: `wait` cannot wait for a process
-    # substitution started inside a pipeline element.
-    local sha_fifo="${work_dir}/sha.fifo" sha_pid
-    mkfifo "$sha_fifo"
-    sha256sum < "$sha_fifo" > "$s3_sha_file" &
-    sha_pid=$!
-    source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | extract_stream
-    wait "$sha_pid"
-  else
-    source_stream | decrypt_stream | decompress_stream | extract_stream
-  fi
-
-  verify_s3_checksum_after_restore
-
-  if (( clear_target )); then
-    clear_target_contents
-  fi
-
-  (
-    shopt -s dotglob nullglob
-    set -- "$tmp_restore_dir"/*
-    (( $# > 0 )) && mv -- "$@" "$target_dir/"
-  )
-  rm -rf "$tmp_restore_dir"
-  tmp_restore_dir=""
-
-  log INFO "Restore completed successfully"
-}
-
-run_all_restores() {
   if [[ -n "$timestamp_filter" ]]; then
     [[ "$timestamp_filter" =~ ^[0-9]{8}_[0-9]{6}$ ]] || die \
       "Invalid timestamp format: '$timestamp_filter'. Expected YYYYMMDD_HHMMSS"
   fi
 
   collect_backups_for_all_mode
-  validate_requested_filters_in_all_mode
-  build_child_args
 
-  if [[ "${#latest_file[@]}" -eq 0 ]]; then
+  if (( ${#volume_filters[@]} > 0 )); then
+    while IFS= read -r requested; do
+      if [[ -z "${latest_file[$requested]:-}" ]]; then
+        log ERROR "No backup found for requested volume: $requested"
+        missing=1
+      fi
+    done < <(printf '%s\n' "${!volume_filters[@]}" | sort)
+    (( missing == 0 )) || die "One or more requested volumes have no matching backups"
+  else
+    # Without -v, restore what is mounted (like backup -a) and skip the rest
+    for vol in "${!latest_file[@]}"; do
+      if [[ ! -d "${VOLUMES_ROOT%/}/${vol}" ]]; then
+        log WARN "Skipping ${vol}: a backup exists but the volume is not mounted into ${VOLUMES_ROOT}"
+        unset 'latest_file[$vol]' 'latest_ts[$vol]'
+      fi
+    done
+  fi
+
+  if (( ${#latest_file[@]} == 0 )); then
     [[ -z "$timestamp_filter" ]] || die "No backup files found in $backup_root for timestamp $timestamp_filter"
-    die "No backup files found in $backup_root"
+    die "No backup files found in $backup_root for the mounted volumes"
   fi
-
-  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
-    wait_supports_p=1
-  fi
-
-  log INFO "Found ${#latest_file[@]} volume(s) to restore"
-  log INFO "Parallel jobs: $jobs"
 
   while IFS= read -r vol; do
+    part_volumes+=("$vol")
+    part_sources+=("${latest_file[$vol]}")
     unique_timestamps["${latest_ts[$vol]}"]=1
-    log INFO "  $vol  <-  $(basename "${latest_file[$vol]}")"
   done < <(printf '%s\n' "${!latest_file[@]}" | sort)
+}
 
-  if [[ -n "$timestamp_filter" ]]; then
-    log INFO "Snapshot timestamp: $timestamp_filter"
-  elif (( ${#unique_timestamps[@]} > 1 )); then
-    log WARN "Selected backups span multiple timestamps; restore may be inconsistent across volumes"
+# Read-only checks of one participant; fills part_paths.
+preflight_participant() {
+  local index="$1"
+  local volume="${part_volumes[index]}" source="${part_sources[index]}" path mounts
+
+  validate_volume_name "$volume"
+  [[ -d "${VOLUMES_ROOT%/}/${volume}" ]] || die \
+    "Target volume '${volume}' is not mounted into ${VOLUMES_ROOT}. Add --volume ${volume}:${VOLUMES_ROOT%/}/${volume} to your docker run command."
+  path="$(resolve_volume_dir "$volume")" || die \
+    "Refusing target volume '${volume}': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
+  part_paths[index]="$path"
+
+  mounts="$(mounts_below "$path")"
+  [[ -z "$mounts" ]] || die \
+    "Target volume '${volume}' contains other mount points, which a restore cannot replace: $(printf '%s ' "$mounts")"
+
+  setup_source "$source"
+  if (( symmetric && ! decrypt && ! all_volumes )); then
+    die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
+  fi
+  check_decryption_prerequisites
+
+  if (( ! download_from_s3 && ! allow_unverified )) && [[ ! -f "${src_path}.sha256" ]]; then
+    die "Checksum file not found: ${src_path}.sha256. The backup may be incomplete; use -U to restore it without verification"
+  fi
+}
+
+# Checks that a target can be used once the locks are held.
+check_target_usable() {
+  local volume="$1" path="$2" reserved
+
+  reserved="$(txn_describe_reserved "$path")"
+  [[ -z "$reserved" ]] || die \
+    "Target volume '${volume}' holds reserved entries ($(printf '%s; ' "$reserved")); run '$SCRIPT_NAME -X' or move them away"
+
+  if dir_has_entries "$path" && (( clear_target == 0 )); then
+    die "Target volume is not empty: ${path}. Use -C to replace its contents"
+  fi
+}
+
+dry_run_participant() {
+  local index="$1" actual reserved
+
+  setup_source "${part_sources[index]}"
+  log INFO "  ${part_volumes[index]}  <-  ${src_path}"
+
+  reserved="$(txn_describe_reserved "${part_paths[index]}")"
+  if [[ -n "$reserved" ]]; then
+    log WARN "  ${part_volumes[index]} holds reserved entries; the restore will recover them first: $(printf '%s; ' "$reserved")"
+  elif dir_has_entries "${part_paths[index]}" && (( clear_target == 0 )); then
+    die "Target volume is not empty: ${part_paths[index]}. Use -C to replace its contents"
+  fi
+
+  if (( download_from_s3 )); then
+    s3_init "$s3_bucket"
+    s3_head "$s3_bucket" "$s3_key" || die "Backup object not found: $src_path"
+  fi
+
+  load_expected_digest
+  if [[ -n "$expected_digest" && "$download_from_s3" == 0 ]]; then
+    actual="$(sha256sum -- "$src_path" | awk '{ print $1 }')"
+    [[ "$actual" == "$expected_digest" ]] || die \
+      "Checksum verification failed for ${src_path} (expected: ${expected_digest}, got: ${actual})"
+    log INFO "  Checksum verification passed"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Modes
+# ------------------------------------------------------------------------------
+
+run_stage_worker() {
+  local path
+  validate_volume_name "$target_volume"
+  path="$(resolve_volume_dir "$target_volume")" || die "Target volume '${target_volume}' is not usable"
+  prepare_tar_flags
+
+  stage_participant "$target_volume" "$source_arg" "$path" "${VB_TXN_GID:?}"
+}
+
+run_restore() {
+  local index ts
+
+  require_command tar
+  require_command flock
+  prepare_tar_flags
+
+  if (( all_volumes )); then
+    build_participants_for_all_mode
+  else
+    [[ -n "$source_arg" ]] || die "Required flag is missing: -i <backup-file|s3://bucket/key>"
+    [[ -n "$target_volume" ]] || die "Required flag is missing: -t <target-volume>"
+    part_volumes=("$target_volume")
+    part_sources=("$source_arg")
+  fi
+
+  for index in "${!part_volumes[@]}"; do
+    preflight_participant "$index"
+  done
+
+  log INFO "Restoring ${#part_volumes[@]} volume(s)"
+  if (( all_volumes )); then
+    log INFO "Parallel jobs: $jobs"
+    if [[ -n "$timestamp_filter" ]]; then
+      log INFO "Snapshot timestamp: $timestamp_filter"
+    elif (( ${#unique_timestamps[@]} > 1 )); then
+      log WARN "Selected backups span multiple timestamps; restore may be inconsistent across volumes"
+    fi
+    for ts in "${!part_volumes[@]}"; do
+      log INFO "  ${part_volumes[ts]}  <-  $(basename "${part_sources[ts]}")"
+    done
+  fi
+
+  if (( clear_target )); then
+    log INFO "Target mode: replace existing contents"
+  else
+    log INFO "Target mode: must be empty"
   fi
 
   if (( dry_run )); then
-    log INFO "Dry-run mode: validating each volume"
-
-    failed=0
-    while IFS= read -r vol; do
-      log INFO "--- $vol ---"
-      BACKUP_ROOT="$backup_root" \
-      bash "$SELF_SCRIPT" -i "${latest_file[$vol]}" -t "$vol" -n "${CHILD_ARGS[@]}" || {
-        log ERROR "Validation failed: $vol"
-        failed=1
-      }
-    done < <(printf '%s\n' "${!latest_file[@]}" | sort)
-
-    (( failed == 0 )) || die "One or more volumes failed validation"
-    log INFO "Dry-run completed successfully"
+    for index in "${!part_volumes[@]}"; do
+      dry_run_participant "$index"
+    done
+    log INFO "Dry-run: no changes made"
     return 0
   fi
 
-  failed=0
+  # Lock every target for the whole transaction, then finish any interrupted
+  # restore that involves them before checking that they are usable.
+  txn_lock x "${part_paths[@]}"
+  txn_recover "${part_volumes[@]}"
+  for index in "${!part_volumes[@]}"; do
+    check_target_usable "${part_volumes[index]}" "${part_paths[index]}"
+  done
 
-  while IFS= read -r vol; do
-    while (( ${#running_pids[@]} >= jobs )); do
-      reap_one_child
-    done
+  run_transaction
 
-    launch_child_restore "$vol" "${latest_file[$vol]}"
-  done < <(printf '%s\n' "${!latest_file[@]}" | sort)
-
-  wait_for_all_children
-
-  (( failed == 0 )) || die "One or more restores failed"
-  log INFO "All restores completed successfully"
+  log INFO "Restore completed successfully"
 }
 
 # ------------------------------------------------------------------------------
 # Parse args
 # ------------------------------------------------------------------------------
 
-while getopts ':ad:i:t:T:v:j:sk:Cnh' flag; do
+while getopts ':ad:i:t:T:v:j:sk:CnUXh' flag; do
   case "$flag" in
     a) all_volumes=1 ;;
     d) backup_root="$OPTARG" ;;
@@ -770,6 +898,8 @@ while getopts ':ad:i:t:T:v:j:sk:Cnh' flag; do
     k) private_key_file="$OPTARG" ;;
     C) clear_target=1 ;;
     n) dry_run=1 ;;
+    U) allow_unverified=1 ;;
+    X) recover_only=1 ;;
     h)
       usage
       exit 0
@@ -795,7 +925,11 @@ shift $((OPTIND - 1))
 
 init_volumes_root
 
-if (( all_volumes )); then
+if (( recover_only )); then
+  if (( all_volumes || ${#volume_filters[@]} > 0 )) || [[ -n "$source_arg$target_volume$timestamp_filter" ]]; then
+    die "Option -X cannot be combined with -a, -i, -t, -T or -v"
+  fi
+elif (( all_volumes )); then
   [[ -z "$source_arg" ]] || die "Option -i cannot be used with -a"
   [[ -z "$target_volume" ]] || die "Option -t cannot be used with -a"
 else
@@ -808,8 +942,13 @@ fi
 # Main
 # ------------------------------------------------------------------------------
 
-if (( all_volumes )); then
-  run_all_restores
+if [[ "$RESTORE_PHASE" == stage ]]; then
+  run_stage_worker
+elif (( recover_only )); then
+  require_command flock
+  prepare_tar_flags
+  txn_recover
+  log INFO "Recovery finished"
 else
-  run_single_restore
+  run_restore
 fi

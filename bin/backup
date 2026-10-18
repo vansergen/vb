@@ -9,7 +9,7 @@ readonly SCRIPT_REAL
 readonly SELF_SCRIPT="${DVB_SELF:-$SCRIPT_REAL}"
 readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
 
-[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" ]] || {
+[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" ]] || {
   printf '%s: library directory not found: %s (set VB_LIB_DIR)\n' "$SCRIPT_NAME" "$VB_LIB_DIR" >&2
   exit 1
 }
@@ -17,6 +17,8 @@ readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
 source "${VB_LIB_DIR}/common.sh"
 # shellcheck source=SCRIPTDIR/../lib/vb/s3.sh
 source "${VB_LIB_DIR}/s3.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/txn.sh
+source "${VB_LIB_DIR}/txn.sh"
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
@@ -28,6 +30,7 @@ backup_timestamp="${BACKUP_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
 all_volumes=0
 jobs=1
 dry_run=0
+strict_tar=0
 
 compress=0
 encrypt=0
@@ -47,6 +50,7 @@ gpg_raw_key="${GPG_PUBLIC_KEY:-}"
 gpg_passphrase="${GPG_PASSPHRASE:-}"
 
 tmp_backup_path=""
+tmp_sidecar_path=""
 recipient_fpr=""
 backup_path=""
 s3_url=""
@@ -90,6 +94,8 @@ Options:
     -T <ts>     Backup timestamp override (format: YYYYMMDD_HHMMSS)
     -j <N>      Number of parallel backups in -a mode (1-99, default: 1)
     -n          Dry-run: validate and print what would be backed up
+    -S          Strict: fail when files change while they are archived
+                (by default this is a warning)
     -h          Show help
 
   Backup options:
@@ -105,6 +111,7 @@ Environment variables:
   VOLUMES_ROOT          Mounted volumes root (default: /volumes)
   GPG_ROOT              Mounted GPG directory (default: /gpg)
   BACKUP_TIMESTAMP      Override backup timestamp (default: current time, format: YYYYMMDD_HHMMSS)
+  VB_LOCK_TIMEOUT       Seconds to wait for the lock on BACKUP_ROOT (default: 300)
   GPG_PUBLIC_KEY        Public key content for asymmetric encryption
   GPG_PASSPHRASE        Passphrase for symmetric encryption
   AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 upload)
@@ -158,6 +165,9 @@ EOF
 cleanup() {
   if [[ -n "$tmp_backup_path" && -f "$tmp_backup_path" ]]; then
     rm -f "$tmp_backup_path"
+  fi
+  if [[ -n "$tmp_sidecar_path" && -f "$tmp_sidecar_path" ]]; then
+    rm -f "$tmp_sidecar_path"
   fi
 
   s3_cleanup
@@ -268,8 +278,17 @@ prepare_gpg_runtime() {
   fi
 }
 
+# GNU tar exits with 1 when files changed while they were read, which is
+# common on live volumes; that is a warning unless -S was given.
 archive_stream() {
-  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" .
+  local rc=0
+  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" . || rc=$?
+
+  if (( rc == 1 && ! strict_tar )); then
+    log WARN "Some files changed while they were archived; their copies may be inconsistent (use -S to fail instead)"
+    return 0
+  fi
+  return "$rc"
 }
 
 compress_stream() {
@@ -308,30 +327,6 @@ encrypt_stream() {
   fi
 }
 
-write_destination() {
-  cat > "$tmp_backup_path"
-}
-
-write_checksum() {
-  local target="$1"
-  local hash
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    hash="$(sha256sum "$target" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    hash="$(shasum -a 256 "$target" | awk '{print $1}')"
-  else
-    log WARN "sha256sum/shasum not found, checksum skipped"
-    return 0
-  fi
-
-  # Store only the basename — sidecars must stay portable when the archive
-  # is moved or copied. Verification on restore re-hashes src_path directly
-  # and compares to the recorded digest, ignoring the filename field.
-  printf '%s  %s\n' "$hash" "$(basename -- "$target")" > "${target}.sha256"
-  log INFO "Checksum written: ${target}.sha256"
-}
-
 validate_common_options() {
   [[ "$backup_timestamp" =~ ^[0-9]{8}_[0-9]{6}$ ]] || die \
     "Invalid backup timestamp: '$backup_timestamp'. Expected YYYYMMDD_HHMMSS"
@@ -357,6 +352,7 @@ validate_common_options() {
   fi
 
   require_command tar
+  require_command flock
 
   if (( symmetric || encrypt )); then
     require_command gpg
@@ -370,6 +366,7 @@ validate_single_mode() {
   [[ -d "${VOLUMES_ROOT%/}/${volume}" ]] || die "Volume '$volume' is not mounted into ${VOLUMES_ROOT}"
   directory="$(resolve_volume_dir "$volume")" || die \
     "Refusing volume '$volume': it does not resolve to a directory directly inside ${VOLUMES_ROOT}"
+  check_source_has_no_reserved_entries
 
   validate_common_options
 }
@@ -407,6 +404,10 @@ build_child_args() {
 
   if (( compress )); then
     CHILD_ARGS+=(-c)
+  fi
+
+  if (( strict_tar )); then
+    CHILD_ARGS+=(-S)
   fi
 
   if (( encrypt )); then
@@ -556,6 +557,71 @@ upload_backup_to_s3() {
   log INFO "Backup uploaded successfully: $s3_url"
 }
 
+# Reserved entries mean an unfinished restore (or a name the restore would
+# refuse); archiving them would produce an inconsistent or unrestorable backup.
+check_source_has_no_reserved_entries() {
+  local reserved
+  reserved="$(txn_describe_reserved "$directory")"
+  [[ -z "$reserved" ]] || die \
+    "Volume '$volume' holds reserved entries ($(printf '%s; ' "$reserved")). If a restore was interrupted, run 'restore -X'; otherwise rename them"
+}
+
+check_local_destination_is_free() {
+  [[ ! -e "$backup_path" ]] || die "Backup file already exists: $backup_path"
+  [[ ! -e "${backup_path}.sha256" ]] || die \
+    "A checksum file without its archive already exists: ${backup_path}.sha256. Inspect and remove it before reusing this timestamp"
+}
+
+# Writes the archive to a private temporary file, then publishes the archive
+# and its checksum sidecar under the BACKUP_ROOT lock. Every operation on
+# backup names (publishing, rotation) runs under that lock, so the check and
+# the renames cannot interleave with another backup. The sidecar is renamed
+# last and marks the backup as complete.
+publish_local_backup() {
+  local sha_fifo sha_out sha_pid digest lock_fd stream_ok=1
+
+  mkdir -p "$backup_root"
+  check_local_destination_is_free
+
+  ensure_work_dir
+  tmp_backup_path="$(mktemp "${backup_path}.XXXXXX.part")"
+  sha_fifo="${work_dir}/sha.fifo"
+  sha_out="${work_dir}/sha.out"
+  mkfifo "$sha_fifo"
+
+  sha256sum < "$sha_fifo" > "$sha_out" &
+  sha_pid=$!
+
+  if ! archive_stream | compress_stream | encrypt_stream | tee "$sha_fifo" > "$tmp_backup_path"; then
+    stream_ok=0
+  fi
+  wait "$sha_pid" || stream_ok=0
+  (( stream_ok )) || die "Backup stream failed; nothing was published"
+
+  digest="$(awk '{ print $1 }' "$sha_out")"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "Failed to compute backup checksum"
+  [[ -s "$tmp_backup_path" ]] || die "Backup file is empty"
+
+  tmp_sidecar_path="$(mktemp "${backup_path}.sha256.XXXXXX.part")"
+  printf '%s  %s\n' "$digest" "$filename" > "$tmp_sidecar_path"
+  sync -- "$tmp_backup_path" "$tmp_sidecar_path"
+
+  exec {lock_fd}>>"${backup_root%/}/.vb.lock"
+  flock -x -w "${VB_LOCK_TIMEOUT:-300}" "$lock_fd" || die "Timed out waiting for the lock on ${backup_root}"
+
+  check_local_destination_is_free
+  vb_test_point "local_publish"
+  mv -T -- "$tmp_backup_path" "$backup_path"
+  tmp_backup_path=""
+  mv -T -- "$tmp_sidecar_path" "${backup_path}.sha256"
+  tmp_sidecar_path=""
+  sync -- "$backup_root"
+
+  exec {lock_fd}>&-
+
+  log INFO "Checksum written: ${backup_path}.sha256"
+}
+
 run_single_backup() {
   validate_single_mode
 
@@ -565,7 +631,6 @@ run_single_backup() {
     construct_s3_url
   else
     backup_path="${backup_root%/}/${filename}"
-    tmp_backup_path="${backup_path}.part"
   fi
 
   log INFO "Starting backup"
@@ -593,8 +658,8 @@ run_single_backup() {
   fi
 
   if (( dry_run )); then
-    if (( upload_to_s3 == 0 )) && [[ -e "$backup_path" ]]; then
-      die "Backup file already exists: $backup_path"
+    if (( upload_to_s3 == 0 )); then
+      check_local_destination_is_free
     fi
     if (( upload_to_s3 )); then
       check_s3_destination_is_free
@@ -604,23 +669,21 @@ run_single_backup() {
   fi
 
   if (( upload_to_s3 == 0 )); then
-    mkdir -p "$backup_root"
-    [[ ! -e "$backup_path" ]] || die "Backup file already exists: $backup_path"
+    check_local_destination_is_free
   else
     check_s3_destination_is_free
   fi
+
+  # Shared lock: concurrent backups are fine, a restore of this volume is not
+  txn_lock s "$directory"
+  check_source_has_no_reserved_entries
 
   prepare_gpg_runtime
 
   if (( upload_to_s3 )); then
     upload_backup_to_s3
   else
-    archive_stream | compress_stream | encrypt_stream | write_destination
-    mv "$tmp_backup_path" "$backup_path"
-    tmp_backup_path=""
-
-    [[ -s "$backup_path" ]] || die "Backup file is empty: $backup_path"
-    write_checksum "$backup_path"
+    publish_local_backup
 
     log INFO "Backup created successfully: $backup_path"
     log INFO "Backup size: $(file_size_human "$backup_path")"
@@ -689,7 +752,7 @@ run_all_backups() {
 # Parse args
 # ------------------------------------------------------------------------------
 
-while getopts ':ad:T:j:ceshb:f:k:v:n' flag; do
+while getopts ':ad:T:j:ceshb:f:k:v:nS' flag; do
   case "$flag" in
     a) all_volumes=1 ;;
     d) backup_root="$OPTARG" ;;
@@ -709,6 +772,7 @@ while getopts ':ad:T:j:ceshb:f:k:v:n' flag; do
       requested_volumes+=("$OPTARG")
       ;;
     n) dry_run=1 ;;
+    S) strict_tar=1 ;;
     h)
       usage
       exit 0
