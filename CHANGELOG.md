@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.0.0](https://github.com/vansergen/vb/compare/v2.0.0...v3.0.0) (2026-10-18)
+
+### ⚠ BREAKING CHANGES
+
+- vb is now licensed under MIT instead of AGPL-3.0-only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011nRLfyq4VM6qJ5tq7RzAqC
+
+### Build System
+
+- ship the license text and label in the image ([bd227dc](https://github.com/vansergen/vb/commit/bd227dc82334cfe6e09f5e06a174ac1643f2324b))
+
+### Metadata
+
+- relicense under MIT ([bd8fa17](https://github.com/vansergen/vb/commit/bd8fa173f1f2ce41b31cef13736de4a0e7bd6b3e))
+
 ## [2.0.0](https://github.com/vansergen/vb/compare/v1.1.1...v2.0.0) (2026-10-18)
 
 ### ⚠ BREAKING CHANGES
