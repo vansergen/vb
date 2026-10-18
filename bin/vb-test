@@ -219,6 +219,13 @@ assert_text_file_contains() {
 # Command helpers
 # ------------------------------------------------------------------------------
 
+# Not `tar --version | grep -q`: with pipefail, tar can die of SIGPIPE
+is_gnu_tar() {
+  local version
+  version="$(tar --version 2>/dev/null)" || true
+  [[ "$version" == *"GNU tar"* ]]
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
@@ -1139,7 +1146,7 @@ test_restore_is_atomic_on_failure() {
 }
 
 test_backup_restore_sparse_file() {
-  tar --version 2>/dev/null | grep -q 'GNU tar' || return "$SKIP_RC"
+  is_gnu_tar || return "$SKIP_RC"
 
   setup_case "backup_restore_sparse_file"
 
@@ -2679,7 +2686,7 @@ test_backup_warns_about_nested_mounts() {
 }
 
 test_restore_does_not_restore_selinux_labels() {
-  tar --version 2>/dev/null | grep -q 'GNU tar' || return "$SKIP_RC"
+  is_gnu_tar || return "$SKIP_RC"
   setup_case "restore_does_not_restore_selinux_labels"
   make_volume_content "alpha"
   local ts="20250101_801200"
@@ -2716,6 +2723,40 @@ test_s3_errors_include_the_curl_message() {
   grep -q 'curl: (7)' "$CASE_ROOT/backup.log" || {
     log "BUG: the error does not say why curl failed:"
     cat "$CASE_ROOT/backup.log" >&2
+    return 1
+  }
+}
+
+test_gnu_tar_features_are_detected_reliably() {
+  is_gnu_tar || return "$SKIP_RC"
+  setup_case "gnu_tar_features_are_detected_reliably"
+  make_volume_content "alpha"
+
+  # A tar whose version banner arrives in two writes: a reader that stops at
+  # the first match makes the second write fail with SIGPIPE
+  local stub="$CASE_ROOT/stub" real_tar
+  real_tar="$(command -v tar)"
+  mkdir -p "$stub"
+  cat > "$stub/tar" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == --version ]]; then
+  printf 'tar (GNU tar) 1.35\n'
+  sleep 0.2
+  printf 'Copyright (C) 2023 Free Software Foundation, Inc.\n'
+  exit 0
+fi
+printf '%s\n' "\$*" >> '$stub/trace'
+exec '$real_tar' "\$@"
+STUB
+  chmod +x "$stub/tar"
+
+  run_backup_with_env PATH="$stub:$PATH" -- -v alpha -T 20250101_901000 || return 1
+  prepare_target_volume "alpha_restore"
+  run_restore_with_env PATH="$stub:$PATH" -- -i alpha_20250101_901000.tar -t alpha_restore || return 1
+
+  grep -q -- '--create.*--xattrs' "$stub/trace" && grep -q -- '--extract.*--xattrs' "$stub/trace" || {
+    log "BUG: GNU tar was not detected; archives lose ACLs and extended attributes:"
+    cat "$stub/trace" >&2
     return 1
   }
 }
@@ -2846,6 +2887,7 @@ run_test "restore refuses source inside target"         test_restore_refuses_sou
 run_test "backup warns about nested mounts"             test_backup_warns_about_nested_mounts
 run_test "restore does not restore SELinux labels"      test_restore_does_not_restore_selinux_labels
 run_test "s3 errors include the curl message"           test_s3_errors_include_the_curl_message
+run_test "GNU tar features detected reliably"           test_gnu_tar_features_are_detected_reliably
 run_test "s3 backup fails closed on HEAD error"         test_s3_backup_fails_closed_on_head_error
 run_test "s3 rejects unsafe keys"                       test_s3_rejects_unsafe_keys
 run_test "s3 roundtrip (optional)"                      test_s3_roundtrip_optional

@@ -137,9 +137,13 @@ tar_extract_flags=()
 # extracting them. SELinux labels belong to the host, so they are never
 # restored (the target's own labeling applies).
 prepare_tar_flags() {
+  local version
   tar_extra_flags=()
   tar_extract_flags=()
-  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  # Captured, not piped into `grep -q`: with pipefail, tar could die of
+  # SIGPIPE when grep exits early, silently dropping these flags.
+  version="$(tar --version 2>/dev/null)" || true
+  if [[ "$version" == *"GNU tar"* ]]; then
     tar_extra_flags=(--acls --xattrs '--xattrs-include=*' --sparse)
     tar_extract_flags=("${tar_extra_flags[@]}" '--xattrs-exclude=security.selinux')
   fi
