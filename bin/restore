@@ -9,7 +9,7 @@ readonly SCRIPT_REAL
 readonly SELF_SCRIPT="${DVR_SELF:-$SCRIPT_REAL}"
 readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
 
-[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" ]] || {
+[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" && -r "${VB_LIB_DIR}/catalog.sh" ]] || {
   printf '%s: library directory not found: %s (set VB_LIB_DIR)\n' "$SCRIPT_NAME" "$VB_LIB_DIR" >&2
   exit 1
 }
@@ -19,6 +19,10 @@ source "${VB_LIB_DIR}/common.sh"
 source "${VB_LIB_DIR}/s3.sh"
 # shellcheck source=SCRIPTDIR/../lib/vb/txn.sh
 source "${VB_LIB_DIR}/txn.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/catalog.sh
+source "${VB_LIB_DIR}/catalog.sh"
+
+load_secret_files GPG_PASSPHRASE GPG_PRIVATE_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
@@ -35,6 +39,11 @@ private_key_file="private.gpg"
 
 all_volumes=0
 recover_only=0
+list_mode=0
+verify_mode=0
+catalog_bucket=""
+catalog_folder=""
+catalog_prefix=""
 timestamp_filter=""
 jobs=1
 dry_run=0
@@ -61,21 +70,19 @@ txn_committed=0
 txn_done=0
 declare -a stage_pids=()
 declare -A stage_pid_volume=()
+worker_action="stage"
 pipeline_pid=""
 checksum_pid=""
 
 # State of the source being processed
 download_from_s3=0
 decrypt=0
-compressed=0
+compression=""
 src_path=""
 source_name=""
 s3_bucket=""
 s3_key=""
 expected_digest=""
-
-parsed_volume=""
-parsed_timestamp=""
 
 gpg_raw_private_key="${GPG_PRIVATE_KEY:-}"
 gpg_passphrase="${GPG_PASSPHRASE:-}"
@@ -93,23 +100,33 @@ Usage:
   # Restore one volume
   $SCRIPT_NAME -i <backup-file|s3://bucket/key> -t <target-volume> [options]
 
-  # Restore all volumes from local BACKUP_ROOT
-  $SCRIPT_NAME -a [options]
+  # Restore all mounted volumes from BACKUP_ROOT or from S3
+  $SCRIPT_NAME -a [-b <bucket> [-f <prefix>]] [options]
 
   # Restore selected volumes in "all" mode
   $SCRIPT_NAME -a -v <VOLUME_NAME> [-v <VOLUME_NAME> ...] [options]
+
+  # List backups
+  $SCRIPT_NAME -l [-b <bucket> [-f <prefix>]] [-v <VOLUME_NAME>] [-T <ts>]
+
+  # Verify backups without restoring them
+  $SCRIPT_NAME -V -i <backup-file|s3://bucket/key>
+  $SCRIPT_NAME -V -a [-b <bucket> [-f <prefix>]] [-v <VOLUME_NAME>] [-T <ts>]
 
   # Finish or roll back an interrupted restore
   $SCRIPT_NAME -X
 
 Options:
   Modes:
-    -a          Restore all mounted volumes from local backup files in BACKUP_ROOT
+    -a          Restore the latest complete backup of every mounted volume
     -i <source> Backup source:
                   - file name inside current BACKUP_ROOT
                   - absolute/relative local path
                   - s3://bucket/key
     -t <name>   Target volume name inside ${VOLUMES_ROOT}
+    -l          List backups and whether they are complete
+    -V          Verify: check the checksum, decrypt, decompress and read the
+                archive without restoring anything (with -i or -a)
     -X          Recover: complete or roll back interrupted restores on all
                 mounted volumes, then exit
 
@@ -119,12 +136,17 @@ Options:
                   -i and -t must not be used
                   -v acts as a volume filter and may be repeated
 
-  General:
+  Backup location (for -a, -l and -V -a):
     -d <dir>    Local backup directory override (default: ${DEFAULT_BACKUP_ROOT})
+    -b <bucket> Use backups in this S3 bucket instead
+    -f <path>   S3 folder/prefix inside the bucket
+
+  General:
     -T <ts>     In -a mode, restore only backups with this timestamp
                 Format: YYYYMMDD_HHMMSS
     -v <name>   In -a mode, restore only this volume (repeatable)
-    -j <N>      Number of volumes staged in parallel in -a mode (1-99, default: 1)
+    -j <N>      Number of volumes staged (or verified) in parallel in -a mode
+                (1-99, default: 1)
     -C          Replace the existing contents of the target volume
     -U          Allow restoring a backup without a .sha256 checksum file
     -n          Dry-run
@@ -141,6 +163,9 @@ Environment variables:
   GPG_ROOT              Mounted GPG directory (default: /gpg)
   GPG_PRIVATE_KEY       Private key content for asymmetric decryption
   GPG_PASSPHRASE        Passphrase for symmetric decryption or private key
+  *_FILE                Read GPG_PASSPHRASE, GPG_PRIVATE_KEY, AWS_ACCESS_KEY_ID,
+                        AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN from a file
+                        (e.g. GPG_PASSPHRASE_FILE=/run/secrets/passphrase)
   AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 restore)
   AWS_SECRET_ACCESS_KEY S3 secret access key (required for S3 restore)
   AWS_SESSION_TOKEN     Optional session token for temporary credentials
@@ -153,8 +178,10 @@ Environment variables:
 Supported formats:
   .tar
   .tar.gz
+  .tar.zst
   .tar.gpg
   .tar.gz.gpg
+  .tar.zst.gpg
 
 Examples:
   # Single restore
@@ -164,6 +191,7 @@ Examples:
 
   # Restore all
   $SCRIPT_NAME -a -C
+  $SCRIPT_NAME -a -b my-bucket -f daily/app1 -T 20250411_120000 -C
   $SCRIPT_NAME -a -T 20250411_120000 -C
   $SCRIPT_NAME -a -v postgres_data -v redis_data -C
   $SCRIPT_NAME -a -j 4 -C
@@ -180,7 +208,8 @@ Notes:
   - A restore locks its target volumes and a backup its source volume, so
     they never run on the same volume at the same time.
   - Top-level names starting with .vb-restore are reserved for the journal.
-  - In -a mode, backups of volumes that are not mounted are skipped.
+  - In -a mode, backups of volumes that are not mounted are skipped, and so
+    are incomplete backups (without a valid .sha256 file) unless -U is given.
   - Without -T, the latest backup is selected independently for each volume.
     If selected backups have different timestamps, the volumes may not form a
     consistent snapshot. Prefer -T for a full snapshot restore.
@@ -249,7 +278,7 @@ setup_source() {
   local source="$1"
   download_from_s3=0
   decrypt=0
-  compressed=0
+  compression=""
   s3_bucket=""
   s3_key=""
 
@@ -272,11 +301,17 @@ setup_source() {
     decrypt=1
     name="${name%.gpg}"
   fi
-  if [[ "$name" == *.gz ]]; then
-    compressed=1
-    name="${name%.gz}"
-  fi
-  [[ "$name" == *.tar ]] || die "Unsupported backup format: $source_name. Expected .tar[.gz][.gpg]"
+  case "$name" in
+    *.gz)
+      compression=gzip
+      name="${name%.gz}"
+      ;;
+    *.zst)
+      compression=zstd
+      name="${name%.zst}"
+      ;;
+  esac
+  [[ "$name" == *.tar ]] || die "Unsupported backup format: $source_name. Expected .tar[.gz|.zst][.gpg]"
 
   if (( download_from_s3 )); then
     local path="${src_path#s3://}"
@@ -306,9 +341,15 @@ check_decryption_prerequisites() {
 }
 
 prepare_decompressor() {
-  (( compressed )) || return 0
+  decompressor_cmd=()
+  decompressor_name="none"
+  [[ -n "$compression" ]] || return 0
 
-  if command -v pigz >/dev/null 2>&1; then
+  if [[ "$compression" == zstd ]]; then
+    command -v zstd >/dev/null 2>&1 || die "zstd-compressed backup detected, but zstd is not installed"
+    decompressor_cmd=(zstd -dcq)
+    decompressor_name="zstd"
+  elif command -v pigz >/dev/null 2>&1; then
     decompressor_cmd=(pigz -dc)
     decompressor_name="pigz"
   elif command -v gzip >/dev/null 2>&1; then
@@ -417,7 +458,7 @@ decrypt_stream() {
 }
 
 decompress_stream() {
-  if (( compressed )); then
+  if [[ -n "$compression" ]]; then
     "${decompressor_cmd[@]}"
   else
     cat
@@ -436,36 +477,17 @@ extract_stream() {
 }
 
 # ------------------------------------------------------------------------------
-# Staging (phase 1)
+# Streaming
 # ------------------------------------------------------------------------------
 
-# Extracts and verifies one archive into the journal of its target volume
-# (created beforehand by the orchestrator).
-#   stage_participant <volume> <source> <target-path> <gid>
-stage_participant() {
-  local volume="$1" source="$2" target="$3" gid="$4"
-  local journal="${target}/${TXN_NAME}"
+# Streams the current source (see setup_source) through checksum, decryption
+# and decompression into a sink command, then checks that every stage
+# succeeded, that GPG confirmed the decryption and that the digest matches.
+#   stream_source_into <test-point-volume> <sink> [sink args...]
+stream_source_into() {
+  local point_volume="$1"
+  shift
   local sha_fifo sha_out actual rc=0 sha_rc=0
-
-  [[ "$(txn_signature_gid "$journal" 2>/dev/null)" == "$gid" && "$(txn_state "$journal")" == staging ]] || die \
-    "Journal of ${target} does not belong to this restore"
-
-  setup_source "$source"
-  if (( symmetric && ! decrypt )); then
-    die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
-  fi
-  prepare_decompressor
-  prepare_decryption
-  if (( download_from_s3 )); then
-    s3_init "$s3_bucket"
-  fi
-  load_expected_digest
-
-  local decryption="none"
-  if (( decrypt )); then
-    if (( symmetric )); then decryption="symmetric GPG"; else decryption="asymmetric GPG"; fi
-  fi
-  log INFO "Staging ${volume} from ${src_path} (compression: ${decompressor_name}, decryption: ${decryption})"
 
   ensure_work_dir
   sha_fifo="${work_dir}/sha.fifo"
@@ -480,8 +502,8 @@ stage_participant() {
 
   # The pipeline runs in the background so signals are handled promptly.
   (
-    vb_test_point "restore_stream" "$volume"
-    source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | extract_stream "${journal}/new"
+    vb_test_point "restore_stream" "$point_volume"
+    source_stream | tee "$sha_fifo" | decrypt_stream | decompress_stream | "$@"
   ) &
   pipeline_pid=$!
 
@@ -490,7 +512,7 @@ stage_participant() {
   wait "$checksum_pid" || sha_rc=$?
   checksum_pid=""
 
-  (( rc == 0 )) || die "Failed to read, decrypt, decompress or extract ${src_path}"
+  (( rc == 0 )) || die "Failed to read, decrypt, decompress or unpack ${src_path}"
   (( sha_rc == 0 )) || die "Failed to compute the checksum of ${src_path}"
   if (( decrypt )); then
     grep -q '^\[GNUPG:\] DECRYPTION_OKAY' "${work_dir}/gpg.status" 2>/dev/null || die \
@@ -503,14 +525,65 @@ stage_participant() {
       "Checksum verification failed for ${src_path} (expected: ${expected_digest}, got: ${actual})"
     log INFO "Checksum verification passed: ${src_path}"
   fi
+}
+
+# Prepares decompression, decryption and the expected digest of a source.
+open_source() {
+  setup_source "$1"
+  if (( symmetric && ! decrypt )); then
+    die "Invalid flag usage: -s. Source does not have a '.gpg' extension"
+  fi
+  prepare_decompressor
+  prepare_decryption
+  if (( download_from_s3 )); then
+    s3_init "$s3_bucket"
+  fi
+  load_expected_digest
+}
+
+list_stream() {
+  tar --list --file - > /dev/null
+}
+
+# ------------------------------------------------------------------------------
+# Staging (phase 1)
+# ------------------------------------------------------------------------------
+
+# Extracts and verifies one archive into the journal of its target volume
+# (created beforehand by the orchestrator).
+#   stage_participant <volume> <source> <target-path> <gid>
+stage_participant() {
+  local volume="$1" source="$2" target="$3" gid="$4"
+  local journal="${target}/${TXN_NAME}"
+
+  [[ "$(txn_signature_gid "$journal" 2>/dev/null)" == "$gid" && "$(txn_state "$journal")" == staging ]] || die \
+    "Journal of ${target} does not belong to this restore"
+
+  open_source "$source"
+
+  local decryption="none"
+  if (( decrypt )); then
+    if (( symmetric )); then decryption="symmetric GPG"; else decryption="asymmetric GPG"; fi
+  fi
+  log INFO "Staging ${volume} from ${src_path} (compression: ${decompressor_name}, decryption: ${decryption})"
+
+  stream_source_into "$volume" extract_stream "${journal}/new"
 
   txn_stage_complete "$target"
   log INFO "Staged ${volume}"
 }
 
+# Starts a worker process for one participant: staging (default) or, with
+# "verify", verification of its archive.
 launch_stage_worker() {
-  local index="$1"
-  local -a args=(-i "${part_sources[index]}" -t "${part_volumes[index]}")
+  local index="$1" phase="${2:-stage}"
+  local -a args=(-i "${part_sources[index]}")
+
+  if [[ "$phase" == verify ]]; then
+    args+=(-V)
+  else
+    args+=(-t "${part_volumes[index]}")
+  fi
 
   if (( symmetric )) && [[ "${part_sources[index]}" == *.gpg ]]; then
     args+=(-s)
@@ -522,7 +595,7 @@ launch_stage_worker() {
     args+=(-U)
   fi
 
-  VB_RESTORE_PHASE=stage \
+  VB_RESTORE_PHASE="$phase" \
     VB_TXN_GID="$txn_gid" \
     BACKUP_ROOT="$backup_root" \
     bash "$SELF_SCRIPT" "${args[@]}" &
@@ -541,7 +614,7 @@ reap_stage_workers() {
   for i in "${!vb_done_pids[@]}"; do
     pid="${vb_done_pids[i]}"
     if (( vb_done_status[i] != 0 )); then
-      log ERROR "Failed to stage ${stage_pid_volume[$pid]}"
+      log ERROR "Failed to ${worker_action:-stage} ${stage_pid_volume[$pid]}"
       failed=1
     fi
   done
@@ -636,80 +709,66 @@ run_transaction() {
 # Participants
 # ------------------------------------------------------------------------------
 
-parse_backup_filename() {
-  local name="$1"
-
-  parsed_volume=""
-  parsed_timestamp=""
-
-  if [[ "$name" == *.gpg ]]; then
-    name="${name%.gpg}"
+# Reads the backups of BACKUP_ROOT or of the S3 location given with -b/-f.
+#   scan_backup_catalog <check S3 tokens: 0|1>
+scan_backup_catalog() {
+  if [[ -n "$catalog_bucket" ]]; then
+    s3_init "$catalog_bucket"
+    catalog_scan_s3 "$catalog_bucket" "$catalog_prefix" "$1"
+  else
+    catalog_scan_local "$backup_root"
   fi
-
-  if [[ "$name" == *.gz ]]; then
-    name="${name%.gz}"
-  fi
-
-  [[ "$name" == *.tar ]] || return 1
-  name="${name%.tar}"
-
-  if [[ "$name" =~ ^(.+)_([0-9]{8}_[0-9]{6})$ ]]; then
-    parsed_volume="${BASH_REMATCH[1]}"
-    parsed_timestamp="${BASH_REMATCH[2]}"
-    return 0
-  fi
-
-  return 1
 }
 
+# Picks the latest eligible backup of every volume (matching -v and -T).
+# Candidates are checked newest first; in S3 the pairing of archive and
+# checksum file is only checked for those candidates.
 collect_backups_for_all_mode() {
-  [[ -d "$backup_root" ]] || die "Backup directory not found: $backup_root"
+  local i vol ts
+  local -a order=()
 
-  local filepath filename vol ts
-  local -A seen=()
+  scan_backup_catalog 0
+  mapfile -t order < <(
+    for i in "${!cat_names[@]}"; do
+      printf '%s\t%s\t%s\n' "${cat_volumes[i]}" "${cat_ts[i]}" "$i"
+    done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2r | cut -f3
+  )
 
-  while IFS= read -r -d '' filepath; do
-    filename="$(basename "$filepath")"
-
-    if ! parse_backup_filename "$filename"; then
-      log WARN "Skipping unsupported file: $filename"
-      continue
-    fi
-
-    vol="$parsed_volume"
-    ts="$parsed_timestamp"
-
-    if ! is_valid_volume_name "$vol"; then
-      log WARN "Skipping backup with unsafe volume name '${vol}': $filename"
-      continue
-    fi
+  for i in "${order[@]}"; do
+    vol="${cat_volumes[i]}"
+    ts="${cat_ts[i]}"
 
     if (( ${#volume_filters[@]} > 0 )) && [[ -z "${volume_filters[$vol]:-}" ]]; then
       continue
     fi
-
     if [[ -n "$timestamp_filter" && "$ts" != "$timestamp_filter" ]]; then
       continue
     fi
+    [[ "${cat_status[i]}" != orphan ]] || continue
 
-    if [[ -n "${seen[${vol}_${ts}]:-}" ]]; then
-      die "Ambiguous backups for volume '${vol}' at ${ts}: $(basename "${seen[${vol}_${ts}]}") and ${filename}"
+    if [[ -n "${latest_ts[$vol]:-}" ]]; then
+      [[ "${latest_ts[$vol]}" != "$ts" ]] || die \
+        "Ambiguous backups for volume '${vol}' at ${ts}: ${latest_file[$vol]##*/} and ${cat_names[i]}"
+      continue
     fi
-    seen[${vol}_${ts}]="$filepath"
 
-    if [[ -z "${latest_ts[$vol]:-}" || "$ts" > "${latest_ts[$vol]}" ]]; then
-      latest_file["$vol"]="$filepath"
-      latest_ts["$vol"]="$ts"
+    if [[ -n "$catalog_bucket" ]]; then
+      catalog_check_s3_tokens "$catalog_bucket" "$i"
     fi
-  done < <(
-    find "$backup_root" -maxdepth 1 -type f \
-      \( -name '*.tar' -o -name '*.tar.gz' -o -name '*.tar.gpg' -o -name '*.tar.gz.gpg' \) \
-      -print0
-  )
+    if [[ "${cat_status[i]}" == incomplete ]] && (( ! allow_unverified )); then
+      log WARN "Skipping incomplete backup ${cat_names[i]} (${cat_reasons[i]}); use -U to restore it anyway"
+      continue
+    fi
+
+    latest_file["$vol"]="${cat_locations[i]}"
+    latest_ts["$vol"]="$ts"
+  done
 }
 
+# Fills the participants from the catalog. Without -v, only mounted volumes
+# take part when <require-mounted> is 1.
 build_participants_for_all_mode() {
-  local vol requested missing=0
+  local require_mounted="${1:-1}" vol requested missing=0
 
   if [[ -n "$timestamp_filter" ]]; then
     [[ "$timestamp_filter" =~ ^[0-9]{8}_[0-9]{6}$ ]] || die \
@@ -726,7 +785,7 @@ build_participants_for_all_mode() {
       fi
     done < <(printf '%s\n' "${!volume_filters[@]}" | sort)
     (( missing == 0 )) || die "One or more requested volumes have no matching backups"
-  else
+  elif (( require_mounted )); then
     # Without -v, restore what is mounted (like backup -a) and skip the rest
     for vol in "${!latest_file[@]}"; do
       if [[ ! -d "${VOLUMES_ROOT%/}/${vol}" ]]; then
@@ -737,8 +796,11 @@ build_participants_for_all_mode() {
   fi
 
   if (( ${#latest_file[@]} == 0 )); then
-    [[ -z "$timestamp_filter" ]] || die "No backup files found in $backup_root for timestamp $timestamp_filter"
-    die "No backup files found in $backup_root for the mounted volumes"
+    local location="$backup_root"
+    [[ -z "$catalog_bucket" ]] || location="s3://${catalog_bucket}/${catalog_prefix}"
+    [[ -z "$timestamp_filter" ]] || die "No complete backups found in ${location} for timestamp $timestamp_filter"
+    (( ! require_mounted )) || die "No complete backups found in ${location} for the mounted volumes"
+    die "No complete backups found in ${location}"
   fi
 
   while IFS= read -r vol; do
@@ -834,6 +896,73 @@ dry_run_participant() {
 # Modes
 # ------------------------------------------------------------------------------
 
+run_list() {
+  local i vol ts status size name reason width=6
+  local -a rows=()
+
+  scan_backup_catalog 1
+
+  for i in "${!cat_names[@]}"; do
+    vol="${cat_volumes[i]}"
+    if (( ${#volume_filters[@]} > 0 )) && [[ -z "${volume_filters[$vol]:-}" ]]; then
+      continue
+    fi
+    if [[ -n "$timestamp_filter" && "${cat_ts[i]}" != "$timestamp_filter" ]]; then
+      continue
+    fi
+    rows+=("${vol}"$'\t'"${cat_ts[i]}"$'\t'"${cat_status[i]}"$'\t'"$(catalog_human_size "${cat_sizes[i]}")"$'\t'"${cat_names[i]}"$'\t'"${cat_reasons[i]}")
+    (( ${#vol} <= width )) || width=${#vol}
+  done
+
+  if (( ${#rows[@]} == 0 )); then
+    log INFO "No backups found"
+    return 0
+  fi
+
+  printf '%-*s  %-15s  %-10s  %10s  %s\n' "$width" VOLUME TIMESTAMP STATUS SIZE NAME
+  while IFS=$'\t' read -r vol ts status size name reason; do
+    printf '%-*s  %-15s  %-10s  %10s  %s%s\n' "$width" "$vol" "$ts" "$status" "$size" "$name" "${reason:+  (${reason})}"
+  done < <(printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k1,1 -k2,2)
+}
+
+verify_backup() {
+  open_source "$1"
+  log INFO "Verifying ${src_path} (compression: ${decompressor_name}, decryption: $( (( decrypt )) && echo GPG || echo none))"
+  stream_source_into "" list_stream
+  log INFO "Verified: ${src_path}"
+}
+
+run_verify() {
+  local index failed=0
+  local -a pending=()
+
+  if (( ! all_volumes )); then
+    [[ -n "$source_arg" ]] || die "Required flag is missing: -i <backup-file|s3://bucket/key> (or -a)"
+    verify_backup "$source_arg"
+    return
+  fi
+
+  build_participants_for_all_mode 0
+  log INFO "Verifying ${#part_volumes[@]} backup(s)"
+  for index in "${!part_volumes[@]}"; do
+    log INFO "  ${part_volumes[index]}  <-  ${part_sources[index]}"
+  done
+
+  worker_action=verify
+  pending=("${!part_volumes[@]}")
+  while (( ${#pending[@]} > 0 || ${#stage_pids[@]} > 0 )); do
+    while (( ${#pending[@]} > 0 && ${#stage_pids[@]} < jobs )); do
+      index="${pending[0]}"
+      pending=("${pending[@]:1}")
+      launch_stage_worker "$index" verify
+    done
+    reap_stage_workers || failed=1
+  done
+
+  (( ! failed )) || die "One or more backups failed verification"
+  log INFO "All ${#part_volumes[@]} backup(s) verified"
+}
+
 run_stage_worker() {
   local path
   validate_volume_name "$target_volume"
@@ -908,10 +1037,12 @@ run_restore() {
 # Parse args
 # ------------------------------------------------------------------------------
 
-while getopts ':ad:i:t:T:v:j:sk:CnUXh' flag; do
+while getopts ':ab:d:f:i:t:T:v:j:sk:lCnUVXh' flag; do
   case "$flag" in
     a) all_volumes=1 ;;
+    b) catalog_bucket="$OPTARG" ;;
     d) backup_root="$OPTARG" ;;
+    f) catalog_folder="$OPTARG" ;;
     i) source_arg="$OPTARG" ;;
     t) target_volume="$OPTARG" ;;
     T) timestamp_filter="$OPTARG" ;;
@@ -924,7 +1055,9 @@ while getopts ':ad:i:t:T:v:j:sk:CnUXh' flag; do
     k) private_key_file="$OPTARG" ;;
     C) clear_target=1 ;;
     n) dry_run=1 ;;
+    l) list_mode=1 ;;
     U) allow_unverified=1 ;;
+    V) verify_mode=1 ;;
     X) recover_only=1 ;;
     h)
       usage
@@ -949,9 +1082,32 @@ shift $((OPTIND - 1))
 # Mode selection
 # ------------------------------------------------------------------------------
 
-init_volumes_root
+(( list_mode + verify_mode + recover_only <= 1 )) || die "Options -l, -V and -X cannot be combined"
 
-if (( recover_only )); then
+if [[ -n "$catalog_folder" && -z "$catalog_bucket" ]]; then
+  die "Option -f requires -b"
+fi
+if [[ -n "$catalog_bucket" ]]; then
+  (( list_mode || all_volumes )) || die "Option -b can only be used with -a, -l or -V -a; use -i s3://bucket/key for a single backup"
+  s3_validate_bucket "$catalog_bucket"
+  catalog_prefix="$(s3_normalize_prefix "$catalog_folder")"
+fi
+
+if (( list_mode )); then
+  if (( all_volumes || clear_target || dry_run || jobs != 1 )) || [[ -n "$source_arg$target_volume" ]]; then
+    die "Option -l cannot be combined with -a, -i, -t, -C, -n or -j"
+  fi
+elif (( verify_mode )); then
+  [[ -z "$target_volume" ]] || die "Option -t cannot be used with -V"
+  (( ! clear_target && ! dry_run )) || die "Options -C and -n cannot be used with -V"
+  if (( all_volumes )); then
+    [[ -z "$source_arg" ]] || die "Option -i cannot be used with -a"
+  else
+    [[ -z "$timestamp_filter" ]] || die "Option -T can only be used with -a"
+    (( ${#volume_filters[@]} == 0 )) || die "Option -v can only be used with -a"
+    (( jobs == 1 )) || die "Option -j can only be used with -a"
+  fi
+elif (( recover_only )); then
   if (( all_volumes || ${#volume_filters[@]} > 0 )) || [[ -n "$source_arg$target_volume$timestamp_filter" ]]; then
     die "Option -X cannot be combined with -a, -i, -t, -T or -v"
   fi
@@ -968,13 +1124,22 @@ fi
 # Main
 # ------------------------------------------------------------------------------
 
-if [[ "$RESTORE_PHASE" == stage ]]; then
+if [[ "$RESTORE_PHASE" == verify ]]; then
+  verify_backup "$source_arg"
+elif (( list_mode )); then
+  run_list
+elif (( verify_mode )); then
+  run_verify
+elif [[ "$RESTORE_PHASE" == stage ]]; then
+  init_volumes_root
   run_stage_worker
 elif (( recover_only )); then
+  init_volumes_root
   require_command flock
   prepare_tar_flags
   txn_recover
   log INFO "Recovery finished"
 else
+  init_volumes_root
   run_restore
 fi

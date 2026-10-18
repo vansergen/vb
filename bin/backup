@@ -9,7 +9,7 @@ readonly SCRIPT_REAL
 readonly SELF_SCRIPT="${DVB_SELF:-$SCRIPT_REAL}"
 readonly VB_LIB_DIR="${VB_LIB_DIR:-$(dirname -- "$SCRIPT_REAL")/../lib/vb}"
 
-[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" ]] || {
+[[ -r "${VB_LIB_DIR}/common.sh" && -r "${VB_LIB_DIR}/s3.sh" && -r "${VB_LIB_DIR}/txn.sh" && -r "${VB_LIB_DIR}/catalog.sh" ]] || {
   printf '%s: library directory not found: %s (set VB_LIB_DIR)\n' "$SCRIPT_NAME" "$VB_LIB_DIR" >&2
   exit 1
 }
@@ -19,6 +19,10 @@ source "${VB_LIB_DIR}/common.sh"
 source "${VB_LIB_DIR}/s3.sh"
 # shellcheck source=SCRIPTDIR/../lib/vb/txn.sh
 source "${VB_LIB_DIR}/txn.sh"
+# shellcheck source=SCRIPTDIR/../lib/vb/catalog.sh
+source "${VB_LIB_DIR}/catalog.sh"
+
+load_secret_files GPG_PASSPHRASE GPG_PUBLIC_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 readonly DEFAULT_BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 readonly VOLUMES_ROOT="${VOLUMES_ROOT:-/volumes}"
@@ -32,7 +36,8 @@ jobs=1
 dry_run=0
 strict_tar=0
 
-compress=0
+compression=""
+compression_level=""
 encrypt=0
 symmetric=0
 upload_to_s3=0
@@ -45,6 +50,9 @@ s3_key=""
 
 volume=""
 declare -a requested_volumes=()
+declare -a exclude_patterns=()
+keep_count=""
+keep_days=""
 
 gpg_raw_key="${GPG_PUBLIC_KEY:-}"
 gpg_passphrase="${GPG_PASSPHRASE:-}"
@@ -98,10 +106,22 @@ Options:
     -n          Dry-run: validate and print what would be backed up
     -S          Strict: fail when files change while they are archived
                 (by default this is a warning)
+    -x <pattern> Exclude files matching a tar --exclude pattern (repeatable).
+                A pattern without "/" matches names at any depth; "./path"
+                matches a path from the volume root
     -h          Show help
 
+  Rotation (after a successful backup, for the backed up volume only):
+    -R <N>      Keep the N newest complete backups
+    -D <days>   Keep backups younger than this many days
+                With both, a backup is kept if either rule keeps it. The newest
+                complete backup is never deleted, and incomplete backups are
+                only deleted by -D.
+
   Backup options:
-    -c          Compress backup (pigz if available, otherwise gzip)
+    -c          Compress backup with gzip (pigz if available)
+    -z          Compress backup with zstd
+    -L <level>  Compression level (gzip: 1-9, zstd: 1-19)
     -e          Encrypt backup with public key (asymmetric GPG)
     -s          Encrypt backup with passphrase (symmetric GPG)
     -b <bucket> Upload backup to S3 bucket
@@ -116,6 +136,9 @@ Environment variables:
   GPG_ROOT              Mounted GPG directory (default: /gpg)
   BACKUP_TIMESTAMP      Override backup timestamp (default: current time, format: YYYYMMDD_HHMMSS)
   VB_LOCK_TIMEOUT       Seconds to wait for the lock on BACKUP_ROOT (default: 300)
+  *_FILE                Read GPG_PASSPHRASE, GPG_PUBLIC_KEY, AWS_ACCESS_KEY_ID,
+                        AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN from a file
+                        (e.g. GPG_PASSPHRASE_FILE=/run/secrets/passphrase)
   GPG_PUBLIC_KEY        Public key content for asymmetric encryption
   GPG_PASSPHRASE        Passphrase for symmetric encryption
   AWS_ACCESS_KEY_ID     S3 access key ID (required for S3 upload)
@@ -128,6 +151,9 @@ Environment variables:
   S3_PART_SIZE          Multipart part size in MiB, 5-5120 (default: 64); max object size is 10000 parts
   S3_ALLOW_UNCONDITIONAL_WRITES
                         Set to 1 to publish on providers without conditional writes (loses overwrite protection)
+  S3_ALLOW_UNCONDITIONAL_DELETE
+                        Set to 1 to rotate on providers that ignore If-Match on DELETE (loses protection
+                        against deleting an object that was replaced meanwhile)
   NO_COLOR              Disable colors in logs
 
 Notes:
@@ -222,9 +248,10 @@ build_filename_for_volume() {
   local vol="$1"
   local name="${vol}_${backup_timestamp}.tar"
 
-  if (( compress )); then
-    name+=".gz"
-  fi
+  case "$compression" in
+    gzip) name+=".gz" ;;
+    zstd) name+=".zst" ;;
+  esac
 
   if (( symmetric || encrypt )); then
     name+=".gpg"
@@ -309,21 +336,34 @@ prepare_asymmetric_gpg() {
 }
 
 prepare_compressor() {
-  if (( compress == 0 )); then
-    compressor_cmd=()
-    compressor_name="none"
-    return 0
-  fi
+  local -a level=()
+  [[ -z "$compression_level" ]] || level=("-${compression_level}")
 
-  if command -v pigz >/dev/null 2>&1; then
-    compressor_cmd=(pigz -c)
-    compressor_name="pigz"
-  elif command -v gzip >/dev/null 2>&1; then
-    compressor_cmd=(gzip -c)
-    compressor_name="gzip"
-    log WARN "pigz not found, falling back to gzip"
-  else
-    die "Compression requested, but neither pigz nor gzip is installed"
+  case "$compression" in
+    "")
+      compressor_cmd=()
+      compressor_name="none"
+      ;;
+    zstd)
+      command -v zstd >/dev/null 2>&1 || die "Compression with zstd requested (-z), but zstd is not installed"
+      compressor_cmd=(zstd -q -c -T0 "${level[@]}")
+      compressor_name="zstd"
+      ;;
+    gzip)
+      if command -v pigz >/dev/null 2>&1; then
+        compressor_cmd=(pigz -c "${level[@]}")
+        compressor_name="pigz"
+      elif command -v gzip >/dev/null 2>&1; then
+        compressor_cmd=(gzip -c "${level[@]}")
+        compressor_name="gzip"
+        log WARN "pigz not found, falling back to gzip"
+      else
+        die "Compression requested, but neither pigz nor gzip is installed"
+      fi
+      ;;
+  esac
+  if [[ -n "$compression_level" ]]; then
+    compressor_name+=" (level ${compression_level})"
   fi
 }
 
@@ -338,9 +378,14 @@ prepare_gpg_runtime() {
 # GNU tar exits with 1 when files changed while they were read, which is
 # common on live volumes; that is a warning unless -S was given.
 archive_stream() {
-  local rc=0
+  local rc=0 pattern
+  local -a excludes=()
+  for pattern in "${exclude_patterns[@]}"; do
+    excludes+=("--exclude=${pattern}")
+  done
   vb_test_point "archive_stream" "$volume"
-  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" . || rc=$?
+  # --exclude is positional in GNU tar: it must precede the member list
+  tar --create --numeric-owner --directory "$directory" --file - "${tar_extra_flags[@]}" "${excludes[@]}" . || rc=$?
 
   if (( rc == 1 && ! strict_tar )); then
     log WARN "Some files changed while they were archived; their copies may be inconsistent (use -S to fail instead)"
@@ -350,7 +395,7 @@ archive_stream() {
 }
 
 compress_stream() {
-  if (( compress )); then
+  if [[ -n "$compression" ]]; then
     "${compressor_cmd[@]}"
   else
     cat
@@ -483,8 +528,22 @@ collect_selected_volumes_for_all_mode() {
 build_child_args() {
   declare -ga CHILD_ARGS=()
 
-  if (( compress )); then
-    CHILD_ARGS+=(-c)
+  case "$compression" in
+    gzip) CHILD_ARGS+=(-c) ;;
+    zstd) CHILD_ARGS+=(-z) ;;
+  esac
+  if [[ -n "$compression_level" ]]; then
+    CHILD_ARGS+=(-L "$compression_level")
+  fi
+  local pattern
+  for pattern in "${exclude_patterns[@]}"; do
+    CHILD_ARGS+=(-x "$pattern")
+  done
+  if [[ -n "$keep_count" ]]; then
+    CHILD_ARGS+=(-R "$keep_count")
+  fi
+  if [[ -n "$keep_days" ]]; then
+    CHILD_ARGS+=(-D "$keep_days")
   fi
 
   if (( strict_tar )); then
@@ -688,6 +747,162 @@ publish_local_backup() {
   log INFO "Checksum written: ${backup_path}.sha256"
 }
 
+# ------------------------------------------------------------------------------
+# Rotation
+# ------------------------------------------------------------------------------
+
+# Decides which backups of $volume to delete from the current catalog and
+# fills rotation_deletes with their catalog indices. A complete backup stays
+# if it is the newest complete one, among the -R newest complete ones, or
+# younger than -D days. Incomplete backups stay unless -D expires them, and
+# orphaned checksum files in S3 always stay (they are only reported).
+plan_rotation() {
+  local cutoff=0 rank=0 i keep epoch
+  local -a indices=()
+  rotation_deletes=()
+
+  if [[ -n "$keep_days" ]]; then
+    cutoff=$(( $(date -u +%s) - keep_days * 86400 ))
+  fi
+  mapfile -t indices < <(catalog_indices_for_volume "$volume")
+
+  for i in "${indices[@]}"; do
+    keep=0
+    if ! epoch="$(catalog_ts_epoch "${cat_ts[i]}")"; then
+      log WARN "Rotation: keeping ${cat_names[i]}: its timestamp is not a valid date"
+      [[ "${cat_status[i]}" != complete ]] || rank=$((rank + 1))
+      continue
+    fi
+    if [[ "${cat_names[i]}" == "$filename" ]]; then
+      # Never the backup that was just made, whatever its timestamp
+      keep=1
+      [[ "${cat_status[i]}" != complete ]] || rank=$((rank + 1))
+    elif [[ "${cat_status[i]}" == complete ]]; then
+      (( rank > 0 )) || keep=1
+      if [[ -n "$keep_count" ]] && (( rank < keep_count )); then
+        keep=1
+      fi
+      if [[ -n "$keep_days" ]] && (( epoch >= cutoff )); then
+        keep=1
+      fi
+      rank=$((rank + 1))
+    elif [[ "${cat_status[i]}" == orphan ]] && (( upload_to_s3 )); then
+      keep=1
+      log WARN "Rotation: ${cat_locations[i]}.sha256 has no archive; orphaned checksum files are not deleted in S3"
+    elif [[ -z "$keep_days" ]] || (( epoch >= cutoff )); then
+      keep=1
+      log WARN "Rotation: keeping ${cat_status[i]} backup ${cat_names[i]} (${cat_reasons[i]}); only -D deletes incomplete backups"
+    fi
+    (( keep )) || rotation_deletes+=("$i")
+  done
+}
+
+rotation_entry_label() {
+  local i="$1"
+  if [[ "${cat_status[i]}" == complete ]]; then
+    printf '%s\n' "${cat_names[i]}"
+  else
+    printf '%s (%s: %s)\n' "${cat_names[i]}" "${cat_status[i]}" "${cat_reasons[i]}"
+  fi
+}
+
+# Shows what a rotation after this backup would delete.
+preview_rotation() {
+  local i
+  if (( upload_to_s3 )); then
+    catalog_scan_s3 "$s3_bucket" "$s3_prefix" 1
+  elif [[ -d "$backup_root" ]]; then
+    catalog_scan_local "$backup_root"
+  else
+    catalog_reset
+  fi
+  catalog_add_virtual "$filename"
+  plan_rotation
+
+  for i in "${rotation_deletes[@]}"; do
+    log INFO "Rotation would delete: $(rotation_entry_label "$i")"
+  done
+  (( ${#rotation_deletes[@]} > 0 )) || log INFO "Rotation would delete nothing"
+}
+
+# Local rotation runs entirely under the BACKUP_ROOT lock, like publishing:
+# the listing, the plan and the deletions cannot interleave with another
+# backup. A pair loses its checksum file first, so an interrupted deletion
+# leaves an incomplete archive, never a checksum file without its archive.
+rotate_local() {
+  local lock_fd i path
+
+  exec {lock_fd}>>"${backup_root%/}/.vb.lock"
+  flock -x -w "${VB_LOCK_TIMEOUT:-300}" "$lock_fd" || die "Timed out waiting for the lock on ${backup_root}"
+
+  catalog_scan_local "$backup_root"
+  plan_rotation
+  vb_test_point "rotate_planned" "$volume"
+
+  for i in "${rotation_deletes[@]}"; do
+    path="${cat_locations[i]}"
+    if (( cat_sidecars[i] )); then
+      rm -f -- "${path}.sha256"
+      sync -- "$backup_root"
+      vb_test_point "rotate_pair" "$volume"
+    fi
+    if [[ "${cat_status[i]}" != orphan ]]; then
+      rm -f -- "$path"
+    fi
+    log INFO "Rotation deleted: $(rotation_entry_label "$i")"
+  done
+  sync -- "$backup_root"
+
+  exec {lock_fd}>&-
+}
+
+# S3 has no locks, so every DELETE is conditional on the ETag seen when the
+# plan was made: an object replaced in the meantime is kept.
+rotate_s3() {
+  local i rc conditional=1 etag
+
+  catalog_scan_s3 "$s3_bucket" "$s3_prefix" 1
+  plan_rotation
+  if (( ${#rotation_deletes[@]} == 0 )); then
+    return 0
+  fi
+
+  if ! s3_probe_conditional_delete "$s3_bucket" "$s3_prefix"; then
+    [[ "${S3_ALLOW_UNCONDITIONAL_DELETE:-0}" == 1 ]] || die \
+      "The S3 provider does not honour If-Match on DELETE, so rotation could delete a backup that was replaced after it was checked. Set S3_ALLOW_UNCONDITIONAL_DELETE=1 to accept that risk"
+    log WARN "The S3 provider ignores If-Match on DELETE; rotating without that protection because S3_ALLOW_UNCONDITIONAL_DELETE=1"
+    conditional=0
+  fi
+
+  vb_test_point "rotate_planned" "$volume"
+
+  for i in "${rotation_deletes[@]}"; do
+    if (( cat_sidecars[i] )); then
+      etag="${cat_sidecar_etags[i]}"
+      (( conditional )) || etag=""
+      rc=0
+      s3_delete_if_match "$s3_bucket" "${cat_keys[i]}.sha256" "$etag" || rc=$?
+      if (( rc == 3 )); then
+        log WARN "Rotation kept ${cat_names[i]}: its checksum file changed after it was checked"
+        continue
+      fi
+      (( rc == 0 )) || die "The S3 provider rejected a conditional DELETE (HTTP 501) of s3://${s3_bucket}/${cat_keys[i]}.sha256"
+      vb_test_point "rotate_pair" "$volume"
+    fi
+
+    etag="${cat_etags[i]}"
+    (( conditional )) || etag=""
+    rc=0
+    s3_delete_if_match "$s3_bucket" "${cat_keys[i]}" "$etag" || rc=$?
+    if (( rc == 3 )); then
+      log WARN "Rotation kept ${cat_names[i]}: the archive changed after it was checked"
+      continue
+    fi
+    (( rc == 0 )) || die "The S3 provider rejected a conditional DELETE (HTTP 501) of s3://${s3_bucket}/${cat_keys[i]}"
+    log INFO "Rotation deleted: $(rotation_entry_label "$i")"
+  done
+}
+
 run_single_backup() {
   validate_single_mode
 
@@ -703,11 +918,7 @@ run_single_backup() {
   log INFO "Volume: $volume"
   log INFO "Source directory: $directory"
 
-  if (( compress )); then
-    log INFO "Compression: ${compressor_name}"
-  else
-    log INFO "Compression: none"
-  fi
+  log INFO "Compression: ${compressor_name}"
 
   if (( symmetric )); then
     log INFO "Encryption: symmetric GPG"
@@ -733,6 +944,9 @@ run_single_backup() {
     if (( encrypt )); then
       prepare_asymmetric_gpg
     fi
+    if [[ -n "$keep_count$keep_days" ]]; then
+      preview_rotation
+    fi
     log INFO "Dry-run: no changes made"
     return 0
   fi
@@ -756,6 +970,14 @@ run_single_backup() {
 
     log INFO "Backup created successfully: $backup_path"
     log INFO "Backup size: $(file_size_human "$backup_path")"
+  fi
+
+  if [[ -n "$keep_count$keep_days" ]]; then
+    if (( upload_to_s3 )); then
+      rotate_s3
+    else
+      rotate_local
+    fi
   fi
 
   log INFO "Done"
@@ -817,13 +1039,27 @@ run_all_backups() {
 # Parse args
 # ------------------------------------------------------------------------------
 
-while getopts ':ad:T:j:ceshb:f:k:v:nS' flag; do
+while getopts ':ad:T:j:cezshb:f:k:v:nSL:x:R:D:' flag; do
   case "$flag" in
     a) all_volumes=1 ;;
     d) backup_root="$OPTARG" ;;
     T) backup_timestamp="$OPTARG" ;;
     j) jobs="$OPTARG" ;;
-    c) compress=1 ;;
+    c)
+      [[ "$compression" != zstd ]] || die "Use either -c or -z, not both"
+      compression=gzip
+      ;;
+    z)
+      [[ "$compression" != gzip ]] || die "Use either -c or -z, not both"
+      compression=zstd
+      ;;
+    L) compression_level="$OPTARG" ;;
+    x)
+      [[ -n "$OPTARG" ]] || die "Option -x needs a non-empty pattern"
+      exclude_patterns+=("$OPTARG")
+      ;;
+    R) keep_count="$OPTARG" ;;
+    D) keep_days="$OPTARG" ;;
     e) encrypt=1 ;;
     s) symmetric=1 ;;
     b)
@@ -856,6 +1092,18 @@ shift $((OPTIND - 1))
 
 # Validate before any arithmetic: bash evaluates array subscripts in (( )).
 [[ "$jobs" =~ ^[1-9][0-9]?$ ]] || die "Invalid -j value: '$jobs'. Expected an integer from 1 to 99"
+
+if [[ -n "$compression_level" ]]; then
+  case "$compression" in
+    gzip) [[ "$compression_level" =~ ^[1-9]$ ]] || die "Invalid -L value: '$compression_level'. gzip levels are 1-9" ;;
+    zstd) [[ "$compression_level" =~ ^(1[0-9]|[1-9])$ ]] || die "Invalid -L value: '$compression_level'. zstd levels are 1-19" ;;
+    *) die "Option -L requires -c or -z" ;;
+  esac
+fi
+[[ -z "$keep_count" || "$keep_count" =~ ^[1-9][0-9]{0,3}$ ]] || die \
+  "Invalid -R value: '$keep_count'. Expected an integer from 1 to 9999"
+[[ -z "$keep_days" || "$keep_days" =~ ^[1-9][0-9]{0,4}$ ]] || die \
+  "Invalid -D value: '$keep_days'. Expected an integer from 1 to 99999"
 
 # ------------------------------------------------------------------------------
 # Mode selection

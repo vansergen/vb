@@ -354,8 +354,10 @@ s3_put_file() {
 s3_delete_if_match() {
   local bucket="$1" key="$2" etag="$3"
   local body="${work_dir}/delete.body"
+  local -a cond=()
+  [[ -z "$etag" ]] || cond=(-H "If-Match: ${etag}")
 
-  s3__call "$body" "${work_dir}/delete.headers" --retry 3 -X DELETE -H "If-Match: ${etag}" "$(s3_url_for "$bucket" "$key")"
+  s3__call "$body" "${work_dir}/delete.headers" --retry 3 -X DELETE "${cond[@]}" "$(s3_url_for "$bucket" "$key")"
 
   case "$S3_STATUS" in
     200 | 204 | 404) return 0 ;;
@@ -367,6 +369,37 @@ s3_delete_if_match() {
 
 # Decodes XML character references, both named (&quot;) and numeric (&#34;,
 # &#x22;): providers differ in which form they use.
+# Checks with a probe object below <prefix> that the provider honours
+# If-Match on DELETE. Returns 1 if it does not (the probe is removed anyway).
+s3_probe_conditional_delete() {
+  local bucket="$1" prefix="$2" key file etag rc=0
+
+  key="${prefix:+${prefix}/}.vb-probe-$(random_hex 8)"
+  file="${work_dir}/probe"
+  printf 'vb conditional delete probe\n' > "$file"
+  s3_put_file "$bucket" "$key" "$file" probe || die "Failed to write the probe object s3://${bucket}/${key}"
+  s3_head "$bucket" "$key" || die "The probe object s3://${bucket}/${key} disappeared"
+  etag="$(s3__header "$s3_head_headers" etag)"
+
+  s3_delete_if_match "$bucket" "$key" '"00000000000000000000000000000000"' || rc=$?
+  case "$rc" in
+    3)
+      rc=0
+      s3_delete_if_match "$bucket" "$key" "$etag" || rc=$?
+      (( rc == 0 )) || die "Failed to delete the probe object s3://${bucket}/${key}"
+      return 0
+      ;;
+    0)
+      # Deleted although the ETag did not match
+      return 1
+      ;;
+    *)
+      s3_delete_if_match "$bucket" "$key" "" || true
+      return 1
+      ;;
+  esac
+}
+
 s3__xml_unescape() {
   awk '
     {

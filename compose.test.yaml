@@ -9,6 +9,7 @@ x-test-env: &test-env
   TEST_S3_PREFIX: docker-volume-tests
   REQUIRE_S3_TESTS: "1"
   REQUIRE_XATTR_TESTS: "1"
+  TEST_S3_VERSIONED_ENDPOINT: http://s3v:7070
 
 services:
   s3:
@@ -19,6 +20,18 @@ services:
       ROOT_SECRET_KEY: vb_test_secret_key
     volumes:
       - s3-data:/data
+
+  # A second server with bucket versioning, for the rotation test
+  s3v:
+    image: versity/versitygw:v1.8.0
+    command:
+      ["--port", ":7070", "posix", "--versioning-dir", "/versions", "/data"]
+    environment:
+      ROOT_ACCESS_KEY: vb_test_access_key
+      ROOT_SECRET_KEY: vb_test_secret_key
+    volumes:
+      - s3v-data:/data
+      - s3v-versions:/versions
 
   test:
     build:
@@ -37,26 +50,40 @@ services:
         # Keep bootstrap values literal here because Docker Compose may interpolate
         # variable-like syntax in command strings before container environment is applied.
         # The S3 image ships no health probe, so wait until the bucket can be created.
-        ready=0
-        for _ in $$(seq 1 60); do
-          code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
-            --user vb_test_access_key:vb_test_secret_key \
-            --aws-sigv4 aws:amz:us-east-1:s3 \
-            http://s3:7070/vb-test || true)
-          if [ "$$code" = 200 ] || [ "$$code" = 409 ]; then
-            ready=1
-            break
+        for host in s3 s3v; do
+          ready=0
+          for _ in $$(seq 1 60); do
+            code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+              --user vb_test_access_key:vb_test_secret_key \
+              --aws-sigv4 aws:amz:us-east-1:s3 \
+              "http://$$host:7070/vb-test" || true)
+            if [ "$$code" = 200 ] || [ "$$code" = 409 ]; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$$ready" != 1 ]; then
+            echo "S3 test server $$host did not become ready" >&2
+            exit 1
           fi
-          sleep 1
         done
-        if [ "$$ready" != 1 ]; then
-          echo "S3 test server did not become ready" >&2
+
+        code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+          --user vb_test_access_key:vb_test_secret_key \
+          --aws-sigv4 aws:amz:us-east-1:s3 \
+          -H 'Content-Type: application/xml' \
+          --data-binary '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' \
+          'http://s3v:7070/vb-test?versioning')
+        if [ "$$code" != 200 ]; then
+          echo "Could not enable bucket versioning (HTTP $$code)" >&2
           exit 1
         fi
 
         exec bash /usr/local/bin/vb-test
     depends_on:
       - s3
+      - s3v
     environment: *test-env
     develop:
       watch:
@@ -67,3 +94,5 @@ services:
 
 volumes:
   s3-data:
+  s3v-data:
+  s3v-versions:

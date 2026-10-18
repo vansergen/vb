@@ -20,6 +20,8 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - [Examples: All Volumes](#examples-all-volumes)
 - [Backing up every Docker volume on the host](#backing-up-every-docker-volume-on-the-host)
 - [Dry Run](#dry-run)
+- [Listing and Verifying Backups](#listing-and-verifying-backups)
+- [Rotation](#rotation)
 - [Automation with cron](#automation-with-cron)
 - [Production Recommendations](#production-recommendations)
 - [Troubleshooting](#troubleshooting)
@@ -34,18 +36,23 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 - Back up a single volume to an archive
 - Back up all volumes from `/volumes`
 - Save archives locally or upload to S3
-- Compress with `pigz` / `gzip`
+- Compress with `pigz` / `gzip` or `zstd`, with a selectable level
 - Encrypt with GPG (symmetric passphrase, or asymmetric to one or more public keys)
 - Run backups for multiple volumes in parallel
 - Assign a shared timestamp to a group of backups
 - Write a SHA256 checksum alongside every archive (local and S3)
 - Preserve sparse files, POSIX ACLs, and extended attributes when GNU `tar` is available
 - Back up live volumes: files that change while they are read only produce a warning (`-S` makes it an error)
+- Exclude files by pattern (`-x`)
+- Rotate old backups after each successful backup: keep the newest N (`-R`) and/or those younger than N days (`-D`), locally and in S3
+- Read secrets from files (`GPG_PASSPHRASE_FILE`, `AWS_SECRET_ACCESS_KEY_FILE`, …) for Docker secrets
 
 **Restore:**
 
 - Restore a single volume from a local file or from S3
-- Restore all volumes from a backup directory
+- Restore all volumes from a backup directory or an S3 prefix
+- List backups and whether each one is complete (`-l`)
+- Verify backups without restoring them (`-V`)
 - Restore only selected volumes
 - Filter by a specific timestamp
 - Clear a volume before restoring (`-C`)
@@ -61,7 +68,7 @@ Runs as a Docker/Podman container. Provides two scripts: `backup` and `restore`.
 ### Backup
 
 ```
-Docker volume → tar archive → [gzip compression] → [GPG encryption] → local file or S3
+Docker volume → tar archive → [gzip or zstd compression] → [GPG encryption] → local file or S3
 ```
 
 The filename is generated automatically:
@@ -69,8 +76,10 @@ The filename is generated automatically:
 ```
 <VOLUME>_<YYYYMMDD_HHMMSS>.tar
 <VOLUME>_<YYYYMMDD_HHMMSS>.tar.gz
+<VOLUME>_<YYYYMMDD_HHMMSS>.tar.zst
 <VOLUME>_<YYYYMMDD_HHMMSS>.tar.gpg
 <VOLUME>_<YYYYMMDD_HHMMSS>.tar.gz.gpg
+<VOLUME>_<YYYYMMDD_HHMMSS>.tar.zst.gpg
 ```
 
 A `.sha256` checksum file is written alongside each archive — for both local backups and uploads to S3.
@@ -78,7 +87,7 @@ A `.sha256` checksum file is written alongside each archive — for both local b
 ### Restore
 
 ```
-local file or S3 → [SHA256 verification] → [GPG decryption] → [gzip decompression] → Docker volume
+local file or S3 → [SHA256 verification] → [GPG decryption] → [gzip/zstd decompression] → Docker volume
 ```
 
 The format is detected automatically from the file extension.
@@ -196,22 +205,27 @@ The key file must be present at `./gpg/public.asc` (or another path specified wi
 
 ### Options
 
-| Option        | Description                                                               |
-| ------------- | ------------------------------------------------------------------------- |
-| `-v <name>`   | Volume name (directory inside `/volumes`)                                 |
-| `-a`          | Back up all volumes found in `/volumes`                                   |
-| `-d <dir>`    | Backup directory override (default: `/backups`)                           |
-| `-T <ts>`     | Set timestamp manually (format: `YYYYMMDD_HHMMSS`)                        |
-| `-j <N>`      | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                       |
-| `-c`          | Compress with `pigz` if available, otherwise `gzip`                       |
-| `-e`          | Asymmetric GPG encryption (public key)                                    |
-| `-s`          | Symmetric GPG encryption (passphrase)                                     |
-| `-b <bucket>` | Upload to S3 bucket                                                       |
-| `-f <path>`   | Folder / prefix inside the S3 bucket                                      |
-| `-k <file>`   | Public key file: absolute path or file inside `/gpg` (repeatable)         |
-| `-n`          | Dry run: validate and print what would be done without creating any files |
-| `-S`          | Strict: fail when files change while they are archived (default: warning) |
-| `-h`          | Show help                                                                 |
+| Option         | Description                                                               |
+| -------------- | ------------------------------------------------------------------------- |
+| `-v <name>`    | Volume name (directory inside `/volumes`)                                 |
+| `-a`           | Back up all volumes found in `/volumes`                                   |
+| `-d <dir>`     | Backup directory override (default: `/backups`)                           |
+| `-T <ts>`      | Set timestamp manually (format: `YYYYMMDD_HHMMSS`)                        |
+| `-j <N>`       | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                       |
+| `-c`           | Compress with `pigz` if available, otherwise `gzip`                       |
+| `-z`           | Compress with `zstd` (multithreaded)                                      |
+| `-L <level>`   | Compression level (`gzip`: `1`–`9`, `zstd`: `1`–`19`)                     |
+| `-x <pattern>` | Exclude files matching a `tar --exclude` pattern (repeatable)             |
+| `-R <N>`       | Rotation: keep the N newest complete backups of the volume                |
+| `-D <days>`    | Rotation: keep backups of the volume younger than this many days          |
+| `-e`           | Asymmetric GPG encryption (public key)                                    |
+| `-s`           | Symmetric GPG encryption (passphrase)                                     |
+| `-b <bucket>`  | Upload to S3 bucket                                                       |
+| `-f <path>`    | Folder / prefix inside the S3 bucket                                      |
+| `-k <file>`    | Public key file: absolute path or file inside `/gpg` (repeatable)         |
+| `-n`           | Dry run: validate and print what would be done without creating any files |
+| `-S`           | Strict: fail when files change while they are archived (default: warning) |
+| `-h`           | Show help                                                                 |
 
 ### Examples
 
@@ -232,6 +246,17 @@ docker run --rm \
   --volume ./backups:/backups \
   ghcr.io/vansergen/vb backup -v postgres_data -c
 ```
+
+#### Exclude files
+
+```bash
+docker run --rm \
+  --volume app_data:/volumes/app_data \
+  --volume ./backups:/backups \
+  ghcr.io/vansergen/vb backup -v app_data -z -x '*.log' -x ./cache
+```
+
+Patterns follow `tar --exclude`: a pattern without `/` matches a name at any depth (`*.log`, `node_modules`), and a pattern starting with `./` matches a path from the volume root (`./cache` excludes the top-level `cache` directory only).
 
 #### Backup to a custom directory
 
@@ -301,16 +326,17 @@ Runs up to 3 backups concurrently.
 
 ### Modes
 
-| Mode                      | Command                                           |
-| ------------------------- | ------------------------------------------------- |
-| Single volume             | `restore -i <file\|s3://...> -t <name> [options]` |
-| All volumes               | `restore -a [options]`                            |
-| Selected volumes from all | `restore -a -v <name> [-v <name> ...] [options]`  |
-| Recovery only             | `restore -X`                                      |
+| Mode                      | Command                                             |
+| ------------------------- | --------------------------------------------------- |
+| Single volume             | `restore -i <file\|s3://...> -t <name> [options]`   |
+| All volumes               | `restore -a [options]`                              |
+| Selected volumes from all | `restore -a -v <name> [-v <name> ...] [options]`    |
+| All volumes from S3       | `restore -a -b <bucket> [-f <prefix>] [options]`    |
+| List backups              | `restore -l [-b <bucket> [-f <prefix>]]`            |
+| Verify backups            | `restore -V -i <file\|s3://...>` or `restore -V -a` |
+| Recovery only             | `restore -X`                                        |
 
-> **Note:** The `-a` mode only works with local files in `BACKUP_ROOT`. To restore from S3, use single mode with `-i s3://...`.
->
-> Without `-v`, `-a` restores the latest backup of every **mounted** volume and skips backups of volumes that are not mounted, with a warning. With `-v`, every requested volume must be mounted and have a backup.
+> **Note:** Without `-v`, `-a` restores the latest complete backup of every **mounted** volume and skips backups of volumes that are not mounted, with a warning. With `-v`, every requested volume must be mounted and have a backup. Incomplete backups (see [Listing and Verifying Backups](#listing-and-verifying-backups)) are skipped with a warning unless `-U` is given.
 
 ### Options
 
@@ -318,8 +344,12 @@ Runs up to 3 backups concurrently.
 | ------------- | ----------------------------------------------------------------------- |
 | `-i <source>` | Source: filename in `BACKUP_ROOT`, a file path, or `s3://bucket/key`    |
 | `-t <name>`   | Target volume name (directory in `/volumes`)                            |
-| `-a`          | Restore all volumes from files in `BACKUP_ROOT`                         |
+| `-a`          | Restore all volumes from files in `BACKUP_ROOT` (or `-b`)               |
+| `-l`          | List backups and their status                                           |
+| `-V`          | Verify backups (checksum, decryption, decompression, archive) only      |
 | `-d <dir>`    | Backup directory override (default: `/backups`)                         |
+| `-b <bucket>` | Use backups in an S3 bucket for `-a`, `-l` and `-V -a`                  |
+| `-f <path>`   | Folder / prefix inside the S3 bucket                                    |
 | `-T <ts>`     | In `-a` mode: restore only backups with this exact timestamp            |
 | `-v <name>`   | In `-a` mode: filter by volume name (repeatable)                        |
 | `-j <N>`      | Parallel jobs in `-a` mode (`1`–`99`, default: `1`)                     |
@@ -427,13 +457,16 @@ docker run --rm \
 | `GPG_ROOT`     | `/gpg`     | Directory with GPG key files                   |
 | `NO_COLOR`     | —          | Set to any value to disable colored log output |
 
+Every secret can also be read from a file, which suits [Docker secrets](https://docs.docker.com/engine/swarm/secrets/): set `<NAME>_FILE` instead of `<NAME>` for `GPG_PASSPHRASE`, `GPG_PUBLIC_KEY`, `GPG_PRIVATE_KEY`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` (for example `GPG_PASSPHRASE_FILE=/run/secrets/backup_passphrase`). Trailing newlines in the file are ignored. Setting both `<NAME>` and `<NAME>_FILE` is an error.
+
 ### For backup
 
-| Variable           | Description                                               |
-| ------------------ | --------------------------------------------------------- |
-| `BACKUP_TIMESTAMP` | Override the backup timestamp (format: `YYYYMMDD_HHMMSS`) |
-| `GPG_PUBLIC_KEY`   | Public key(s) for asymmetric encryption                   |
-| `GPG_PASSPHRASE`   | Passphrase for symmetric encryption                       |
+| Variable           | Description                                                    |
+| ------------------ | -------------------------------------------------------------- |
+| `BACKUP_TIMESTAMP` | Override the backup timestamp (format: `YYYYMMDD_HHMMSS`)      |
+| `VB_LOCK_TIMEOUT`  | Seconds to wait for the lock on `BACKUP_ROOT` (default: `300`) |
+| `GPG_PUBLIC_KEY`   | Public key(s) for asymmetric encryption                        |
+| `GPG_PASSPHRASE`   | Passphrase for symmetric encryption                            |
 
 ### For restore
 
@@ -444,30 +477,33 @@ docker run --rm \
 
 ### AWS / S3
 
-| Variable                        | Default | Description                                                                                                        |
-| ------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
-| `AWS_ACCESS_KEY_ID`             | —       | S3 access key                                                                                                      |
-| `AWS_SECRET_ACCESS_KEY`         | —       | S3 secret key                                                                                                      |
-| `AWS_SESSION_TOKEN`             | —       | Session token for temporary IAM credentials                                                                        |
-| `AWS_REGION`                    | —       | S3 region. On AWS it is detected from the bucket when unset; for custom endpoints the default is `us-east-1`       |
-| `AWS_DEFAULT_REGION`            | —       | Fallback for `AWS_REGION`                                                                                          |
-| `AWS_ENDPOINT_URL`              | —       | Custom S3-compatible endpoint as `scheme://host[:port]` (Yandex Cloud, MinIO, DO Spaces, etc.)                     |
-| `S3_ADDRESSING_STYLE`           | `auto`  | `path`, `virtual`, or `auto` (virtual-hosted on AWS unless the bucket name contains dots, path style elsewhere)    |
-| `S3_PART_SIZE`                  | `64`    | Multipart part size in MiB (`5`–`5120`). A stream may have at most 10000 parts, so the default allows ~625 GiB     |
-| `S3_ALLOW_UNCONDITIONAL_WRITES` | —       | Set to `1` to publish on providers without conditional writes; this gives up protection against concurrent writers |
+| Variable                        | Default | Description                                                                                                                      |
+| ------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `AWS_ACCESS_KEY_ID`             | —       | S3 access key                                                                                                                    |
+| `AWS_SECRET_ACCESS_KEY`         | —       | S3 secret key                                                                                                                    |
+| `AWS_SESSION_TOKEN`             | —       | Session token for temporary IAM credentials                                                                                      |
+| `AWS_REGION`                    | —       | S3 region. On AWS it is detected from the bucket when unset; for custom endpoints the default is `us-east-1`                     |
+| `AWS_DEFAULT_REGION`            | —       | Fallback for `AWS_REGION`                                                                                                        |
+| `AWS_ENDPOINT_URL`              | —       | Custom S3-compatible endpoint as `scheme://host[:port]` (Yandex Cloud, MinIO, DO Spaces, etc.)                                   |
+| `S3_ADDRESSING_STYLE`           | `auto`  | `path`, `virtual`, or `auto` (virtual-hosted on AWS unless the bucket name contains dots, path style elsewhere)                  |
+| `S3_PART_SIZE`                  | `64`    | Multipart part size in MiB (`5`–`5120`). A stream may have at most 10000 parts, so the default allows ~625 GiB                   |
+| `S3_ALLOW_UNCONDITIONAL_WRITES` | —       | Set to `1` to publish on providers without conditional writes; this gives up protection against concurrent writers               |
+| `S3_ALLOW_UNCONDITIONAL_DELETE` | —       | Set to `1` to rotate on providers that ignore `If-Match` on `DELETE`; this gives up protection against deleting replaced objects |
 
 ---
 
 ## Backup File Formats
 
-| Extension     | Compression | Encryption |
-| ------------- | ----------- | ---------- |
-| `.tar`        | none        | none       |
-| `.tar.gz`     | gzip        | none       |
-| `.tar.gpg`    | none        | GPG        |
-| `.tar.gz.gpg` | gzip        | GPG        |
+| Extension      | Compression | Encryption |
+| -------------- | ----------- | ---------- |
+| `.tar`         | none        | none       |
+| `.tar.gz`      | gzip        | none       |
+| `.tar.zst`     | zstd        | none       |
+| `.tar.gpg`     | none        | GPG        |
+| `.tar.gz.gpg`  | gzip        | GPG        |
+| `.tar.zst.gpg` | zstd        | GPG        |
 
-The format during backup is determined by the `-c`, `-e`, `-s` flags.  
+The format during backup is determined by the `-c`, `-z`, `-e`, `-s` flags.  
 During restore, the format is detected automatically from the file extension.
 
 ---
@@ -611,7 +647,7 @@ This works with AWS S3, Yandex Cloud Object Storage, MinIO, DigitalOcean Spaces,
 
 ### Required permissions
 
-`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, and `s3:AbortMultipartUpload` on the bucket (or prefix). Without `s3:ListBucket`, S3 answers `403` instead of `404` for missing keys, and the backup refuses to continue.
+`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, and `s3:AbortMultipartUpload` on the bucket (or prefix), plus `s3:DeleteObject` for [rotation](#rotation). Without `s3:ListBucket`, S3 answers `403` instead of `404` for missing keys, and the backup refuses to continue.
 
 ### Recommended bucket settings
 
@@ -680,6 +716,20 @@ docker run --rm \
     -i s3://my-bucket/daily/app1/postgres_data_20250411_120000.tar.gz \
     -t postgres_data \
     -C
+```
+
+### Restore all volumes from S3
+
+`-a` also works on an S3 prefix: it lists the prefix and restores the latest complete backup of every mounted volume (or exactly the snapshot given with `-T`) as one transaction.
+
+```bash
+docker run --rm \
+  --volume postgres_data:/volumes/postgres_data \
+  --volume redis_data:/volumes/redis_data \
+  --env AWS_ACCESS_KEY_ID=<KEY_ID> \
+  --env AWS_SECRET_ACCESS_KEY=<SECRET_KEY> \
+  --env AWS_REGION=eu-central-1 \
+  ghcr.io/vansergen/vb restore -a -b my-bucket -f daily/app1 -T 20250411_120000 -C
 ```
 
 ### Restore an encrypted archive from S3
@@ -877,6 +927,55 @@ docker run --rm \
 
 ---
 
+## Listing and Verifying Backups
+
+`restore -l` lists the backups in `BACKUP_ROOT` (or with `-b`/`-f`, in an S3 prefix), optionally filtered with `-v` and `-T`:
+
+```
+$ docker run --rm --volume ./backups:/backups ghcr.io/vansergen/vb restore -l
+VOLUME         TIMESTAMP        STATUS            SIZE  NAME
+postgres_data  20250410_030000  complete       1.2 GiB  postgres_data_20250410_030000.tar.zst
+postgres_data  20250411_030000  incomplete     1.2 GiB  postgres_data_20250411_030000.tar.zst  (no checksum file)
+```
+
+- **complete**: the archive and its `.sha256` file belong together (locally: the checksum file is valid and names the archive; in S3: both objects come from the same upload, as their `x-amz-meta-vb-token` shows).
+- **incomplete**: the checksum file is missing, malformed, or belongs to another archive, for example after an interrupted backup or rotation. `restore -a` skips such backups, and restoring one needs `-U`.
+- **orphan**: a checksum file without its archive.
+
+`restore -V` checks backups end to end without touching any volume: it verifies the checksum, decrypts, decompresses, and reads the whole archive. Use it with `-i` for one backup, or with `-a` (and `-T`, `-v`, `-b`, `-f`, `-j`) for the latest backup of every volume:
+
+```bash
+docker run --rm \
+  --volume ./backups:/backups \
+  --env GPG_PASSPHRASE_FILE=/run/secrets/passphrase \
+  ghcr.io/vansergen/vb restore -V -a -s
+```
+
+---
+
+## Rotation
+
+`-R <N>` and `-D <days>` delete old backups of a volume after a successful backup of that volume, in the same destination (`BACKUP_ROOT`, or the S3 bucket and prefix):
+
+```bash
+# Keep the 7 newest daily backups, and everything from the last 30 days
+docker run --rm ... ghcr.io/vansergen/vb backup -a -z -R 7 -D 30
+```
+
+- With both options, a backup is kept if **either** rule keeps it.
+- Only complete backups count for `-R`. The newest complete backup and the backup that was just made are never deleted.
+- Incomplete backups and orphaned checksum files are only deleted by `-D`, once they are old enough; otherwise they are reported.
+- Ages come from the timestamp in the file name, read as UTC.
+- Only backups of exactly that volume are considered (`app` never touches `app_data_…`).
+- A pair is deleted checksum file first, so an interrupted rotation leaves an incomplete archive, never a checksum file that could be attributed to another archive.
+- `-n` shows what would be deleted.
+
+**Locally**, the listing, the plan, and the deletions run under the same lock on `BACKUP_ROOT` as publishing, so a rotation never races a concurrent backup.
+
+**In S3**, every `DELETE` carries `If-Match` with the ETag seen while planning, so an object replaced in the meantime is kept. Before the first deletion, the backup checks with a probe object (`<prefix>/.vb-probe-…`) that the provider honours `If-Match` on `DELETE`, and refuses to rotate otherwise (set `S3_ALLOW_UNCONDITIONAL_DELETE=1` to accept the risk). Orphaned checksum files are never deleted in S3. On a versioned bucket, a deletion adds a delete marker and keeps the previous versions; remove those with a lifecycle rule (`NoncurrentVersionExpiration`).
+
+---
+
 ## Automation with cron
 
 ### Daily backup script
@@ -895,7 +994,7 @@ docker run --rm \
   --env AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
   --env AWS_REGION=eu-central-1 \
   --env GPG_PASSPHRASE="${GPG_PASSPHRASE}" \
-  ghcr.io/vansergen/vb backup -a -c -s -b my-bucket -f "daily/$(hostname)"
+  ghcr.io/vansergen/vb backup -a -z -s -b my-bucket -f "daily/$(hostname)" -R 14
 ```
 
 Add to `crontab -e`:
@@ -920,7 +1019,7 @@ Add to `crontab -e`:
 
 ### Supported platforms
 
-The published image supports `linux/amd64`, `linux/arm64/v8`, and `linux/ppc64le`. 32-bit ARM platforms (`linux/arm/v6`, `linux/arm/v7`, e.g. Raspberry Pi Zero / 1 / 2 / 3 running a 32-bit OS) are no longer published, because the MinIO client (`mc`) bundled in the image no longer ships 32-bit ARM builds. Use a 64-bit OS on supported ARM boards.
+The published image supports `linux/amd64`, `linux/arm64/v8`, `linux/arm/v7`, `linux/arm/v6`, and `linux/ppc64le`.
 
 ### Stop stateful services before restore
 
@@ -1045,7 +1144,19 @@ For asymmetric decryption, the script looks for a private key at `/gpg/private.g
 ### `No backup files found in /backups`
 
 The directory is empty or the files do not match the expected naming pattern:  
-`<VOLUME>_<YYYYMMDD_HHMMSS>.tar[.gz][.gpg]`
+`<VOLUME>_<YYYYMMDD_HHMMSS>.tar[.gz|.zst][.gpg]`
+
+### `Skipping incomplete backup`
+
+`restore -a` found a backup without a valid checksum file (see [Listing and Verifying Backups](#listing-and-verifying-backups)) and used an older complete one. Pass `-U` to restore the incomplete one anyway.
+
+### `does not honour If-Match on DELETE`
+
+Rotation in S3 needs conditional deletes, and the provider ignored or rejected them. Nothing was deleted. Set `S3_ALLOW_UNCONDITIONAL_DELETE=1` if you accept that a backup replaced during the rotation could be deleted.
+
+### `Both … and …_FILE are set`
+
+Set a secret either directly or through its `_FILE` variable, not both.
 
 ### `No backup found for requested volume`
 
@@ -1096,8 +1207,8 @@ Yes. The scripts work with any directory mounted under `VOLUMES_ROOT`. Bind moun
 **Do I need to stop containers to take a backup?**  
 Not for static files. For actively writing databases (PostgreSQL, MySQL, Redis), it depends on your consistency requirements. A file-level backup of a running database may be file-intact but logically inconsistent.
 
-**Why does `-a` restore only work with local files, not S3?**  
-The `-a` mode automatically scans `BACKUP_ROOT` and matches filenames to volume names. S3 does not provide local file scanning. To restore from S3, use single mode with an explicit source: `restore -i s3://...`.
+**Can `-a` restore from S3?**  
+Yes: `restore -a -b <bucket> -f <prefix>` lists the prefix and restores the latest complete backup of every mounted volume (or the snapshot given with `-T`).
 
 **Symmetric (`-s`) vs. asymmetric (`-e`) encryption — which should I use?**  
 Symmetric (`-s`) is simpler: one passphrase, easy to automate.  

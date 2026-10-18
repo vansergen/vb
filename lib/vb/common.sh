@@ -159,6 +159,28 @@ read_sidecar_digest() {
 }
 
 # ------------------------------------------------------------------------------
+# Secrets
+# ------------------------------------------------------------------------------
+
+# Docker-style secrets: for each <VAR>, a <VAR>_FILE variable names a file
+# that holds the value (trailing newlines are dropped). The value is
+# exported and <VAR>_FILE unset, so child processes see only <VAR>.
+load_secret_files() {
+  local var file_var file value
+  for var in "$@"; do
+    file_var="${var}_FILE"
+    [[ -n "${!file_var:-}" ]] || continue
+    [[ -z "${!var:-}" ]] || die "Both ${var} and ${file_var} are set; set only one of them"
+    file="${!file_var}"
+    [[ -f "$file" && -r "$file" ]] || die "${file_var} does not name a readable file: ${file}"
+    value="$(< "$file")"
+    printf -v "$var" '%s' "$value"
+    export "${var?}"
+    unset "$file_var"
+  done
+}
+
+# ------------------------------------------------------------------------------
 # GPG
 # ------------------------------------------------------------------------------
 
