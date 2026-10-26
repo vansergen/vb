@@ -1,4 +1,4 @@
-FROM alpine:3.24.2 AS base
+FROM alpine:3.24.3 AS base
 
 RUN apk add --no-cache \
   attr \
