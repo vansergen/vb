@@ -43,7 +43,7 @@ services:
       - seaweedfs-data:/data
 
   rustfs:
-    image: rustfs/rustfs:1.0.1
+    image: rustfs/rustfs:1.0.4
     environment:
       RUSTFS_ACCESS_KEY: vb_test_access_key
       RUSTFS_SECRET_KEY: vb_test_secret_key
