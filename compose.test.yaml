@@ -13,7 +13,7 @@ x-test-env: &test-env
 services:
   # versitygw: the default target, runs the whole suite
   s3:
-    image: versity/versitygw:v1.9.0
+    image: versity/versitygw:v1.10.0
     command: ["--port", ":7070", "posix", "/data"]
     environment:
       ROOT_ACCESS_KEY: vb_test_access_key
@@ -23,7 +23,7 @@ services:
 
   # A second versitygw with bucket versioning, for the rotation test
   s3v:
-    image: versity/versitygw:v1.9.0
+    image: versity/versitygw:v1.10.0
     command:
       ["--port", ":7070", "posix", "--versioning-dir", "/versions", "/data"]
     environment:
