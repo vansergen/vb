@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.0.1](https://github.com/vansergen/vb/compare/v3.0.0...v3.0.1) (2026-10-30)
+
+### Build System
+
+- bump alpine from 3.24.2 to 3.24.3 ([026c267](https://github.com/vansergen/vb/commit/026c267da77c5d52aff6801d0048dd90a0fe3285))
+
 ## [3.0.0](https://github.com/vansergen/vb/compare/v2.0.0...v3.0.0) (2026-10-18)
 
 ### ⚠ BREAKING CHANGES
