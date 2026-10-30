@@ -34,7 +34,7 @@ services:
       - s3v-versions:/versions
 
   seaweedfs:
-    image: chrislusf/seaweedfs:4.48
+    image: chrislusf/seaweedfs:4.50
     command: ["mini", "-dir=/data"]
     environment:
       AWS_ACCESS_KEY_ID: vb_test_access_key
